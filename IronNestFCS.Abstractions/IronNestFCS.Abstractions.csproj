@@ -6,6 +6,8 @@
         <Nullable>enable</Nullable>
         <AssemblyName>IronNestFCS.Abstractions</AssemblyName>
         <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
+        <GameDir>C:\Program Files (x86)\Steam\steamapps\common\Iron Nest Heavy Turret Simulator</GameDir>
+        <OutputPath>$(GameDir)\UserLibs\</OutputPath>
     </PropertyGroup>
 
 </Project>

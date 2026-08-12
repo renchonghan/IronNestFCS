@@ -6,7 +6,7 @@
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
         <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
-        <GameDir>D:\SteamLibrary\steamapps\common\Iron Nest Heavy Turret Simulator</GameDir>
+        <GameDir>C:\Program Files (x86)\Steam\steamapps\common\Iron Nest Heavy Turret Simulator</GameDir>
         <!-- 独立的 MelonMod，放进 Mods/ 由 MelonLoader 自动加载（无需热重载）。 -->
         <OutputPath>$(GameDir)\Mods\</OutputPath>
         <PackageId>IronNestFCS.CustomRecords</PackageId>
