@@ -34,10 +34,16 @@ public class TriggerConsole {
         _rotationCheck = buttons[2];
         _elevationCheck = buttons[3];
         _readyFire = buttons[4];
-        _armLeft = GameObject.Find(".ArmingLeverParent Left").GetComponentInChildren<LookAtTarget>();
-        _armRight = GameObject.Find(".ArmingLeverParent Right").GetComponentInChildren<LookAtTarget>();
-        _fire = GameObject.Find(".Trigger Core").transform.FindChild(".Generator Spinner")
-            .GetComponentInChildren<SliderEnergyMomentumSpinner>();
+        _armLeft = GameObject.Find(".ArmingLeverParent Left")?.GetComponentInChildren<LookAtTarget>();
+        _armRight = GameObject.Find(".ArmingLeverParent Right")?.GetComponentInChildren<LookAtTarget>();
+        _fire = GameObject.Find(".Trigger Core")?.transform.FindChild(".Generator Spinner")
+            ?.GetComponentInChildren<SliderEnergyMomentumSpinner>();
+
+        if (_fire == null)
+        {
+            MelonLogger.Error("[FCS] TriggerConsole: Can't find fire spinner");
+            return false;
+        }
         return true;
     }
 
