@@ -327,10 +327,12 @@ public class FSC
     }
 
     /// <summary>
-    /// 单次打击任务主流程, 弹种保护状态机:
-    /// 现场三要素 = 膛内弹种 (ChamberedShellBlueprint) / 实装药包数 (PowderCharges) / 装填相位 (CurrentStateIndex).
-    /// 最多两轮: 第一轮可能是退弹 (膛内弹错, 或弹对但实装药包不足且 P4 锁死补不了), 第二轮实射.
-    /// 实装药包 >= 需求量时跳过装填, 按实装量重算诸元直接击发 (省一次装填).
+    /// 单次打击任务主流程, CALL 枢纽回跳式弹种保护状态机 (详见 Function.md 第 5 章):
+    /// CALL 读现场决策: 有弹正确 + CANFIRE 检查装药 (不够 DUMP / 超出回 CALL 带条件 / 符合 EAIM);
+    /// 有弹正确 + 未就绪 PWDR (实拉不足补拉 / 超出回 CALL / 符合或超时 LOAD); 有弹错误 DUMP (平射打掉); 无弹 SELC.
+    /// CALL 计数器: PEND 后最多 2 次完整检查, 第 3 次跳过检查直接按实际装药实射, 保证终止.
+    /// 检查点鲁棒性: 推弹机动作中 (ShellRamming) 现场读数不可信, 等它完成再决策.
+    /// 最多两轮: 第一轮退弹, 等 2s 机构循环, 第二轮实射; 两轮未完 Failed.
     /// </summary>
     private IEnumerator RunTaskRoutine(LeftRight leftRight, ArtilleryTask task) {
         var gunSys = leftRight == LeftRight.Left ? LeftGun : RightGun;
@@ -346,188 +348,238 @@ public class FSC
         // 否则热重载后旧 ALC 的它仍被 Unity 驱动 → 崩溃
         _runningCoroutines.Add((MelonCoroutines.Start(ReserveTurretAndRotate(task, turret)), leftRight));
 
+        int callCount = 0; // CALL 枢纽计数器, PEND 后最多 2 次完整检查
+
         for (int round = 0; round < 2; round++) {
-            // ===== 读现场, 决定本轮是退弹还是实射 =====
-            string? chambered = gunSys.BulletInChamber();
-            int loaded = gunSys.LoadedPowderCharges();
-            int need = _sceneInteractor.maxCharge ? 6 : BallisticCalculator.MinimumCharge(task.distance);
-            bool shellWrong = chambered != null && chambered != task.bulletType.ToString();
-            bool powderLacking = chambered != null && !shellWrong && loaded > 0 && loaded < need;
-            bool isDump = shellWrong || powderLacking;
-
-            // 本轮装药量: 退弹用已装(没装补 1); 实射时实装足量按实装, 否则按需求
-            int powderCount;
-            if (isDump) powderCount = loaded > 0 ? loaded : 1;
-            else if (loaded >= need) powderCount = loaded;
-            else powderCount = need;
-
-            if (isDump) {
-                task.progress = Progress.DumpingWrongShell;
-                MarkProgress(leftRight, Progress.DumpingWrongShell);
-                MelonLogger.Msg($"[FCS] {leftRight}: dump round {round}, chambered={chambered}, loaded={loaded}, need={need}");
-            }
-            else {
-                MelonLogger.Msg($"[FCS] {leftRight}: fire round {round}, chambered={chambered}, loaded={loaded}, powderCount={powderCount}");
-            }
-
-            // ===== 临界区 1:解算(无论如何都要算仰角)=====
-            // 弹道计算器 / 确认台 / 采购台都是全局唯一硬件, 必须串行. 算完仰角即放
-            // 让另一管炮能立刻进来算它自己的弹道, 与本管炮接下来的长装填段重叠
+            bool roundFinished = false;
+            bool useActual = false; // CALL(带条件): 以实际装药为基准
             float elevation = 0f;
-            bool viable = true;
-            yield return _deskLock.Acquire();
-            try {
-                task.progress = Progress.Calculating;
-                MarkProgress(leftRight, Progress.Calculating);
-                yield return BallisticCalculator.SetDistance(task.distance);
-                yield return BallisticCalculator.SetDirection(task.angel);
-                yield return BallisticCalculator.SetCharge(powderCount);
-                yield return BallisticCalculator.SetShellType(task.bulletType);
-                yield return BallisticCalculator.Calculate();
-                elevation = BallisticCalculator.GetElevation();
 
-                // 装药不足则补购. 单次采购未必补满(且偶发点击早于卡牌入槽而失败)
-                // 故循环购买直到够本次发射所需, 避免"装药不足但非 0"时直接推进, 卡住后续装填
-                // 加购买次数上限兜底: 采购始终无效时不至于无限循环(每次约 2.5s)
-                var powderPurchaseAttempts = 0;
-                while (gunSys.RemainingCharges() < powderCount) {
-                    yield return _purchaseDeck.BuyPowders();
-                    if (++powderPurchaseAttempts >= 10) {
-                        MelonLogger.Error(
-                            $"[FCS] {leftRight} 炮管: 购买装药 {powderPurchaseAttempts} 次后仍不足 " +
-                            $"{powderCount} (当前 {gunSys.RemainingCharges()}), 停止补购.");
-                        break;
-                    }
+            while (!roundFinished) {
+                // ===== 检查点: 推弹机动作中, 膛内读数不可信, 等它完成再决策 (不消耗 CALL 预算) =====
+                if (gunSys.IsShellRamming()) {
+                    yield return gunSys.WaitShellRammed();
+                    continue;
                 }
 
-                task.progress = Progress.SelectingBullet;
-                MarkProgress(leftRight, Progress.SelectingBullet);
-                // 弹仓里没有目标弹种则采购(采购台也是共享硬件, 放在锁内)
-                if (!gunSys.HaveBulletInCylinder(task.bulletType)) {
-                    if (!gunSys.HaveEmptyShellInCylinder()) {
-                        task.progress = Progress.Failed;
-                        MarkProgress(leftRight, Progress.Failed);
-                        viable = false;
+                // ===== 1-1 CALL 枢纽: 读现场 + 决策 =====
+                callCount++;
+                task.progress = Progress.Calculating;
+                MarkProgress(leftRight, Progress.Calculating);
+
+                string? chambered = gunSys.BulletInChamber();
+                int loaded = gunSys.LoadedPowderCharges();
+                int selected = gunSys.SelectedPowderCharges();
+                int need = _sceneInteractor.maxCharge ? 6 : BallisticCalculator.MinimumCharge(task.distance);
+                bool canFire = gunSys.CanFire();
+                bool shellWrong = chambered != null && chambered != task.bulletType.ToString();
+
+                int powderCount;
+                string path;
+                if (callCount > 2) {
+                    // 第 3 次 CALL: 跳过检查, 直接按实际装药实射
+                    powderCount = loaded > 0 ? loaded : (selected > 0 ? selected : need);
+                    path = "aim";
+                    MelonLogger.Msg($"[FCS] {leftRight}: CALL x{callCount}, forced proceed with charge {powderCount}");
+                }
+                else if (shellWrong) {
+                    powderCount = loaded > 0 ? loaded : 1;
+                    path = "dump";
+                }
+                else if (chambered == null) {
+                    powderCount = need;
+                    path = "selc";
+                }
+                else if (canFire) {
+                    // 有弹正确 + CANFIRE: 检查装药
+                    int expected = useActual ? loaded : need;
+                    if (loaded < expected) {
+                        powderCount = loaded > 0 ? loaded : 1;
+                        path = "dump";
+                    }
+                    else if (loaded > expected) {
+                        MelonLogger.Msg($"[FCS] {leftRight}: CALL over-charge {loaded}>{expected}, retry with actual");
+                        useActual = true;
+                        continue;
                     }
                     else {
-                        yield return _purchaseDeck.BuyShell(task.bulletType, leftRight);
-                        // 确认采购到位: 等弹仓出现目标弹种, 最多 3 秒
-                        float waited = 0f;
-                        while (!gunSys.HaveBulletInCylinder(task.bulletType) && waited < 3f) {
-                            yield return new WaitForSeconds(0.5f);
-                            waited += 0.5f;
+                        powderCount = loaded;
+                        path = "aim";
+                    }
+                }
+                else {
+                    // 有弹正确 + 未就绪: 直接进 PWDR
+                    powderCount = useActual && (loaded > 0 || selected > 0) ? Math.Max(loaded, selected) : need;
+                    path = "pwdr";
+                }
+
+                MelonLogger.Msg($"[FCS] {leftRight}: CALL x{callCount} round {round}: path={path}, chambered={chambered}, loaded={loaded}, selected={selected}, need={need}, powderCount={powderCount}");
+
+                // ===== 临界区 1: 解算 (CALL 的一部分, 无论如何都要算仰角) =====
+                // 弹道计算器 / 确认台 / 采购台都是全局唯一硬件, 必须串行. 算完仰角即放
+                // 让另一管炮能立刻进来算它自己的弹道, 与本管炮接下来的长装填段重叠
+                yield return _deskLock.Acquire();
+                try {
+                    yield return BallisticCalculator.SetDistance(task.distance);
+                    yield return BallisticCalculator.SetDirection(task.angel);
+                    yield return BallisticCalculator.SetCharge(powderCount);
+                    yield return BallisticCalculator.SetShellType(task.bulletType);
+                    yield return BallisticCalculator.Calculate();
+                    elevation = BallisticCalculator.GetElevation();
+                    task.calculatedElevation = elevation; // 快照真实解算仰角, 面板行 2 用
+                    task.charge = powderCount;            // 快照本轮装药量
+
+                    // 装药不足则补购. 单次采购未必补满(且偶发点击早于卡牌入槽而失败)
+                    // 故循环购买直到够本次发射所需, 避免"装药不足但非 0"时直接推进, 卡住后续装填
+                    // 加购买次数上限兜底: 采购始终无效时不至于无限循环(每次约 2.5s)
+                    var powderPurchaseAttempts = 0;
+                    while (gunSys.RemainingCharges() < powderCount) {
+                        yield return _purchaseDeck.BuyPowders();
+                        if (++powderPurchaseAttempts >= 10) {
+                            MelonLogger.Error(
+                                $"[FCS] {leftRight} 炮管: 购买装药 {powderPurchaseAttempts} 次后仍不足 " +
+                                $"{powderCount} (当前 {gunSys.RemainingCharges()}), 停止补购.");
+                            break;
                         }
                     }
                 }
-            }
-            finally {
-                _deskLock.Release();
-            }
+                finally {
+                    _deskLock.Release();
+                }
 
-            // 任务不可行: 取消炮塔预约并归还(后台若尚未抢到, 会在抢到后自行归还)
-            // 避免炮塔锁被一个不会击发的任务永久占用
-            if (!viable) {
-                turret.Canceled = true;
-                ReleaseTurretOnce(turret);
-                ReleaseSlot(leftRight);
-                yield break;
-            }
-
-            // ===== 锁外: 装填(按现场分支)=====
-            if (isDump) {
-                // 退弹: 只保证膛内有药包, 弹不换; 已装药则直接打
-                if (loaded == 0) {
-                    task.progress = Progress.LoadingPowder;
-                    MarkProgress(leftRight, Progress.LoadingPowder);
-                    yield return gunSys.LoadPowder(1);
-                    task.progress = Progress.WaitLoading;
-                    MarkProgress(leftRight, Progress.WaitLoading);
-                    while (!gunSys.CanFire()) {
-                        yield return new WaitForSeconds(1f);
+                // ===== 分支执行 =====
+                if (path == "dump") {
+                    // 1-3 DUMP: 退弹平射
+                    task.progress = Progress.DumpingWrongShell;
+                    MarkProgress(leftRight, Progress.DumpingWrongShell);
+                    if (!gunSys.CanFire()) {
+                        if (gunSys.BulletInChamber() == null) {
+                            continue; // 无弹 → 回 CALL 重新决策
+                        }
+                        // 有弹: 架上保证至少一药
+                        if (gunSys.LoadedPowderCharges() == 0 && gunSys.SelectedPowderCharges() == 0) {
+                            task.progress = Progress.LoadingPowder;
+                            MarkProgress(leftRight, Progress.LoadingPowder);
+                            yield return LoadPowderWithDialLock(task, gunSys, 1, 1);
+                        }
+                        task.progress = Progress.WaitLoading;
+                        MarkProgress(leftRight, Progress.WaitLoading);
+                        while (!gunSys.CanFire()) {
+                            yield return new WaitForSeconds(1f);
+                        }
                     }
+                    // 平射: HAIM + 击发
+                    task.progress = Progress.AimingAzimuth;
+                    MarkProgress(leftRight, Progress.AimingAzimuth);
+                    while (!turret.Ready) {
+                        yield return null;
+                    }
+                    yield return FireSequence(leftRight, task, gunSys, turret, true);
+                    yield return new WaitForSeconds(2f); // 退弹轮结束: 等机构自动循环
+                    roundFinished = true;
+                }
+                else {
+                    if (path == "selc") {
+                        // 弹仓缺目标弹种才采购 (采购台共享硬件, 进桌子锁); 膛内弹已正确时不会走到这里
+                        if (!gunSys.HaveBulletInCylinder(task.bulletType)) {
+                            yield return _deskLock.Acquire();
+                            try {
+                                if (!gunSys.HaveBulletInCylinder(task.bulletType)) {
+                                    if (!gunSys.HaveEmptyShellInCylinder()) {
+                                        // 弹仓全满无空位: 任务不可行
+                                        MelonLogger.Error($"[FCS] {leftRight}: cylinder full, no {task.bulletType} slot, fail task");
+                                        turret.Canceled = true;
+                                        ReleaseTurretOnce(turret);
+                                        task.progress = Progress.Failed;
+                                        MarkProgress(leftRight, Progress.Failed);
+                                        ReleaseSlot(leftRight);
+                                        yield break;
+                                    }
+                                    yield return _purchaseDeck.BuyShell(task.bulletType, leftRight);
+                                    // 确认采购到位: 等弹仓出现目标弹种, 最多 3 秒
+                                    float waited = 0f;
+                                    while (!gunSys.HaveBulletInCylinder(task.bulletType) && waited < 3f) {
+                                        yield return new WaitForSeconds(0.5f);
+                                        waited += 0.5f;
+                                    }
+                                }
+                            }
+                            finally {
+                                _deskLock.Release();
+                            }
+                        }
+                        // 空膛: 先等残留实装计数清零(上一发击发后的自动循环)
+                        float waitLoaded = 0f;
+                        while (gunSys.LoadedPowderCharges() > 0 && waitLoaded < 10f) {
+                            yield return new WaitForSeconds(0.5f);
+                            waitLoaded += 0.5f;
+                        }
+                        // 1-2 SELC: 转弹仓选弹
+                        yield return gunSys.RotateCylinderTo(task.bulletType);
+                        // 2-1 BLRD: 按推弹按钮, 确认架上有弹
+                        task.progress = Progress.LoadingBullet;
+                        MarkProgress(leftRight, Progress.LoadingBullet);
+                        yield return gunSys.PressRammer();
+                        yield return gunSys.WaitRammingStart();
+                        // 2-2 BLLD: 推弹中
+                        task.progress = Progress.RammingBullet;
+                        MarkProgress(leftRight, Progress.RammingBullet);
+                        yield return gunSys.WaitShellRammed();
+                    }
+
+                    if (path is "selc" or "pwdr") {
+                        // 2-3 PWDR: 检查装药 (实拉 vs 期望)
+                        task.progress = Progress.LoadingPowder;
+                        MarkProgress(leftRight, Progress.LoadingPowder);
+                        int selectedNow = gunSys.SelectedPowderCharges();
+                        if (selectedNow > powderCount) {
+                            MelonLogger.Msg($"[FCS] {leftRight}: PWDR over {selectedNow}>{powderCount}, retry with actual");
+                            useActual = true;
+                            continue; // 超出 → CALL(带条件)
+                        }
+                        // 不够补拉差, 符合/超时也走推药
+                        yield return LoadPowderWithDialLock(task, gunSys, powderCount, powderCount - selectedNow);
+                        // 2-4 LOAD: 推药 + 等装填完成
+                        task.progress = Progress.WaitLoading;
+                        MarkProgress(leftRight, Progress.WaitLoading);
+                        while (!gunSys.CanFire()) {
+                            yield return new WaitForSeconds(1f);
+                        }
+                        // 2-5 COFM: 击发前装药确认
+                        task.progress = Progress.ConfirmingCharge;
+                        MarkProgress(leftRight, Progress.ConfirmingCharge);
+                        int finalCharge = gunSys.LoadedPowderCharges();
+                        if (finalCharge <= 0) finalCharge = powderCount;
+                        if (finalCharge != task.charge) {
+                            MelonLogger.Msg($"[FCS] {leftRight}: COFM mismatch {finalCharge}!={task.charge}, back to CALL");
+                            continue; // 差异 → CALL
+                        }
+                    }
+
+                    // 3-1 EAIM: 升仰角
+                    task.progress = Progress.Aiming;
+                    MarkProgress(leftRight, Progress.Aiming);
+                    yield return gunSys.SetElevation(elevation);
+                    task.impactTime = gunSys.PredictedImpactTime(); // 仰角就位: 锁存总飞行时间 (行 2 T: 数据源)
+                    // 3-2 HAIM: 等炮塔水平到位
+                    task.progress = Progress.AimingAzimuth;
+                    MarkProgress(leftRight, Progress.AimingAzimuth);
+                    while (!turret.Ready) {
+                        yield return null;
+                    }
+                    // 3-3 WAIT: 击发
+                    yield return FireSequence(leftRight, task, gunSys, turret, false);
+                    // 3-4 RSET: 回位
+                    task.progress = Progress.BackToIdle;
+                    MarkProgress(leftRight, Progress.BackToIdle);
+                    yield return gunSys.WaitBackToIdle();
+                    task.progress = Progress.Finished;
+                    MarkProgress(leftRight, Progress.Finished);
+                    _sceneInteractor.TaskFinished(task);
+                    ReleaseSlot(leftRight);
+                    yield break;
                 }
             }
-            else if (chambered == null) {
-                // 空膛: 装弹 + 装药. 先等残留实装计数清零(上一发击发后的自动循环)
-                float waitLoaded = 0f;
-                while (gunSys.LoadedPowderCharges() > 0 && waitLoaded < 10f) {
-                    yield return new WaitForSeconds(0.5f);
-                    waitLoaded += 0.5f;
-                }
-                task.progress = Progress.LoadingBullet;
-                MarkProgress(leftRight, Progress.LoadingBullet);
-                yield return gunSys.LoadBullet(task.bulletType);
-                task.progress = Progress.LoadingPowder;
-                MarkProgress(leftRight, Progress.LoadingPowder);
-                yield return gunSys.LoadPowder(powderCount);
-                task.progress = Progress.WaitLoading;
-                MarkProgress(leftRight, Progress.WaitLoading);
-                while (!gunSys.CanFire()) {
-                    yield return new WaitForSeconds(1f);
-                }
-            }
-            else if (loaded == 0) {
-                // 弹已在膛: 只装药
-                task.progress = Progress.LoadingPowder;
-                MarkProgress(leftRight, Progress.LoadingPowder);
-                yield return gunSys.LoadPowder(powderCount);
-                task.progress = Progress.WaitLoading;
-                MarkProgress(leftRight, Progress.WaitLoading);
-                while (!gunSys.CanFire()) {
-                    yield return new WaitForSeconds(1f);
-                }
-            }
-            // 否则 loaded >= need: 实装足量, 全部跳过, 直接瞄准击发
-
-            // ===== 锁外: 升仰角(退弹平射跳过)=====
-            if (!isDump) {
-                task.progress = Progress.Aiming;
-                MarkProgress(leftRight, Progress.Aiming);
-                yield return gunSys.SetElevation(elevation);
-            }
-
-            // ===== 锁外: 等炮塔水平到位(2-2 HAIM)=====
-            task.progress = Progress.AimingAzimuth;
-            MarkProgress(leftRight, Progress.AimingAzimuth);
-            while (!turret.Ready) {
-                yield return null;
-            }
-
-            // ===== 临界区 2: 击发 =====
-            task.progress = Progress.WaitingForFire;
-            MarkProgress(leftRight, Progress.WaitingForFire);
-            try {
-                yield return TriggerConsole.ConfirmTask();
-                yield return TriggerConsole.ConfirmBullet();
-                yield return TriggerConsole.ConfirmRotation();
-                yield return TriggerConsole.ConfirmElevation();
-                yield return TriggerConsole.ReadyToFire();
-                yield return TriggerConsole.Arm(leftRight);
-                task.impactTime = gunSys.PredictedImpactTime(); // 火控解总飞行时间: 击发前拷贝炮兵计时器
-                if (_sceneInteractor.AutoFire) {
-                    TriggerConsole.Fire();
-                }
-                yield return gunSys.WaitFire();
-            }
-            finally {
-                // 炮塔方向角独占到实射这一发打出去为止; 退弹轮继续持有给下一轮
-                if (!isDump) ReleaseTurretOnce(turret);
-            }
-
-            if (!isDump) {
-                // ===== 锁外: 回位 =====
-                task.progress = Progress.BackToIdle;
-                MarkProgress(leftRight, Progress.BackToIdle);
-                yield return gunSys.WaitBackToIdle();
-                task.progress = Progress.Finished;
-                MarkProgress(leftRight, Progress.Finished);
-                _sceneInteractor.TaskFinished(task);
-                ReleaseSlot(leftRight);
-                yield break;
-            }
-
-            // 退弹轮结束: 等机构自动循环, 下一轮重装正确弹种
-            yield return new WaitForSeconds(2f);
         }
 
         // 两轮仍未完成(异常兜底): 归还炮塔并失败
@@ -535,6 +587,32 @@ public class FSC
         task.progress = Progress.Failed;
         MarkProgress(leftRight, Progress.Failed);
         ReleaseSlot(leftRight);
+    }
+
+    /// <summary>临界区 2 击发: 五步确认 + Arm + 拷贝飞行时间 + Fire + WaitFire. 非退弹轮归还炮塔.</summary>
+    private IEnumerator FireSequence(LeftRight leftRight, ArtilleryTask task, GunSystem gunSys, TurretReservation turret, bool isDump) {
+        task.progress = Progress.WaitingForFire;
+        MarkProgress(leftRight, Progress.WaitingForFire);
+        try {
+            yield return TriggerConsole.ConfirmTask();
+            yield return TriggerConsole.ConfirmBullet();
+            yield return TriggerConsole.ConfirmRotation();
+            yield return TriggerConsole.ConfirmElevation();
+            yield return TriggerConsole.ReadyToFire();
+            yield return TriggerConsole.Arm(leftRight);
+            // 总飞行时间正常在仰角就位时锁存; 这里兜底平射轮等未锁存的情况
+            if (task.impactTime <= 0f) task.impactTime = gunSys.PredictedImpactTime();
+            task.progress = Progress.Fire; // 3-4 FIRE: 击发瞬间 (自动/手动开火都一闪而过)
+            MarkProgress(leftRight, Progress.Fire);
+            if (_sceneInteractor.AutoFire) {
+                TriggerConsole.Fire();
+            }
+            yield return gunSys.WaitFire();
+        }
+        finally {
+            // 炮塔方向角独占到实射这一发打出去为止; 退弹轮继续持有给下一轮
+            if (!isDump) ReleaseTurretOnce(turret);
+        }
     }
 
     /// <summary>
@@ -554,6 +632,31 @@ public class FSC
     /// 抢到后若发现已被取消则立即归还, 不空转; 否则转到目标方向并置 Ready
     /// 此后炮塔由主流程在击发完成时归还(若转向期间被取消则在此自行归还)
     /// </summary>
+    /// <summary>
+    /// PWDR 段: 锁内完整重算 (距离/方向/装药/弹种 + Calculate) + 按差补拉药包杆 + 按推药按钮.
+    /// 游戏只在按 Calculate 那一刻存储"已计算装药数", 药包杆最多允许拉到这个数;
+    /// 弹道计算器全局唯一, 另一炮的解算会改写存储值 → 必须锁内重算, 否则拉杆/推药被游戏锁死.
+    /// </summary>
+    private IEnumerator LoadPowderWithDialLock(ArtilleryTask task, GunSystem gunSys, int calcCharge, int pullCount) {
+        yield return _deskLock.Acquire();
+        try {
+            yield return BallisticCalculator.SetDistance(task.distance);
+            yield return BallisticCalculator.SetDirection(task.angel);
+            yield return BallisticCalculator.SetCharge(calcCharge);
+            yield return BallisticCalculator.SetShellType(task.bulletType);
+            yield return BallisticCalculator.Calculate();
+            task.calculatedElevation = BallisticCalculator.GetElevation(); // 重算结果仍是本轮的, 再快照一次
+            task.charge = calcCharge;
+            if (pullCount > 0) {
+                yield return gunSys.PullPowders(pullCount);
+            }
+            yield return gunSys.RamPowder();
+        }
+        finally {
+            _deskLock.Release();
+        }
+    }
+
     private IEnumerator ReserveTurretAndRotate(ArtilleryTask task, TurretReservation res) {
         yield return _turretLock.Acquire();
         res.Acquired = true;

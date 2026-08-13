@@ -48,6 +48,7 @@ public class GunSystem {
     private ArtilleryReloadController? reloadController;
     private LinearSliderInteractable? elevationLever;
     private OdometerDisplay? remainingCharges;
+    private OdometerDisplay? selectedCharges;
 
     private TextMeshPro shellId;
 
@@ -62,6 +63,13 @@ public class GunSystem {
         }
 
         remainingCharges = reloadingConsole.GetComponentInChildren<OdometerDisplay>();
+        // 实拉药包杆数 (P3 就可见, PowderCharges 要到 P4 后才有值)
+        // 该里程表挂在 "Calculated Charge Display (1)" (实际装药量表) 下, 不在装填控制台里
+        // Transform.Find/FindChild 只查直接子级, 这里用递归查找
+        selectedCharges = FindChildDeep(gunSystem, "Odomiter Counter Selected Charges")
+            ?.GetComponent<OdometerDisplay>();
+        MelonLogger.Msg($"[FCS] GunSystem {surfix}: selectedCharges bound={selectedCharges != null}, " +
+                        $"value={selectedCharges?.CurrentNumber}"); // [临时调试] 验证绑定, 用完注释掉本行
         
         nextBulletButton = 
             reloadingConsole.Find("Universal Button Move Cylinder")
@@ -378,6 +386,16 @@ public class GunSystem {
         return gunController != null && gunController.CanFire;
     }
 
+    /// <summary>深度优先递归按名字找子物体 (Transform.Find/FindChild 只查直接子级).</summary>
+    private static Transform? FindChildDeep(Transform root, string name) {
+        if (root.name == name) return root;
+        for (int i = 0; i < root.childCount; i++) {
+            var hit = FindChildDeep(root.GetChild(i), name);
+            if (hit != null) return hit;
+        }
+        return null;
+    }
+
     public IEnumerator SetElevation(float elevation) {
         if (elevationLever == null || gunController == null) {
             MelonLogger.Error($"[FCS] GunSystem {_surfix}: Elevation lever or gun controller unbound");
@@ -453,19 +471,19 @@ public class GunSystem {
     /// (游戏有转动动画/物理). 返回 IEnumerator, 调用方用 yield return 等待它跑完
     /// 必须走协程而非 async: continuation 要留在主线程才能安全访问 IL2CPP 对象
     /// </summary>
-    public IEnumerator LoadBullet(BulletType type) {
+    /// <summary>转弹仓直到目标弹种位于待装位 (面板 1-2 SELC 阶段).</summary>
+    public IEnumerator RotateCylinderTo(BulletType type) {
         // 上一发的退壳/炮闩/复位机构可能仍在工作. 先等待真实机构状态空闲
-        // 再开始下一轮弹仓和推弹操作, 避免连续射击时过早点击后续控件
+        // 再开始下一轮弹仓操作, 避免连续射击时过早点击后续控件
         yield return WaitForReloadReady();
 
         RefreshBullets();
-        var index = bullets.IndexOf(type.ToString());
-        if (index == -1) {
+        if (!bullets.Contains(type.ToString())) {
             MelonLogger.Error($"[FCS] GunSystem {_surfix}: " +
                               $"No {type} available in cylinder, current bullets: {string.Join(", ", bullets)}");
             yield break;
         }
-        
+
         for (var i = 0; i < bullets.Count; ++i) {
             if (bullets[0] == type.ToString()) {
                 break;
@@ -477,11 +495,25 @@ public class GunSystem {
         if (bullets[0] != type.ToString()) {
             MelonLogger.Error($"[FCS] GunSystem {_surfix}: Can't find {type} after rotation, " +
                               $"current: {string.Join(", ", bullets)}");
-            yield break;
         }
+    }
 
+    /// <summary>按推弹按钮把炮弹送上推弹架 (面板 2-1 DLRD 阶段).</summary>
+    public IEnumerator PressRammer() {
         yield return WaitForReloadReady();
         yield return FcsSceneInteractor.WaitAndClick(loadBulletButton!);
+    }
+
+    /// <summary>按完推弹按钮后等推弹机启动 (装填状态机进入 ShellRamming), 10 秒兜底.</summary>
+    public IEnumerator WaitRammingStart() {
+        float waited = 0f;
+        while (waited < 10f) {
+            var key = reloadController?.CurrentState?.stateKey;
+            if (key == "ShellRamming") yield break;
+            yield return new WaitForSeconds(0.5f);
+            waited += 0.5f;
+        }
+        MelonLogger.Msg($"[FCS] GunSystem {_surfix}: WaitRammingStart timeout, proceed");
     }
 
     private IEnumerator SelectPowder(int count) {
@@ -513,7 +545,35 @@ public class GunSystem {
         }
     }
 
-    public IEnumerator LoadPowder(int count) {
+    /// <summary>
+    /// 等推弹机把炮弹推进到位: 游戏装填状态机离开 ShellRamming 状态 (P2 炮弹已推入).
+    /// 必须先观察到 ShellRamming 才算数, 避免点击后机构尚未启动就误判完成;
+    /// 兜底: 膛内出现炮弹也算完成 (机构动作极快、错过 ShellRamming 轮询时用); 30 秒兜底.
+    /// </summary>
+    public IEnumerator WaitShellRammed() {
+        bool seenRamming = false;
+        float waited = 0f;
+        while (waited < 30f) {
+            var key = reloadController?.CurrentState?.stateKey;
+            if (key == "ShellRamming") {
+                seenRamming = true;
+            }
+            else if (seenRamming || BulletInChamber() != null) {
+                yield break;
+            }
+            yield return new WaitForSeconds(0.5f);
+            waited += 0.5f;
+        }
+        MelonLogger.Msg($"[FCS] GunSystem {_surfix}: WaitShellRammed timeout, proceed");
+    }
+
+    /// <summary>拉指定数量的药包杆 (PWDR 补拉用, 按钮逐个带 9s 超时).</summary>
+    public IEnumerator PullPowders(int count) {
+        yield return SelectPowder(count);
+    }
+
+    /// <summary>按推药按钮 (P4 推药入膛).</summary>
+    public IEnumerator RamPowder() {
         // 推药杆引用可能因 reload 重建而失效, 重新绑定
         if (loadPowderButton == null || loadPowderButton.gameObject == null) {
             var gunSystem = GameObject.Find("Gun System " + _surfix)?.transform;
@@ -521,11 +581,10 @@ public class GunSystem {
             loadPowderButton = reloadingConsole?.FindChild("Universal Button Charge Rammer (1)")
                 ?.GetComponent<LookAtTarget>();
             if (loadPowderButton == null) {
-                MelonLogger.Error($"[GunSystem] LoadPowder: rammer button missing");
+                MelonLogger.Error($"[GunSystem] RamPowder: rammer button missing");
                 yield break;
             }
         }
-        yield return SelectPowder(count);
         yield return FcsSceneInteractor.WaitAndClick(loadPowderButton);
     }
 
@@ -568,6 +627,16 @@ public class GunSystem {
     /// <summary>实装药包数 (P4 推入确认后生效, 之前为 0). 弹种保护状态机的关键输入.</summary>
     public int LoadedPowderCharges() {
         return gunController == null ? 0 : gunController.PowderCharges;
+    }
+
+    /// <summary>实拉药包杆数 (Selected Charges 里程表, P3 阶段就可见, 用于 PWDR 补拉/超量判定).</summary>
+    public int SelectedPowderCharges() {
+        return selectedCharges == null ? 0 : (int)selectedCharges.CurrentNumber;
+    }
+
+    /// <summary>推弹机是否正在把炮弹推入 (装填状态机 ShellRamming). 检查点用: 此时膛内读数不可信.</summary>
+    public bool IsShellRamming() {
+        return reloadController?.CurrentState?.stateKey == "ShellRamming";
     }
 
     /// <summary>炮弹预计飞行时间 (游戏 GunController 弹道预测, 未解算时为 0).</summary>

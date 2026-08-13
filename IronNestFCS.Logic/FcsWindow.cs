@@ -20,7 +20,7 @@ public class FcsWindow
     private readonly FSC fcs;
 
     private bool showWindow = true;
-    private Rect panelRect = new(20, 20, 440, 150);
+    private Rect panelRect = new(20, 20, 450, 150);
 
     private static readonly Color ClrTitle = new(0.00f, 1.00f, 0.35f);
     private static readonly Color ClrLabel = new(0.00f, 1.00f, 0.35f);
@@ -114,8 +114,12 @@ public class FcsWindow
 
         foreach (var item in fcs.QueueCan)
         {
+            // 准备队列: 一单进入流程即出队, 不需要相位. 与火控行 2 列对齐: [RQTA] 方位 距离 | 弹种
+            // 弹种位 4 字符定宽 (CenterPad), 保证 AP/HCHE 两行不歪; 队列用白字
+            GUI.color = ClrWhite;
             GUI.Label(new Rect(x, y, w, h),
-                $"  T{item.targetId}  {ConvertPosition(item.position)}  {item.angel,5:F1}°/{item.distance,5:F2}km  {item.bulletType}");
+                $"[--:--:--] {item.angel:000.0} {item.distance:00.00} | {CenterPad(item.bulletType.ToString(), 4)}");
+            GUI.color = oldColor;
             y += lineH;
         }
     }
@@ -123,17 +127,20 @@ public class FcsWindow
     /// <summary>进度枚举 -> 相位代号与名称 (火控台风格).</summary>
     private static (string code, string name) PhaseCode(Progress p) => p switch
     {
-        Progress.Pending => ("0-1", "CALL"),
-        Progress.Calculating => ("0-1", "CALL"),
-        Progress.SelectingBullet => ("0-2", "SELC"),
-        Progress.DumpingWrongShell => ("0-3", "DUMP"),
-        Progress.LoadingBullet => ("1-2", "BLLD"),
-        Progress.LoadingPowder => ("1-3", "PWDR"),
-        Progress.WaitLoading => ("1-4", "LOAD"),
-        Progress.Aiming => ("2-1", "EAIM"),
-        Progress.AimingAzimuth => ("2-2", "HAIM"),
-        Progress.WaitingForFire => ("2-3", "WAIT"),
-        Progress.BackToIdle => ("2-4", "RSET"),
+        Progress.Pending => ("1-0", "PEND"),
+        Progress.Calculating => ("1-1", "CALL"),
+        Progress.SelectingBullet => ("1-2", "SELC"),
+        Progress.DumpingWrongShell => ("1-3", "DUMP"),
+        Progress.LoadingBullet => ("2-1", "BLRD"),
+        Progress.RammingBullet => ("2-2", "BLLD"),
+        Progress.LoadingPowder => ("2-3", "PWDR"),
+        Progress.WaitLoading => ("2-4", "LOAD"),
+        Progress.ConfirmingCharge => ("2-5", "COFM"),
+        Progress.Aiming => ("3-1", "EAIM"),
+        Progress.AimingAzimuth => ("3-2", "HAIM"),
+        Progress.WaitingForFire => ("3-3", "WAIT"),
+        Progress.Fire => ("3-4", "FIRE"),
+        Progress.BackToIdle => ("3-5", "RSET"),
         Progress.Finished => ("0-0", "IDLE"),
         Progress.Failed => ("0-0", "FAIL"),
         _ => ("0-0", "IDLE"),
@@ -219,23 +226,25 @@ public class FcsWindow
         string flightStr = !float.IsNaN(remain) && remain > 0.01f ? $"{remain:00.0}S" : "--.-S";
 
         GUI.Label(new Rect(x, y, w, 22f),
-            $"[{gunLabel}] PHASE {code} {phase} | {CenterPad(chambered, 4)} E:{elStr} A:{azStr} C:{cStr} T:{flightStr}");
+            $"[{gunLabel}] PHASE {code} {phase} | {CenterPad(chambered, 4)} E:{elStr} A:{azStr} C:{cStr} | T:-{flightStr}");
         y += lineH;
 
         // ===== 行 2: 火控解 (RQTA + 目标方位/距离 + 解算诸元), 无任务时全横线 =====
         if (task == null)
         {
             GUI.Label(new Rect(x, y, w, 22f),
-                "[--:--:--] ---.- --.-- | ---- E:--.-- A:---.- C:- T:--.-S");
+                "[--:--:--] ---.- --.-- | ---- E:--.-- A:---.- C:- | FT:--.-S");
         }
         else
         {
-            int planned = FcsCalc.Charge(task.distance);
             // 总飞行时间: WaitForFire 时从炮兵计时器拷贝的火控解, 不随飞行倒数
             float total = task.impactTime;
             string totalStr = total > 0.01f ? $"{total:00.0}S" : "--.-S";
+            // 真实解算快照: 仰角与装药量来自弹道计算器输出, 未解算时显示横线
+            string solE = task.calculatedElevation > 0.01f ? $"{task.calculatedElevation:00.00}" : "--.--";
+            string solC = task.charge > 0 ? task.charge.ToString() : "-";
             GUI.Label(new Rect(x, y, w, 22f),
-                $"[--:--:--] {task.angel:000.0} {task.distance:00.00} |{CenterPad(task.bulletType.ToString(), 4)} E:{FcsCalc.Elevation(task.distance):00.00} A:{task.angel:000.0} C:{planned} T:{totalStr}");
+                $"[--:--:--] {task.angel:000.0} {task.distance:00.00} | {CenterPad(task.bulletType.ToString(), 4)} E:{solE} A:{task.angel:000.0} C:{solC} | FT:{totalStr}");
         }
         GUI.color = oldColor;
         return y + lineH;
