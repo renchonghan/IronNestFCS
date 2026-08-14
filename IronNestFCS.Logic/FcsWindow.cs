@@ -61,12 +61,18 @@ public class FcsWindow
         float h = 22f;
         float lineH = h + 2f;
 
-        float extra = 0f;
-        extra += lineH * 4; // 两炮各两行
-        extra += lineH * (fcs.PendingCount + 1);
-        extra += 12f;
+        // 面板高度逐行精确计算 (不再用 base+extra 的估计法)
+        float panelH = 4f + lineH;                       // 标题
+        if (AutoSweepEnabled) panelH += lineH;           // 扫荡提示
+        panelH += lineH;                                 // 分隔线
+        panelH += lineH * 4;                             // 两炮各两行
+        panelH += lineH * 2;                             // 两条分隔线
+        panelH += lineH;                                 // 队列表头
+        panelH += lineH * 8;                             // 队列固定 8 行
+        if (fcs.PendingOverflow || fcs.FinishedOverflow) panelH += lineH; // ...(x more)
+        panelH += 8f;                                    // 底部余量
 
-        panelRect.height = 150f + extra;
+        panelRect.height = panelH;
 
         // 背景框
         GUI.Box(panelRect, "");
@@ -90,7 +96,7 @@ public class FcsWindow
         }
 
         DrawDivider(x, y, w);
-        y += 4f;
+        y += lineH;
 
         if (!fcs.IsBound)
         {
@@ -102,26 +108,41 @@ public class FcsWindow
 
         y = DrawGunRow("GUN-L", fcs.LeftGun, fcs.LeftTask, x, y, w, lineH);
         DrawDivider(x, y, w);
-        y += 4f;
+        y += lineH;
         y = DrawGunRow("GUN-R", fcs.RightGun, fcs.RightTask, x, y, w, lineH);
         DrawDivider(x, y, w);
-        y += 4f;
+        y += lineH;
 
+        // ===== 队列区: 左任务队列 | 右完成队列 =====
+        // 整行按 28 字符左列 + "|" + 右列 拼接成单条字符串 (等宽字体, 空位纯空格)
         GUI.color = ClrLabel;
-        GUI.Label(new Rect(x, y, w, h), $"Queue: {fcs.PendingCount}");
+        GUI.Label(new Rect(x, y, w, h),
+            $"{"Task Queue(" + fcs.PendingCount + ")",-28}|Finish Queue({fcs.FinishedCount})");
         GUI.color = oldColor;
         y += lineH;
 
-        foreach (var item in fcs.QueueCan)
+        var pending = fcs.QueueCan.Take(8).ToList();
+        var finished = fcs.FinishedQueue.TakeLast(8).Reverse().ToList(); // 最新在前
+        GUI.color = ClrLabel; // 队列区与整体一致的荧光绿
+        for (int i = 0; i < 8; i++) // 固定 8 行, 空位纯空格, 中间的 | 常驻
         {
-            // 准备队列: 一单进入流程即出队, 不需要相位. 与火控行 2 列对齐: [RQTA] 方位 距离 | 弹种
-            // 弹种位 4 字符定宽 (CenterPad), 保证 AP/HCHE 两行不歪; 队列用白字
-            GUI.color = ClrWhite;
-            GUI.Label(new Rect(x, y, w, h),
-                $"[--:--:--] {item.angel:000.0} {item.distance:00.00} | {CenterPad(item.bulletType.ToString(), 4)}");
-            GUI.color = oldColor;
+            string left = i < pending.Count
+                ? $"[--:--:--] {pending[i].angel:000.0} {pending[i].distance:00.00}  {CenterPad(pending[i].bulletType.ToString(), 4)}"
+                : "";
+            string right = i < finished.Count
+                ? BuildFinishLine(finished[i])
+                : "";
+            GUI.Label(new Rect(x, y, w, h), $"{left,-28}|{right}");
             y += lineH;
         }
+        if (fcs.PendingOverflow || fcs.FinishedOverflow)
+        {
+            string leftOver = fcs.PendingOverflow ? $"...({fcs.PendingCount - 8} more)" : "";
+            string rightOver = fcs.FinishedOverflow ? $"...({fcs.FinishedOverflowCount} more)" : "";
+            GUI.Label(new Rect(x, y, w, h), $"{leftOver,-28}|{rightOver}");
+            y += lineH;
+        }
+        GUI.color = oldColor;
     }
 
     /// <summary>进度枚举 -> 相位代号与名称 (火控台风格).</summary>
@@ -223,38 +244,48 @@ public class FcsWindow
         string elStr = float.IsNaN(el) ? "--.--" : $"{el:00.00}";
         string azStr = float.IsNaN(az) ? "---.-" : $"{az:000.0}";
         string cStr = loaded > 0 ? loaded.ToString() : "-";
-        string flightStr = !float.IsNaN(remain) && remain > 0.01f ? $"{remain:00.0}S" : "--.-S";
+        // 行 1 FT: 仰角就位锁存前显示活飞行时间 (实时跟仰角), 锁存后显示总飞行时间
+        float ft = task != null && task.impactTime > 0.01f ? task.impactTime : remain;
+        string ftStr = !float.IsNaN(ft) && ft > 0.01f ? $"{ft:00.0}S" : "--.-S";
 
         GUI.Label(new Rect(x, y, w, 22f),
-            $"[{gunLabel}] PHASE {code} {phase} | {CenterPad(chambered, 4)} E:{elStr} A:{azStr} C:{cStr} | T:-{flightStr}");
+            $"[{gunLabel}] PHASE {code} {phase} | {CenterPad(chambered, 4)} E:{elStr} A:{azStr} C:{cStr} | FT:{ftStr}");
         y += lineH;
 
         // ===== 行 2: 火控解 (RQTA + 目标方位/距离 + 解算诸元), 无任务时全横线 =====
         if (task == null)
         {
             GUI.Label(new Rect(x, y, w, 22f),
-                "[--:--:--] ---.- --.-- | ---- E:--.-- A:---.- C:- | FT:--.-S");
+                "[--:--:--] ---.- --.-- | ---- E:--.-- A:---.- C:- | T:---.-S");
         }
         else
         {
-            // 总飞行时间: WaitForFire 时从炮兵计时器拷贝的火控解, 不随飞行倒数
-            float total = task.impactTime;
-            string totalStr = total > 0.01f ? $"{total:00.0}S" : "--.-S";
+            // 行 2 T:-: 击发后显示目标倒计时 (计时表), 击发前/落地后横线
+            float cd = gun.CountdownRemainingSeconds();
+            string cdStr = !float.IsNaN(cd) && cd > 0.01f ? $"{cd:00.0}S" : "--.-S";
             // 真实解算快照: 仰角与装药量来自弹道计算器输出, 未解算时显示横线
             string solE = task.calculatedElevation > 0.01f ? $"{task.calculatedElevation:00.00}" : "--.--";
             string solC = task.charge > 0 ? task.charge.ToString() : "-";
             GUI.Label(new Rect(x, y, w, 22f),
-                $"[--:--:--] {task.angel:000.0} {task.distance:00.00} | {CenterPad(task.bulletType.ToString(), 4)} E:{solE} A:{task.angel:000.0} C:{solC} | FT:{totalStr}");
+                $"[--:--:--] {task.angel:000.0} {task.distance:00.00} | {CenterPad(task.bulletType.ToString(), 4)} E:{solE} A:{task.angel:000.0} C:{solC} | T:-{cdStr}");
         }
         GUI.color = oldColor;
         return y + lineH;
+    }
+
+    /// <summary>完成队列行: 完成时刻占位 [--:--:--] + 目标方位距离 + 该发的实时剩余飞行时间 T:- (落地后横线).</summary>
+    private static string BuildFinishLine(FinishedTask f)
+    {
+        float remain = f.task.impactTime - (Time.time - f.fireTime);
+        string cd = remain > 0.01f ? $"{remain:00.0}S" : "--.-S"; // T:- 前缀自带一个杠, 这里只需 --.-S
+        return $"[--:--:--] {f.task.angel:000.0} {f.task.distance:00.00} T:-{cd}";
     }
 
     private static void DrawDivider(float x, float y, float w)
     {
         var oldColor = GUI.color;
         GUI.color = ClrDiv;
-        GUI.Label(new Rect(x, y, w, 1f), "");
+        GUI.Label(new Rect(x, y, w, 22f), new string('-', 60)); // 等宽横分割线, 按用户排版 60 字符
         GUI.color = oldColor;
     }
 

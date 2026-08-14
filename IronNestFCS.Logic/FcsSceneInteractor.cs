@@ -135,6 +135,14 @@ public class FcsSceneInteractor {
     public void TaskFinished(ArtilleryTask task) {
     }
 
+    /// <summary>[临时调试] 把地图实体菱形框注册为点击目标: 点击直接按实体当前位置入队.</summary>
+    public void RegisterEntityClickTargets(IReadOnlyList<(Collider collider, Transform entity)> targets) {
+        foreach (var (collider, entity) in targets) {
+            var e = entity; // 闭包捕获
+            clicks.Register(collider, () => fcs.ToggleEntityTask(e, selectedBulletType), right: true); // 右键: 入队/取消
+        }
+    }
+
     /// <summary>键盘快捷键触发射击目标(对应小键盘 1-4), 等价于点击 T1-T4 按钮.</summary>
     public void FireTarget(int targetId) {
         if (!targetButtons.TryGetValue(targetId, out var button)) return;

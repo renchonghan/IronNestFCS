@@ -21,6 +21,12 @@ public enum Progress {
     Failed,
 }
 
+/// <summary>完成队列条目: 击发时刻的快照, T:- 为该发的实时剩余飞行时间 (impactTime 在 task 上锁存).</summary>
+public class FinishedTask {
+    public ArtilleryTask task = null!;
+    public float fireTime; // Time.time 击发时刻
+}
+
 public class ArtilleryTask {
     public int targetId;
     public float angel;
@@ -29,6 +35,8 @@ public class ArtilleryTask {
     public BulletType bulletType;
     /// <summary>火控解总飞行时间: WaitForFire 击发前从炮兵计时器拷贝, 未拷贝时为 0.</summary>
     public float impactTime;
+    /// <summary>击发时刻 (Time.time), 0 = 未击发. 地图菱形框下方的落点计时器用.</summary>
+    public float fireTime;
     /// <summary>弹道计算器真实输出的仰角, 解算后快照 (计算器全局唯一, 必须按任务快照).</summary>
     public float calculatedElevation;
     /// <summary>本轮实际用于计算的装药量 (实装足量按实装, 否则按需求, 退弹轮为已装或 1).</summary>

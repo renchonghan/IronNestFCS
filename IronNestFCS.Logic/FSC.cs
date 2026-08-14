@@ -56,6 +56,16 @@ public class FSC
     public int PendingCount => _taskQueue.Count;
     public Queue<ArtilleryTask> QueueCan => new Queue<ArtilleryTask>(_taskQueue);
 
+    // 完成队列: 击发时刻入列, 最多显示 8 条, 溢出计数
+    private readonly List<FinishedTask> _finished = new();
+    private int _finishedOverflow;
+
+    public int FinishedCount => _finished.Count;
+    public bool FinishedOverflow => _finishedOverflow > 0;
+    public int FinishedOverflowCount => _finishedOverflow;
+    public bool PendingOverflow => _taskQueue.Count > 8;
+    public IReadOnlyList<FinishedTask> FinishedQueue => _finished;
+
     /// <summary>
     /// 控制台互斥锁: 保护弹道计算器, 确认开关台, 采购台这三组全局唯一的"短操作"硬件
     /// 临界区都很短(解算 / 确认弹 / 击发前的确认+击发), 用完即放
@@ -109,6 +119,12 @@ public class FSC
             _runningCoroutines.Add((MelonCoroutines.Start(ReplenishPowderLoop()), LeftRight.Left));
             // 铁巢棋子自动吸附游戏网格位置 (四角校准映射), 摆错棋子不再导致火控打飞
             _runningCoroutines.Add((MelonCoroutines.Start(SyncIronNestLoop()), LeftRight.Left));
+            // MapTable.SpawnTestMarker(new Vector2(2.85f, 8.95f), Color.green); // [临时调试] 沙盘直接放置元素验证, 备用
+            // MapTable.SpawnArrow(new Vector2(10f, 5f), Color.yellow);         // [临时调试] 铁巢→地图中心测试箭头, 备用
+            MapTable.SpawnEntityDiamonds();                                   // 地图实体菱形框: 敌对红/友军蓝
+            MapTable.SpawnAimMarks();                                         // 左右炮瞄准指示: 十字/X
+            MapTable.SpawnTargetLines();                                      // 铁巢→当前目标虚线
+            _sceneInteractor.RegisterEntityClickTargets(MapTable.EntityClickTargets); // 右键菱形框入队/取消
         }
         // _runningCoroutines.Add(MelonCoroutines.Start(ExposeAllEntities()));
 
@@ -193,11 +209,57 @@ public class FSC
     /// 必须在 TryBind 成功后启动并登记进 _runningCoroutines; Dispose 时随其它协程一起 Stop
     /// 迭代器被 Stop 时 Dispose 会执行 finally, 锁不会泄漏
     /// </summary>
+    /// <summary>右键菱形: 未入队 → 入队并亮标记; 已在队列 → 出队并清标记; 在炮上 → 忽略.</summary>
+    public void ToggleEntityTask(Transform entity, BulletType bullet)
+    {
+        var existing = MapTable.TaskOfEntity(entity);
+        if (existing == null) {
+            var task = MapTable.TaskFromEntity(entity);
+            if (task == null) return;
+            task.bulletType = bullet;
+            EnqueueTask(task);
+            return;
+        }
+        if (_taskQueue.Contains(existing)) {
+            var arr = _taskQueue.ToList();
+            _taskQueue.Clear();
+            foreach (var t in arr) {
+                if (t != existing) _taskQueue.Enqueue(t);
+            }
+            MapTable.ClearEntityMark(entity);
+        }
+        // 在炮上: 不打断击发流程, 忽略
+    }
+
+    /// <summary>刷新点选目标的队列位置标签: 在炮上 = L/R, 在队列 = 1..n, 已完成 = 回单菱形.</summary>
+    private void UpdateTaskedMarks()
+    {
+        foreach (var task in MapTable.TaskedTasks) {
+            string? slot = null;
+            if (task == LeftTask) slot = "L";
+            else if (task == RightTask) slot = "R";
+            else {
+                var queue = QueueCan.ToList();
+                int idx = queue.IndexOf(task);
+                if (idx >= 0) slot = (idx + 1).ToString();
+            }
+            MapTable.UpdateTaskMark(task, slot);
+        }
+    }
+
     /// <summary>铁巢棋子以 10fps (0.1s) 吸附到真实炮塔位置.</summary>
     private IEnumerator SyncIronNestLoop() {
+        int tick = 0;
         while (true) {
             yield return new WaitForSeconds(0.1f);
             MapTable.SyncIronNestToken();
+            // MapTable.UpdateArrowToNest(); // [临时调试] 测试箭头已停用, 备用
+            UpdateTaskedMarks();          // 10fps 刷新点选目标的队列位置标签
+            MapTable.UpdateAimMarks(LeftGun.CanFire(), RightGun.CanFire()); // 瞄准十字/X 实时跟落点
+            MapTable.UpdateTargetLines(LeftTask, RightTask);                  // 铁巢→当前目标虚线
+            if (++tick % 10 == 0) {
+                MapTable.UpdateEntityMarks(); // 每秒隐藏已消灭目标的菱形框
+            }
             // [临时调试] 计时表状态探针, 已确认 EAIM 读活变量 PredictedImpactTime, 备用:
             // LeftGun.DebugTimerLine(); RightGun.DebugTimerLine();
         }
@@ -633,6 +695,15 @@ public class FSC
         finally {
             // 炮塔方向角独占到实射这一发打出去为止; 退弹轮继续持有给下一轮
             if (!isDump) ReleaseTurretOnce(turret);
+        }
+        if (!isDump) task.fireTime = Time.time; // 击发时刻: 地图落点计时器用 (退弹平射不算)
+        if (!isDump) {
+            // 击发确认: 完成队列入列 (退弹轮不算完成任务), 最多 8 条, 溢出计数
+            _finished.Add(new FinishedTask { task = task, fireTime = Time.time });
+            if (_finished.Count > 8) {
+                _finished.RemoveAt(0);
+                _finishedOverflow++;
+            }
         }
     }
 

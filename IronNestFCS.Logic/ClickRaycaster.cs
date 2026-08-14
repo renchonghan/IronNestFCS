@@ -17,20 +17,24 @@ namespace IronNestFCS.Logic;
 /// </summary>
 public class ClickRaycaster
 {
-    private readonly List<(Collider collider, System.Action onClick)> targets = new();
+    private readonly List<(Collider collider, System.Action onClick, bool right)> targets = new();
 
-    /// <summary>注册一个可点击 Collider 及其点击回调。</summary>
-    public void Register(Collider collider, System.Action onClick)
+    /// <summary>注册一个可点击 Collider 及其点击回调 (right=true 响应右键).</summary>
+    public void Register(Collider collider, System.Action onClick, bool right = false)
     {
         if (collider != null)
-            targets.Add((collider, onClick));
+            targets.Add((collider, onClick, right));
     }
 
-    /// <summary>每帧调用。检测左键点击并派发。</summary>
+    /// <summary>每帧调用。检测左/右键点击并派发。</summary>
     public void Update()
     {
         var mouse = Mouse.current;
-        if (mouse == null || !mouse.leftButton.wasPressedThisFrame)
+        if (mouse == null)
+            return;
+        bool left = mouse.leftButton.wasPressedThisFrame;
+        bool right = mouse.rightButton.wasPressedThisFrame;
+        if (!left && !right)
             return;
 
         var cam = Camera.main;
@@ -43,8 +47,9 @@ public class ClickRaycaster
             return;
 
         var hitCollider = hit.collider;
-        foreach (var (collider, onClick) in targets) {
+        foreach (var (collider, onClick, isRight) in targets) {
             if (collider == null || !collider.Equals(hitCollider)) continue;
+            if (isRight != right) continue;
             try { onClick?.Invoke(); }
             catch (Exception ex) { MelonLogger.Error($"[Click] Callback exception: {ex}"); }
             break;

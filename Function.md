@@ -88,18 +88,19 @@ Numpad 7/8/9 触发: 停该炮管全部协程 -> 强制释放两把锁 -> 清空
 | 代号 | 名称 | 含义 |
 | --- | --- | --- |
 | 1-0 | PEND | 任务等待调度 (在队列里) |
-| 1-1 | CALL | 弹道解算 (含补购药包/弹种) |
+| 1-1 | CALL | 状态检查枢纽 + 补购药包/弹种 (不解算, 整个任务只解算一次) |
 | 1-2 | SELC | 选弹: 转弹仓到目标弹种 |
 | 1-3 | DUMP | 退弹平射 (弹种错 / 实装不足) |
 | 2-1 | BLRD | 按推弹按钮, 确认架上有弹 (一闪而过) |
 | 2-2 | BLLD | 推弹中 (等装填状态机离开 ShellRamming) |
-| 2-3 | PWDR | 拉药包杆 (锁内重算后拉) |
-| 2-4 | LOAD | 推药 + 等装填完成 (CanFire) |
-| 2-5 | COFM | 击发前最后装药确认 (实装 vs 快照, 不一致按实装重算) |
-| 3-1 | EAIM | 升仰角 (SetElevation 循环, 无进展检测) |
+| 2-3 | PWDR | 解算 + 按差补拉药包杆 + 推药 (锁内, 唯一解算点之一) |
+| 2-4 | LOAD | 等装填完成 (CanFire) |
+| 2-5 | COFM | 击发前装药确认 (实装 vs 快照, 差异回 CALL) |
+| 3-1 | EAIM | 升仰角 (SetElevation 循环, 无进展检测); 跳过装填路径在此前解算 |
 | 3-2 | HAIM | 等炮塔水平到位 |
-| 3-3 | WAIT | 五步确认 + Arm + 击发 + WaitFire |
-| 3-4 | RSET | 回位 (13s 最小恢复 + 机构空闲) |
+| 3-3 | WAIT | 五步确认 + Arm + 待击发 |
+| 3-4 | FIRE | 击发瞬间 (AutoFire 秒过) |
+| 3-5 | RSET | 回位 (13s 最小恢复 + 机构空闲) |
 | 0-0 | IDLE / FAIL | 空闲 / 失败 |
 
 ### 5.2 弹种保护状态机 (最多两轮)
@@ -107,10 +108,11 @@ Numpad 7/8/9 触发: 停该炮管全部协程 -> 强制释放两把锁 -> 清空
 现场三要素: **膛内弹种** (ChamberedShellBlueprint) / **实装药包数** (PowderCharges) / **需求量** (Max Charge 开启为 6, 否则 MinimumCharge 按距离查表).
 
 - shellWrong = 膛内有弹且弹种 != 任务弹种
-- powderLacking = 弹种正确但实装 > 0 且 < 需求量
-- isDump = shellWrong || powderLacking → 本轮退弹 (平射打掉错误状态)
+- 有弹正确 + CANFIRE 且实装 < 需求 → 退弹 (平射打掉错误状态)
 - 本轮装药量: 退弹轮 = 已装 (没装补 1); 实射轮 = 实装 >= 需求按实装, 否则按需求
 - 第一轮退弹, 等 2s 机构自动循环, 第二轮重装正确弹实射; 两轮未完 → Failed
+- **CALL 计数器**: 每个任务最多 2 次完整检查, 第 3 次跳过检查直接按实际装药实射 (保证终止)
+- **检查点鲁棒性**: 推弹机动作中 (ShellRamming) 膛内读数不可信, 等推完再决策 (不消耗 CALL 预算)
 
 ### 5.3 每轮详细流程
 
@@ -151,26 +153,29 @@ LOAD > COFM
 ```
 
 1. **炮塔预约** (任务开始即启动): 后台协程抢炮塔锁并转向目标方向, 与整个装填段重叠; 方向角独占到实射完成
-2. **读现场** → 判定 dump/实射 → 定本轮装药量 powderCount
-3. **临界区 1 解算** (持 deskLock, 1-1 CALL): 设距离 → 设方向 → 设装药 → 设弹种 → Calculate → 读仰角 → 快照 (task.calculatedElevation / task.charge, 面板行 2 数据源); 药包不足循环补购 (上限 10 次); 弹仓缺目标弹种则采购并等 3s 入仓 (弹仓全满无空位 → Failed)
-4. **锁外装填** (按现场分支):
-   - 退弹轮且无实装: 锁内重算(1) + 拉 1 根杆 + 推药 + 等 CanFire
-   - 空膛: 先等残留实装计数清零 (10s) → 1-2 SELC 转弹仓 → 2-1 BLRD 按推弹按钮 + 等推弹机启动 → 2-2 BLLD 等推到位 (离开 ShellRamming 或膛内出现炮弹, 30s 兜底) → 2-3 PWDR 拉杆 + 推药 → 2-4 LOAD 等 CanFire
-   - 弹已在膛且无实装: 直接 2-3 PWDR → 2-4 LOAD
-   - 实装 >= 需求: 全部跳过, 直接进入 COFM
-   - **LoadPowderWithDialLock**: 游戏只在按 Calculate 那一刻存储"已计算装药数", 药包杆最多允许拉到这个数; 弹道计算器全局唯一, 另一炮的解算会改写存储值 → 拉杆前必须锁内完整重算 (距离/方向/装药/弹种 + Calculate), 否则拉杆按钮被游戏锁死
-5. **2-5 COFM 击发前装药确认**: 对比实际实装 vs task.charge 快照; 一致直接过; 不一致锁内按实际实装完整重算并更新仰角/快照 (弹道正确性: 实装 ≠ 计划时按实装打)
-6. **3-1 EAIM 升仰角** (退弹轮平射跳过): SetElevation 循环, 10s 无进展放弃
-7. **3-2 HAIM**: 等炮塔水平到位 (turret.Ready)
-8. **3-3 WAIT 击发**: 五步确认 (任务/弹种/旋转/仰角/准备) → Arm → 拷贝炮兵计时表读数 (task.impactTime, 行 2 总飞行时间) → AutoFire 则 Fire → WaitFire (等 pendingReload). 游戏击发校验的是**实时状态** (实际仰角/膛内弹种/飞行时间/装填完成), 不读计算台
-9. **非退弹轮**: 3-4 RSET 回位 (13s + 机构空闲) → Finished → 释放槽位拉下一单; finally 归还炮塔锁. **退弹轮**: 不归还炮塔, 等 2s 进入下一轮
-10. **两轮未完 (兜底)**: 归还炮塔 → Failed → 释放槽位
+2. **CALL 枢纽**: 读现场 → 判定分支 (dump/selc/pwdr/aim) → 定本轮装药量 powderCount; 第 3 次 CALL 跳过检查强制实射
+3. **临界区 1 补购** (持 deskLock, 1-1 CALL): 药包不足循环补购 (上限 10 次). 解算不在这里 — **整个任务只解算一次**
+4. **弹仓缺目标弹种则采购** (1-2 SELC 分支内, 持 deskLock): 弹仓全满无空位 → Failed; 采购后等 3s 入仓
+5. **分支执行**:
+   - 退弹轮 (1-3 DUMP): CANFIRE 直接平射; 无弹回 CALL; 有弹保证至少一药 → 装填 → 平射
+   - 空膛 (1-2 SELC): 先等残留实装计数清零 (10s) → 转弹仓 → 2-1 BLRD 按推弹按钮 + 等推弹机启动 → 2-2 BLLD 等推到位 (离开 ShellRamming 或膛内出现炮弹, 30s 兜底) → 2-3 PWDR
+   - 弹已在膛且无实装: 直接 2-3 PWDR
+   - 实装 >= 需求: 跳过装填, 解算放 3-1 EAIM 前 (锁内)
+   - **2-3 PWDR 唯一解算点**: 游戏只在按 Calculate 那一刻存储"已计算装药数", 药包杆最多允许拉到这个数; 弹道计算器全局唯一, 另一炮的解算会改写存储值 → 锁内完整重算 (距离/方向/装药/弹种 + Calculate) 后按差补拉 (实拉不足补拉差 / 超出回 CALL 带条件 / 符合或超时直接推药) → 2-4 LOAD 等 CanFire
+6. **2-5 COFM 击发前装药确认**: 对比实际实装 vs task.charge 快照; 一致直接过; 差异回 CALL (不本地重算)
+7. **3-1 EAIM 升仰角** (退弹轮平射跳过): SetElevation 循环, 10s 无进展放弃; **仰角就位后锁存总飞行时间** (task.impactTime = 活变量 PredictedImpactTime)
+8. **3-2 HAIM**: 等炮塔水平到位 (turret.Ready)
+9. **3-3/3-4 击发**: 五步确认 (任务/弹种/旋转/仰角/准备) → Arm → 3-4 FIRE (AutoFire 秒过) → WaitFire (等 pendingReload). 游戏击发校验的是**实时状态** (实际仰角/膛内弹种/飞行时间/装填完成), 不读计算台; impactTime 未锁存时在 Arm 后兜底拷贝
+10. **非退弹轮**: 3-5 RSET 回位 (13s + 机构空闲) → Finished → 释放槽位拉下一单; finally 归还炮塔锁. **退弹轮**: 不归还炮塔, 等 2s 进入下一轮
+11. **两轮未完 (兜底)**: 归还炮塔 → Failed → 释放槽位
 
 ### 5.4 相关机制
 
 - **WaitAndClick**: 所有按钮点击带 9s 超时, 超时打日志跳过 (按钮不激活时不再无限挂)
 - **进度超时监视器**: 卡状态 20s 自动重置; EAIM / HAIM / RSET / 手动击发等待豁免
-- **面板两行**: 行 1 = 炮实际状态 (膛内弹种 / 实际仰角 / 实际方位角 / 实装药包 / 炮兵计时表倒计时 GunStopwatch); 行 2 = 火控解快照 (RQTA 占位 / 目标方位距离 / 弹种 / 解算仰角 / 装药 / 击发前拷贝的总飞行时间)
+- **面板两行**: 行 1 = 炮实际状态 (膛内弹种 / 实际仰角 / 实际方位角 / 实装药包 / FT 飞行时间); 行 2 = 火控解快照 (RQTA 占位 / 目标方位距离 / 弹种 / 解算仰角 / 装药 / T:- 目标倒计时)
+- **飞行时间两个变量**: 活变量 `GunController.PredictedImpactTime` 抬炮实时更新 (行 1 瞄准期 FT 数据源, 仰角就位时锁存进 task.impactTime); 击发后游戏炮兵计时表 (GunStopwatch) 倒数, `previousCountingDownRemainingSeconds` 是剩余秒数 (行 2 T:- 数据源)
+- **铁巢棋子自动吸附** (SyncIronNestLoop, 10fps): 真源 = `turretController.turretBase.localPosition` (MapRoot 网格空间, 归位/紧急转移由游戏更新); 经沙盘校准常数映射到棋子局部系 (格长 = 1/3.8164, 左下角经平射真值+目测校准), 棋子摆错不再导致火控打飞
 
 ## 6. 硬件抽象层 (FCS/ 目录)
 
@@ -181,18 +186,22 @@ LOAD > COFM
 - FcsCalc (在 TacticalRadar.cs 内) 提供面板预览用: Elevation(distance)/Charge(distance) 分段线性拟合
 
 ### 6.2 GunSystem - 单管炮抽象
-- 绑定: 弹仓选择器, 转弹仓按钮, 推弹按钮, 装药按钮组 (PowderChargeController 下 Button Dispencer), 推药杆, GunController, 仰角杆, 装药余量表, Shell ID 显示器
-- LoadBullet: 等机构空闲 (WaitForReloadReady) -> 转弹仓到目标弹 (每步 1.5s) -> 再等机构空闲 -> 推弹
-- LoadPowder: 按次数点装药按钮 -> 推药杆; 按钮引用失效时自动重新扫描 (RefreshPowderButtons)
+- 绑定: 弹仓选择器, 转弹仓按钮, 推弹按钮, 装药按钮组 (PowderChargeController 下 Button Dispencer), 推药杆, GunController, 仰角杆, 装药余量表, 实拉药包数里程表 (递归查找), Shell ID 显示器, GunStopwatch 炮兵计时表 (watchedGun 匹配)
+- RotateCylinderTo: 等机构空闲 -> 转弹仓到目标弹 (每步 1.5s); PressRammer: 等机构空闲 -> 按推弹按钮; WaitRammingStart: 等装填状态机进入 ShellRamming; WaitShellRammed: 等离开 ShellRamming 或膛内出现炮弹 (30s 兜底)
+- PullPowders: 按次数点装药按钮; RamPowder: 按推药杆; 按钮引用失效时自动重新扫描 (RefreshPowderButtons)
+- SelectedPowderCharges: 实拉药包杆数 (Selected Charges 里程表, P3 就可见; 里程表挂在 Calculated Charge Display (1) 下, 不在装填控制台里)
+- IsShellRamming: 装填状态机是否在推弹 (检查点用)
 - SetElevation: 循环设仰角杆值直到到位, 带无进展检测 (连续 10s 变化 < 0.2° 判定卡死, 放弃本次瞄准)
 - WaitForReloadReady: 正式版装填状态索引是数据驱动的, 只依据真实机构状态判断 (reloadController.working / ExternalReloadLoweringLocked / elevationChangeVelocity)
 - WaitBackToIdle: 13s 最小恢复窗口 + 机构真正结束工作
+- 计时表读数: RemainingFlightSeconds (瞄准期 = 活 PredictedImpactTime, 倒计时 = 表读数), CountdownRemainingSeconds (纯倒计时)
 - 弹种名归一: 游戏侧 PLCM 统一 Replace 为 PCLM
 - GetState: 炮管状态快照 (膛内弹/CanFire/PendingReload/仰角速度/装药余量/弹仓列表)
 
 ### 6.3 MapTable - 地图桌
-- 绑定: Player Turret Piece, Draggable Surface, MapToken_Artillery 标记 (1~4), Fire Mission Root
-- GetMarkTarget: 标记位置 - 炮塔位置 (世界坐标统一转地图局部系, 铁巢紧急转移后依然正确) -> 距离 (x3.8164f 比例) + 方向角
+- 绑定: Player Turret Piece (铁巢棋子), Draggable Surface, MapToken_Artillery 标记 (1~4), Fire Mission Root, ImpactMarkerManager
+- GetMarkTarget: 标记位置 - 铁巢棋子位置 (同在地图局部系) -> 距离 (x3.8164f 比例) + 方向角
+- SyncIronNestToken: 铁巢棋子吸附到游戏真值 (turretController.turretBase.localPosition 经沙盘校准常数映射); 沙盘校准 = 格长 1/3.8164 + 左下角 (平射真值+目测校准)
 - SetMarkerWorldPos/SetMarkerByKmPos/SetMarkerLocalPos/ResetMarker: 四种标记设置方式 (雷达标点用)
 - GetAllFireMissionEntities: 枚举 Fire Mission Root 下全部实体
 

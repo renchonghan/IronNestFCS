@@ -303,7 +303,7 @@ public class TacticalRadar
         return brief;
     }
 
-    private static bool IsUnitAlive(EntityLocation loc, GameObject go)
+    internal static bool IsUnitAlive(EntityLocation loc, GameObject go)
     {
         if (!go.activeInHierarchy) return false;
 
@@ -370,7 +370,7 @@ public class TacticalRadar
         return go.activeSelf;
     }
 
-    private static bool IsHostile(EntityLocation loc, Transform t)
+    internal static bool IsHostile(EntityLocation loc, Transform t)
     {
         var name = t.name;
         const int RoleAlly = 2;

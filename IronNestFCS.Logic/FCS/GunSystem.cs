@@ -102,6 +102,7 @@ public class GunSystem {
         elevationLever = GameObject.Find(".Elevation Lever Baseplate")?.transform.FindChild(".Elevation Lever " + surfix).GetComponent<LinearSliderInteractable>();
         // ProbeTacticalMap();     // [临时调试] 绘图台元素, 已提取完所需信息 (无 LineRenderer, 纯色 Image 可画), 备用
         // ProbeNestVariable();    // [临时调试] 已确认真源 = turretController.turretBase.localPosition, 备用
+        // ProbeDrawnArrows();     // [临时调试] 已确认箭头 = MapMarkerLineUI + Il2CppShapes.Line, 备用
         // DebugDumpReloadState(); // [临时调试] 已定位完 4 相位灯/实装药包指示器/装填状态机, 备用
         // ProbeFlightTimer();     // [临时调试] 已找到读数源: GunStopwatch.previousCountingDownRemainingSeconds. 备用
         // ProbeArtilleryTimer();  // [临时调试] 已确认: 炮兵计时器就是 GunController.PredictedImpactTime, 实时倒数. 备用
@@ -172,6 +173,7 @@ public class GunSystem {
 
     /// <summary>拿组件被基类封箱前的真实 Il2Cpp 类型名 (GetIl2CppType 读原生类指针).</summary>
     private static string TrueTypeName(Component c) {
+        if (c == null) return "<null>"; // 销毁中的物体可能枚举出 null 组件
         try {
             var il2 = c.GetIl2CppType();
             return il2?.Name ?? c.GetType().Name;
@@ -384,6 +386,32 @@ public class GunSystem {
 
     public bool CanFire() {
         return gunController != null && gunController.CanFire;
+    }
+
+    /// <summary>[临时调试] 扫玩家用游戏工具画的箭头 (名字含 arrow/draw/stroke/mark 或有 LineRenderer), 看其结构与材质实现.</summary>
+    private static bool _arrowProbeRan = false;
+    private static void ProbeDrawnArrows() {
+        if (_arrowProbeRan) return;
+        _arrowProbeRan = true;
+        MelonLogger.Msg("[FCS_DEBUG] ===== drawn arrows probe =====");
+        foreach (var go in Resources.FindObjectsOfTypeAll<GameObject>()) {
+            if (go == null || go.name == null) continue;
+            string l = go.name.ToLower();
+            bool nameHit = l.Contains("arrow") || l.Contains("draw") || l.Contains("stroke") || l.Contains("mark");
+            var comps = new List<string>();
+            foreach (var c in go.GetComponents<Component>()) {
+                if (c == null || c is Transform) continue;
+                string tn = TrueTypeName(c);
+                try { var ml = c.Cast<MapMarkerLineUI>(); MelonLogger.Msg($"[FCS_DEBUG] ARROW? {HierarchyPath(go.transform)} [{tn}]"); DumpFields(ml, $"{go.name}.{tn}"); DumpFields(ml.line, $"{go.name}.Line"); if (ml.disc != null) DumpFields(ml.disc, $"{go.name}.Disc"); continue; } catch { }
+                try { var lr = c.Cast<LineRenderer>(); comps.Add($"LineRenderer(pos={lr.positionCount},mat={lr.material?.name},color={lr.startColor})"); continue; } catch { }
+                try { var r = c.Cast<Renderer>(); comps.Add($"Renderer(mat={r.material?.name},color={r.material?.color})"); continue; } catch { }
+                comps.Add(tn);
+            }
+            bool typeHit = comps.Any(s => s.Contains("LineRenderer"));
+            if (!nameHit && !typeHit) continue;
+            MelonLogger.Msg($"[FCS_DEBUG] ARROW? {HierarchyPath(go.transform)} [{string.Join(", ", comps)}]");
+        }
+        MelonLogger.Msg("[FCS_DEBUG] ===== end drawn arrows probe =====");
     }
 
     /// <summary>
@@ -811,6 +839,12 @@ public class GunSystem {
     /// 游戏炮兵计时表读数: 倒计时中返回剩余秒数; 未倒计时但膛内有弹 (瞄准阶段)
     /// 返回表针当前的预计飞行时间; 膛空/落地后返回 NaN (面板显示横线).
     /// </summary>
+    /// <summary>纯倒计时剩余秒数 (仅 CountingDown 状态, 否则 NaN). 行 2 T:- 的数据源.</summary>
+    public float CountdownRemainingSeconds() {
+        if (_stopwatch == null || _stopwatch.state != "CountingDown") return float.NaN;
+        return _stopwatch.previousCountingDownRemainingSeconds;
+    }
+
     public float RemainingFlightSeconds() {
         if (_stopwatch == null) return float.NaN;
         if (_stopwatch.state == "CountingDown") return _stopwatch.previousCountingDownRemainingSeconds;

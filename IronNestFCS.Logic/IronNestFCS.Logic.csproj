@@ -88,6 +88,10 @@
             <HintPath>$(GameDir)\MelonLoader\Il2CppAssemblies\UnityEngine.ImageConversionModule.dll</HintPath>
             <Private>false</Private>
         </Reference>
+        <Reference Include="Il2CppShapesRuntime">
+            <HintPath>$(GameDir)\MelonLoader\Il2CppAssemblies\Il2CppShapesRuntime.dll</HintPath>
+            <Private>false</Private>
+        </Reference>
     </ItemGroup>
 
 </Project>
