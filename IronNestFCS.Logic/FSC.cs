@@ -107,6 +107,8 @@ public class FSC
         if (IsBound) {
             // 常驻药包自动补充协程: 仅保证装药余量充足, 不改动任务流程
             _runningCoroutines.Add((MelonCoroutines.Start(ReplenishPowderLoop()), LeftRight.Left));
+            // 铁巢棋子自动吸附游戏网格位置 (四角校准映射), 摆错棋子不再导致火控打飞
+            _runningCoroutines.Add((MelonCoroutines.Start(SyncIronNestLoop()), LeftRight.Left));
         }
         // _runningCoroutines.Add(MelonCoroutines.Start(ExposeAllEntities()));
 
@@ -191,6 +193,16 @@ public class FSC
     /// 必须在 TryBind 成功后启动并登记进 _runningCoroutines; Dispose 时随其它协程一起 Stop
     /// 迭代器被 Stop 时 Dispose 会执行 finally, 锁不会泄漏
     /// </summary>
+    /// <summary>铁巢棋子以 10fps (0.1s) 吸附到真实炮塔位置.</summary>
+    private IEnumerator SyncIronNestLoop() {
+        while (true) {
+            yield return new WaitForSeconds(0.1f);
+            MapTable.SyncIronNestToken();
+            // [临时调试] 计时表状态探针, 已确认 EAIM 读活变量 PredictedImpactTime, 备用:
+            // LeftGun.DebugTimerLine(); RightGun.DebugTimerLine();
+        }
+    }
+
     private IEnumerator ReplenishPowderLoop() {
         while (true) {
             yield return new WaitForSeconds(PowderCheckInterval);
@@ -415,20 +427,10 @@ public class FSC
 
                 MelonLogger.Msg($"[FCS] {leftRight}: CALL x{callCount} round {round}: path={path}, chambered={chambered}, loaded={loaded}, selected={selected}, need={need}, powderCount={powderCount}");
 
-                // ===== 临界区 1: 解算 (CALL 的一部分, 无论如何都要算仰角) =====
-                // 弹道计算器 / 确认台 / 采购台都是全局唯一硬件, 必须串行. 算完仰角即放
-                // 让另一管炮能立刻进来算它自己的弹道, 与本管炮接下来的长装填段重叠
+                // ===== 临界区 1: 补购 (解算不在这里, 整个任务只解算一次, 见加载/瞄准路径) =====
+                // 采购台是全局唯一硬件, 必须串行. 买完即放
                 yield return _deskLock.Acquire();
                 try {
-                    yield return BallisticCalculator.SetDistance(task.distance);
-                    yield return BallisticCalculator.SetDirection(task.angel);
-                    yield return BallisticCalculator.SetCharge(powderCount);
-                    yield return BallisticCalculator.SetShellType(task.bulletType);
-                    yield return BallisticCalculator.Calculate();
-                    elevation = BallisticCalculator.GetElevation();
-                    task.calculatedElevation = elevation; // 快照真实解算仰角, 面板行 2 用
-                    task.charge = powderCount;            // 快照本轮装药量
-
                     // 装药不足则补购. 单次采购未必补满(且偶发点击早于卡牌入槽而失败)
                     // 故循环购买直到够本次发射所需, 避免"装药不足但非 0"时直接推进, 卡住后续装填
                     // 加购买次数上限兜底: 采购始终无效时不至于无限循环(每次约 2.5s)
@@ -539,6 +541,7 @@ public class FSC
                         }
                         // 不够补拉差, 符合/超时也走推药
                         yield return LoadPowderWithDialLock(task, gunSys, powderCount, powderCount - selectedNow);
+                        elevation = task.calculatedElevation; // 本任务唯一解算在锁内已完成, 取快照供 EAIM 用
                         // 2-4 LOAD: 推药 + 等装填完成
                         task.progress = Progress.WaitLoading;
                         MarkProgress(leftRight, Progress.WaitLoading);
@@ -553,6 +556,24 @@ public class FSC
                         if (finalCharge != task.charge) {
                             MelonLogger.Msg($"[FCS] {leftRight}: COFM mismatch {finalCharge}!={task.charge}, back to CALL");
                             continue; // 差异 → CALL
+                        }
+                    }
+
+                    if (path == "aim") {
+                        // 实装足量跳过装填: 本任务的唯一一次解算放在这里 (锁内, 算完即放)
+                        yield return _deskLock.Acquire();
+                        try {
+                            yield return BallisticCalculator.SetDistance(task.distance);
+                            yield return BallisticCalculator.SetDirection(task.angel);
+                            yield return BallisticCalculator.SetCharge(powderCount);
+                            yield return BallisticCalculator.SetShellType(task.bulletType);
+                            yield return BallisticCalculator.Calculate();
+                            elevation = BallisticCalculator.GetElevation();
+                            task.calculatedElevation = elevation;
+                            task.charge = powderCount;
+                        }
+                        finally {
+                            _deskLock.Release();
                         }
                     }
 

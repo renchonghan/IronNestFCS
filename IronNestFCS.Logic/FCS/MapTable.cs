@@ -6,7 +6,14 @@ namespace IronNestFCS.Logic.FCS;
 
 public class MapTable {
     private Transform? turret;
+    private ImpactMarkerManager? impactManager; // 铁巢网格位置真源: 它把真实炮塔世界坐标投到地图网格
     private Dictionary<int, Transform> artilleries;
+
+    // 沙盘校准: 网格 A-T × 1-10 映射到棋子局部系
+    // 格长用代码原有比例 1/3.8164 (1 棋盘单位 = 3.8164 km); 左下角用 1 药平射真实落点解出:
+    // 目标 (-1.88,0.97) = 左下角 + 网格 (2.85,8.95) × 格长
+    private static readonly Vector2 MapBottomLeft = new(-2.6238f, -1.3741f); // 网格原点 (A1) 在棋子空间的位置 (含目测修正: 右 0.1 小格 / 上 1/20 小格)
+    private static readonly float MapCellSize = 1f / 3.8164f;                 // 每大格的棋子空间尺寸
     private Transform? fireMissionRoot;
     private FireMission? fireMission;
     private Transform? mapSurface;
@@ -30,6 +37,7 @@ public class MapTable {
 
         turret = turretObject.transform;
         mapSurface = mapObject.transform;
+        impactManager = GameObject.Find("---ImpactMarkerManager")?.GetComponent<ImpactMarkerManager>();
         var map = mapObject.transform;
         for (var i = 0; i < map.childCount; ++i) {
             var t = map.GetChild(i);
@@ -49,6 +57,23 @@ public class MapTable {
         fireMissionRoot = fireMissionObject.transform;
         fireMission = fireMissionRoot.GetComponent<FireMission>();
         return fireMission != null;
+    }
+
+    /// <summary>
+    /// 把铁巢棋子吸附到游戏网格位置: 铁巢底座 RectTransform (turretBase) 就挂在
+    /// MapRoot 网格空间里, 它的 localPosition 就是铁巢当前网格坐标, 游戏自己维护
+    /// (归位/紧急转移都会更新). 再经四角校准常数映射到棋子局部系.
+    /// </summary>
+    public void SyncIronNestToken()
+    {
+        if (turret == null || impactManager == null || impactManager.turretController == null) return;
+        var tb = impactManager.turretController.turretBase;
+        if (tb == null) return;
+        var grid = tb.localPosition;
+        var local = new Vector3(MapBottomLeft.x + grid.x * MapCellSize,
+                                MapBottomLeft.y + grid.y * MapCellSize,
+                                turret.localPosition.z);
+        turret.localPosition = local;
     }
 
     /// <summary>把第 index 号地图标记放到世界坐标对应位置(雷达自动标点用)</summary>

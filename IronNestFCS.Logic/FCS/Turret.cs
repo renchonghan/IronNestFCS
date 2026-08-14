@@ -18,7 +18,7 @@ public class Turret {
             return false;
         }
         _turret = turretObj.GetComponent<TurretController>();
-        // GunSystem.DumpFields(_turret, "TurretController"); // [临时调试] 已确认字段: CurrentAngle(原始)/CurrentAngleCompass(罗盘), 备用
+        // GunSystem.DumpFields(_turret, "TurretController"); // [临时调试] 已确认无位置字段, 铁巢真源在 turretBase, 备用
         // 实际方位角: 优先 CurrentAngleCompass (与 task.angel 同号), 找不到再退回原始 CurrentAngle
         // 注意不能用同一个循环找两个名字: CurrentAngle 在元数据里排在前面会先被命中
         foreach (var p in _turret.GetType().GetProperties()) {

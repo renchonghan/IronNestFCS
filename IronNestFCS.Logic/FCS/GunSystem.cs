@@ -66,10 +66,8 @@ public class GunSystem {
         // 实拉药包杆数 (P3 就可见, PowderCharges 要到 P4 后才有值)
         // 该里程表挂在 "Calculated Charge Display (1)" (实际装药量表) 下, 不在装填控制台里
         // Transform.Find/FindChild 只查直接子级, 这里用递归查找
-        selectedCharges = FindChildDeep(gunSystem, "Odomiter Counter Selected Charges")
-            ?.GetComponent<OdometerDisplay>();
-        MelonLogger.Msg($"[FCS] GunSystem {surfix}: selectedCharges bound={selectedCharges != null}, " +
-                        $"value={selectedCharges?.CurrentNumber}"); // [临时调试] 验证绑定, 用完注释掉本行
+        selectedCharges = FindChildDeep(gunSystem, "Odomiter Counter Selected Charges")?.GetComponent<OdometerDisplay>();
+        MelonLogger.Msg($"[FCS] GunSystem {surfix}: selectedCharges bound={selectedCharges != null}, " + $"value={selectedCharges?.CurrentNumber}"); // 绑定失败时读数恒 0, 这条日志留着排查用
         
         nextBulletButton = 
             reloadingConsole.Find("Universal Button Move Cylinder")
@@ -102,7 +100,9 @@ public class GunSystem {
         reloadController = gunController?.artilleryReloadController;
         BindStopwatch();
         elevationLever = GameObject.Find(".Elevation Lever Baseplate")?.transform.FindChild(".Elevation Lever " + surfix).GetComponent<LinearSliderInteractable>();
-        DebugDumpReloadState(); // [临时调试] 定位 4 相位灯与实装药包指示器, 用完注释掉本行
+        // ProbeTacticalMap();     // [临时调试] 绘图台元素, 已提取完所需信息 (无 LineRenderer, 纯色 Image 可画), 备用
+        // ProbeNestVariable();    // [临时调试] 已确认真源 = turretController.turretBase.localPosition, 备用
+        // DebugDumpReloadState(); // [临时调试] 已定位完 4 相位灯/实装药包指示器/装填状态机, 备用
         // ProbeFlightTimer();     // [临时调试] 已找到读数源: GunStopwatch.previousCountingDownRemainingSeconds. 备用
         // ProbeArtilleryTimer();  // [临时调试] 已确认: 炮兵计时器就是 GunController.PredictedImpactTime, 实时倒数. 备用
         return true;
@@ -384,6 +384,146 @@ public class GunSystem {
 
     public bool CanFire() {
         return gunController != null && gunController.CanFire;
+    }
+
+    /// <summary>
+    /// [临时调试] 火控绘图台 (Tactical Map) 探针: dump 地图子树, 找可复用的线/箭头元素
+    /// (LineRenderer/Image/SpriteRenderer 等) 和层级约定, 为"地图上画箭头"做准备.
+    /// 用完注释掉 TryBind 末尾的调用即可, 方法保留备用.
+    /// </summary>
+    private static bool _mapProbeRan = false;
+
+    private static void ProbeTacticalMap() {
+        if (_mapProbeRan) return;
+        _mapProbeRan = true;
+        MelonLogger.Msg("[FCS_DEBUG] ===== tactical map probe =====");
+        var map = GameObject.Find("Tactical Map")?.transform;
+        if (map == null) {
+            MelonLogger.Msg("[FCS_DEBUG] MAP? Tactical Map not found");
+            return;
+        }
+        DumpMapSubtree(map, 0);
+        MelonLogger.Msg("[FCS_DEBUG] ===== end tactical map probe =====");
+    }
+
+    /// <summary>[临时调试] 全场景扫含"铁巢/Nest"的 TMP 文本, 找铁巢网格位置的权威源.</summary>
+    private static bool _nestProbeRan = false;
+    private static void ProbeNestPrompt() {
+        if (_nestProbeRan) return;
+        _nestProbeRan = true;
+        MelonLogger.Msg("[FCS_DEBUG] ===== nest prompt probe =====");
+        foreach (var tmp in Resources.FindObjectsOfTypeAll<TextMeshPro>()) {
+            if (tmp == null || tmp.text == null) continue;
+            if (tmp.text.Contains("铁巢") || tmp.text.Contains("Nest") || tmp.text.Contains("转移")) {
+                MelonLogger.Msg($"[FCS_DEBUG] NEST? TMP3D {HierarchyPath(tmp.transform)} text=\"{tmp.text.Replace("\n", " ")}\"");
+            }
+        }
+        foreach (var tmp in Resources.FindObjectsOfTypeAll<Il2CppTMPro.TMP_Text>()) {
+            if (tmp == null || tmp.text == null) continue;
+            if (tmp.text.Contains("铁巢") || tmp.text.Contains("Nest") || tmp.text.Contains("转移")) {
+                MelonLogger.Msg($"[FCS_DEBUG] NEST? TMPUI {HierarchyPath(tmp.transform)} text=\"{tmp.text.Replace("\n", " ")}\"");
+            }
+        }
+        MelonLogger.Msg("[FCS_DEBUG] ===== end nest prompt probe =====");
+    }
+
+    /// <summary>
+    /// [临时调试] 铁巢位置真源探针: dump ImpactMarkerManager / ImpactTracker / ImpactIndicator
+    /// 的托管字段 (落点标记在炮放平时停铁巢, 追踪器内部应有铁巢坐标真值).
+    /// </summary>
+    private static bool _nestVarProbeRan = false;
+    private static void ProbeNestVariable() {
+        if (_nestVarProbeRan) return;
+        _nestVarProbeRan = true;
+        MelonLogger.Msg("[FCS_DEBUG] ===== nest variable probe =====");
+        var managerGo = GameObject.Find("---ImpactMarkerManager");
+        if (managerGo == null) {
+            MelonLogger.Msg("[FCS_DEBUG] NESTVAR? ---ImpactMarkerManager not found");
+            return;
+        }
+        foreach (var c in managerGo.GetComponents<Component>()) {
+            if (c is Transform) continue;
+            string tn = TrueTypeName(c);
+            try {
+                var m = c.Cast<ImpactMarkerManager>();
+                MelonLogger.Msg($"[FCS_DEBUG] NESTVAR? {tn}");
+                DumpFields(m, tn);
+                MelonLogger.Msg($"[FCS_DEBUG] NESTVAR?   turretController.pos={m.turretController?.transform?.position}");
+                // MarkerData 列表逐个 dump: 铁巢/炮状态的每炮标记数据
+                var list = m.markerDataList;
+                if (list != null) {
+                    for (int i = 0; i < list.Count; i++) {
+                        try { DumpFields(list[i], $"MarkerData[{i}]"); }
+                        catch (Exception ex) { MelonLogger.Msg($"[FCS_DEBUG] NESTVAR?   MarkerData[{i}] dump err: {ex.Message}"); }
+                    }
+                }
+                continue;
+            } catch { }
+            try { var t = c.Cast<ImpactTracker>(); MelonLogger.Msg($"[FCS_DEBUG] NESTVAR? {tn}"); DumpFields(t, tn); continue; } catch { }
+        }
+        // 落点标记上的 ImpactIndicator 也 dump 一份
+        foreach (var markerName in new[] { "GunLeft_ImpactMarker", "GunRight_ImpactMarker", "MasterImpactMarker(Clone)" }) {
+            var mgo = GameObject.Find(markerName);
+            if (mgo == null) continue;
+            MelonLogger.Msg($"[FCS_DEBUG] NESTVAR? {HierarchyPath(mgo.transform)}");
+            foreach (var c in mgo.GetComponents<Component>()) {
+                if (c is Transform) continue;
+                string tn = TrueTypeName(c);
+                try { var ind = c.Cast<ImpactIndicator>(); MelonLogger.Msg($"[FCS_DEBUG] NESTVAR?   {tn}"); DumpFields(ind, tn); continue; } catch { }
+            }
+        }
+        MelonLogger.Msg("[FCS_DEBUG] ===== end nest variable probe =====");
+    }
+
+    private static void DumpMapSubtree(Transform t, int depth) {
+        if (depth > 8) return;
+        var go = t.gameObject;
+        var parts = new List<string>();
+        foreach (var c in go.GetComponents<Component>()) {
+            if (c is Transform) continue;
+            string tn = TrueTypeName(c);
+            try { var g = c.Cast<DraggableItemGridArea>(); parts.Add(tn); DumpFields(g, $"{go.name}.DraggableItemGridArea"); continue; } catch { }
+            try { var p = c.Cast<MapMarkerPlacer>(); parts.Add(tn); DumpFields(p, $"{go.name}.MapMarkerPlacer"); continue; } catch { }
+            try { var bc = c.Cast<BoxCollider>(); parts.Add($"BoxCollider(center={bc.center},size={bc.size})"); continue; } catch { }
+            try { var r = c.Cast<LineRenderer>(); parts.Add($"LineRenderer(pos={r.positionCount},on={r.enabled})"); continue; } catch { }
+            try { var img = c.Cast<UnityEngine.UI.Image>(); parts.Add($"Image(sprite={img.sprite?.name},color={img.color})"); continue; } catch { }
+            try { var sr = c.Cast<SpriteRenderer>(); parts.Add($"SpriteRenderer(sprite={sr.sprite?.name})"); continue; } catch { }
+            try { parts.Add($"Odo={c.Cast<OdometerDisplay>().CurrentNumber}"); continue; } catch { }
+            try { parts.Add($"TMP=\"{c.Cast<TextMeshPro>().text}\""); continue; } catch { }
+            parts.Add(tn);
+        }
+        // 坐标系相关物体打印局部坐标 (确认铁巢/标记/落点标记/实体的位置约定)
+        bool hasEntity = false;
+        foreach (var c in go.GetComponents<Component>()) {
+            if (c is Transform) continue;
+            try { c.Cast<EntityLocation>(); hasEntity = true; break; } catch { }
+        }
+        // DraggableItem = 可拖动放置的沙盘标记 (铁巢/目标/参考点令牌)
+        if (go.name.Contains("Turret Piece") || go.name.Contains("MapToken") || go.name.Contains("Impact")
+            || go.name.Contains("Fire Mission") || go.name.Contains("Marker") || hasEntity) {
+            foreach (var c in go.GetComponents<Component>()) {
+                if (c is Transform) continue;
+                try { c.Cast<DraggableItem>(); parts.Add("DRAGGABLE"); break; } catch { }
+            }
+            var lp = t.localPosition;
+            parts.Add($"pos=({lp.x:F2},{lp.y:F2},{lp.z:F2})");
+        }
+        if (parts.Count > 0)
+            MelonLogger.Msg($"[FCS_DEBUG] MAP? {new string(' ', depth * 2)}{go.name} active={go.activeSelf} [{string.Join(", ", parts)}]");
+        // UI 物体的 RectTransform 就是 Transform 本身 (组件循环会跳过), 这里单独读地图区域矩形
+        if (go.name.Contains("Marker Parent") || go.name.Contains("MapMarkers") || go.name.Contains("Map Image")) {
+            try {
+                var rt = t.Cast<RectTransform>();
+                MelonLogger.Msg($"[FCS_DEBUG] MAP?   RECT {go.name}: anchor={rt.anchoredPosition:F3}, size={rt.sizeDelta:F3}, pivot={rt.pivot:F3}, localPos={rt.localPosition:F3}");
+            }
+            catch (Exception ex) {
+                MelonLogger.Msg($"[FCS_DEBUG] MAP?   RECT {go.name} err: {ex.Message}");
+            }
+        }
+        if (go.name.StartsWith("FMOD") || go.name.StartsWith("LOD")) return;
+        for (int i = 0; i < t.childCount; i++) {
+            DumpMapSubtree(t.GetChild(i), depth + 1);
+        }
     }
 
     /// <summary>深度优先递归按名字找子物体 (Transform.Find/FindChild 只查直接子级).</summary>
@@ -674,9 +814,15 @@ public class GunSystem {
     public float RemainingFlightSeconds() {
         if (_stopwatch == null) return float.NaN;
         if (_stopwatch.state == "CountingDown") return _stopwatch.previousCountingDownRemainingSeconds;
-        if (!string.IsNullOrEmpty(BulletInChamber()) && _stopwatch.lastPredictedTravelTime > 0.01f)
-            return _stopwatch.lastPredictedTravelTime;
+        // 瞄准阶段: 读活变量 PredictedImpactTime (抬炮实时更新), 击发后才由计时表倒数
+        if (!string.IsNullOrEmpty(BulletInChamber()) && gunController != null && gunController.PredictedImpactTime > 0.01f)
+            return gunController.PredictedImpactTime;
         return float.NaN;
+    }
+
+    /// <summary>[临时调试] 打一行计时表状态, 排查 EAIM 期间读数不更新的问题.</summary>
+    public void DebugTimerLine() {
+        MelonLogger.Msg($"[FCS_DEBUG] TIMER {_surfix}: state={_stopwatch?.state}, lastPred={_stopwatch?.lastPredictedTravelTime:F2}, prevRemain={_stopwatch?.previousCountingDownRemainingSeconds:F2}, gunPred={gunController?.PredictedImpactTime:F2}");
     }
 
     private float _lastFireTime = -1f;   // Time.time, 击发时刻快照
