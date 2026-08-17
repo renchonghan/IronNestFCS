@@ -127,7 +127,7 @@ public class FcsWindow
         for (int i = 0; i < 8; i++) // 固定 8 行, 空位纯空格, 中间的 | 常驻
         {
             string left = i < pending.Count
-                ? $"[--:--:--] {pending[i].angel:000.0} {pending[i].distance:00.00}  {CenterPad(pending[i].bulletType.ToString(), 4)}"
+                ? $"{(pending[i].salvoFollower ? ">>>[SALVO]" : "[--:--:--]")} {pending[i].angel:000.0} {pending[i].distance:00.00}  {CenterPad(pending[i].bulletType.ToString(), 4)}"
                 : "";
             string right = i < finished.Count
                 ? BuildFinishLine(finished[i])
@@ -220,21 +220,25 @@ public class FcsWindow
 
     private float DrawGunRow(string gunLabel, GunSystem gun, ArtilleryTask? task, float x, float y, float w, float lineH)
     {
+        y = DrawGunPhaseRow(gunLabel, gun, task, x, y, w, lineH);
+        return DrawGunSolutionRow(gun, task, x, y, w, lineH);
+    }
+
+    private static Color StateColor(ArtilleryTask? task) => task?.progress switch
+    {
+        Progress.Failed => ClrFailed,
+        Progress.Finished => ClrGreen,
+        Progress.Pending => ClrLabel,
+        null => ClrIdle,
+        _ => ClrActive
+    };
+
+    /// <summary>行 1: 炮当前实际状态 (与任务无关, 手动装填也如实显示).</summary>
+    private float DrawGunPhaseRow(string gunLabel, GunSystem gun, ArtilleryTask? task, float x, float y, float w, float lineH)
+    {
         var oldColor = GUI.color;
         var (code, phase) = task == null ? ("0-0", "IDLE") : PhaseCode(task.progress);
-
-        Color stateColor = task?.progress switch
-        {
-            Progress.Failed => ClrFailed,
-            Progress.Finished => ClrGreen,
-            Progress.Pending => ClrLabel,
-            null => ClrIdle,
-            _ => ClrActive
-        };
-
-        GUI.color = stateColor;
-
-        // ===== 行 1: 炮当前实际状态 (与任务无关, 手动装填也如实显示) =====
+        GUI.color = StateColor(task);
         string chambered = gun.BulletInChamber() ?? "NULL";
         float el = gun.ActualElevation();
         float az = fcs.Turret.CurrentAngle();
@@ -250,9 +254,15 @@ public class FcsWindow
 
         GUI.Label(new Rect(x, y, w, 22f),
             $"[{gunLabel}] PHASE {code} {phase} | {CenterPad(chambered, 4)} E:{elStr} A:{azStr} C:{cStr} | FT:{ftStr}");
-        y += lineH;
+        GUI.color = oldColor;
+        return y + lineH;
+    }
 
-        // ===== 行 2: 火控解 (RQTA + 目标方位/距离 + 解算诸元), 无任务时全横线 =====
+    /// <summary>行 2: 火控解 (RQTA + 目标方位/距离 + 解算诸元), 无任务时全横线. 齐射跟随炮行首 >>>[SALVO].</summary>
+    private float DrawGunSolutionRow(GunSystem gun, ArtilleryTask? task, float x, float y, float w, float lineH)
+    {
+        var oldColor = GUI.color;
+        GUI.color = StateColor(task);
         if (task == null)
         {
             GUI.Label(new Rect(x, y, w, 22f),
@@ -267,7 +277,7 @@ public class FcsWindow
             string solE = task.calculatedElevation > 0.01f ? $"{task.calculatedElevation:00.00}" : "--.--";
             string solC = task.charge > 0 ? task.charge.ToString() : "-";
             GUI.Label(new Rect(x, y, w, 22f),
-                $"[--:--:--] {task.angel:000.0} {task.distance:00.00} | {CenterPad(task.bulletType.ToString(), 4)} E:{solE} A:{task.angel:000.0} C:{solC} | T:-{cdStr}");
+                $"{(task.salvoFollower ? ">>>[SALVO]" : "[--:--:--]")} {task.angel:000.0} {task.distance:00.00} | {CenterPad(task.bulletType.ToString(), 4)} E:{solE} A:{task.angel:000.0} C:{solC} | T:-{cdStr}");
         }
         GUI.color = oldColor;
         return y + lineH;

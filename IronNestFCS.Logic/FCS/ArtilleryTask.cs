@@ -28,11 +28,17 @@ public class FinishedTask {
 }
 
 public class ArtilleryTask {
+    /// <summary>火控 UID: 首次入队时递增分配, 不显示, 仅日志追溯用 (重试/插队保持原号).</summary>
+    public int fireControlId;
     public int targetId;
     public float angel;
     public float distance;
     public Vector3 position;
     public BulletType bulletType;
+    /// <summary>齐射跟随炮任务: 右键二次升级时与主任务一同入队, 面板该行显示 >>>[SALVO].</summary>
+    public bool salvoFollower;
+    /// <summary>齐射主任务引用 (仅跟随任务持有), 取消时两个任务一起出队.</summary>
+    public ArtilleryTask? salvoLeader;
     /// <summary>火控解总飞行时间: WaitForFire 击发前从炮兵计时器拷贝, 未拷贝时为 0.</summary>
     public float impactTime;
     /// <summary>击发时刻 (Time.time), 0 = 未击发. 地图菱形框下方的落点计时器用.</summary>

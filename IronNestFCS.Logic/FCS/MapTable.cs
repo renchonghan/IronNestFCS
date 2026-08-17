@@ -219,9 +219,12 @@ public class MapTable {
         public Transform entity = null!;
         public List<GameObject> outerSegs = new();
         public GameObject? labelRoot;
+        public GameObject? bulletRoot; // 序列上方的弹种标签
         public GameObject? timerRoot; // 菱形框下方的落点计时器 (整秒)
         public GameObject? radiusRoot; // 杀伤圈容器 (选中后显示红色同款虚线)
         public List<Il2CppShapes.Line> radiusSegs = new();
+        public List<GameObject> salvoSegs = new(); // 齐射第三圈
+        public bool salvo; // 已升级齐射 (创建了跟随任务)
         public float radiusKm = -1f;
         public int segCount = -1;
         public bool pierce = false;
@@ -251,6 +254,12 @@ public class MapTable {
         return _marks.TryGetValue(entity, out var mark) ? mark.task : null;
     }
 
+    /// <summary>实体当前是否已升级齐射 (三圈).</summary>
+    public bool MarkIsSalvo(Transform entity)
+    {
+        return _marks.TryGetValue(entity, out var mark) && mark.salvo;
+    }
+
     /// <summary>清除实体的标记 (出队/完成时), 回单菱形.</summary>
     public void ClearEntityMark(Transform entity)
     {
@@ -259,7 +268,12 @@ public class MapTable {
             if (seg != null) UnityEngine.Object.Destroy(seg);
         }
         mark.outerSegs.Clear();
+        foreach (var seg in mark.salvoSegs) {
+            if (seg != null) UnityEngine.Object.Destroy(seg);
+        }
+        mark.salvoSegs.Clear();
         if (mark.labelRoot != null) UnityEngine.Object.Destroy(mark.labelRoot);
+        if (mark.bulletRoot != null) UnityEngine.Object.Destroy(mark.bulletRoot);
         if (mark.timerRoot != null) UnityEngine.Object.Destroy(mark.timerRoot);
         if (mark.radiusRoot != null) UnityEngine.Object.Destroy(mark.radiusRoot);
         _marks.Remove(entity);
@@ -302,8 +316,39 @@ public class MapTable {
     private static void SetMarkVisible(TaskedMark mark)
     {
         foreach (var seg in mark.outerSegs) seg.SetActive(mark.visible);
+        foreach (var seg in mark.salvoSegs) seg.SetActive(mark.visible);
         if (mark.labelRoot != null) mark.labelRoot.SetActive(mark.visible);
         if (mark.radiusRoot != null) mark.radiusRoot.SetActive(mark.visible);
+    }
+
+    /// <summary>齐射标记: 双圈外再画第三圈菱形 (右键二次升级时调用).</summary>
+    public void SetMarkSalvo(Transform entity, bool salvo)
+    {
+        if (!_marks.TryGetValue(entity, out var mark)) return;
+        mark.salvo = salvo;
+        foreach (var seg in mark.salvoSegs) {
+            if (seg != null) UnityEngine.Object.Destroy(seg);
+        }
+        mark.salvoSegs.Clear();
+        if (!salvo) return;
+        float r3 = 0.05f * Mathf.Sqrt(2f) * 1.7f;
+        var pts = new[] {
+            new Vector3(0f, r3, 0f), new Vector3(r3, 0f, 0f),
+            new Vector3(0f, -r3, 0f), new Vector3(-r3, 0f, 0f),
+        };
+        for (int s = 0; s < 4; s++) {
+            var lineGo = new GameObject("FCS_EntityDiamondSegSalvo");
+            lineGo.transform.SetParent(mark.holder.transform, false);
+            var line = lineGo.AddComponent<Il2CppShapes.Line>();
+            line.Thickness = 0.01f;
+            line.Start = pts[s];
+            line.End = pts[(s + 1) % 4];
+            line.Color = mark.color;
+            line.ColorStart = mark.color;
+            line.ColorEnd = mark.color;
+            mark.salvoSegs.Add(lineGo);
+        }
+        SetMarkVisible(mark);
     }
 
     /// <summary>
@@ -350,6 +395,7 @@ public class MapTable {
         }
         if (mark == null) return;
         SetMarkRadius(mark, task.bulletType); // 杀伤圈随任务弹种
+        if (mark.salvo && slot is "[L]" or "[R]") slot = "[S]"; // 齐射执行时顶部显示 [S], 队列内仍显示队列位
         if (slot == null) {
             // 任务已完成 (主炮已换目标) 但炮弹可能还在飞: 撤位置标签, 计时器留到落地
             float remain = task.fireTime > 0f ? task.impactTime - (Time.time - task.fireTime) : 0f;
@@ -394,6 +440,20 @@ public class MapTable {
                 DrawCharSegments(root.transform, slot[i], mark.color, i * step, segW);
             }
             mark.labelRoot = root;
+        }
+
+        // 序列上方: 本次任务的弹种标签 (16 段字形, 最多 4 字符)
+        if (mark.bulletRoot != null) UnityEngine.Object.Destroy(mark.bulletRoot);
+        mark.bulletRoot = null;
+        if (mark.task != null && !string.IsNullOrEmpty(slot)) {
+            string bt = mark.task.bulletType.ToString();
+            var bRoot = new GameObject("FCS_EntityBulletLines");
+            bRoot.transform.SetParent(mark.holder.transform, false);
+            bRoot.transform.localPosition = new Vector3(-((bt.Length - 1) * step + segW) / 2f, 0.14f + dy + segW * 1.6f + (step - segW) + 0.02775f, 0f); // 行间距 = 字间距 + 再上抬 1/4 小格 (避开杀伤圈)
+            for (int i = 0; i < bt.Length; i++) {
+                DrawCharSegments(bRoot.transform, bt[i], mark.color, i * step, segW);
+            }
+            mark.bulletRoot = bRoot;
         }
 
         if (mark.timerRoot != null) UnityEngine.Object.Destroy(mark.timerRoot);
@@ -482,7 +542,7 @@ public class MapTable {
         ['P'] = A1|A2|F|E|G1|G2|B,
         ['Q'] = A1|A2|B|C|D1|D2|E|F|M,
         ['R'] = A1|A2|F|E|G1|G2|B|M,   // 上横 + 左竖全 f/e + 中横 g1g2 + 右上竖 b + 斜腿 m
-        ['S'] = A1|A2|F|G1|G2|C|D1|D2,
+        ['S'] = A1|A2|J|M|D1|D2,   // Z 镜像形, 与 5 区分 (齐射 S 标记用)
         ['T'] = A1|A2|H|I,
         ['U'] = F|E|B|C|D1|D2,
         ['V'] = F|E|K|L,   // 左竖 f/e + 整条斜线 k/l (右上到左下)
@@ -633,24 +693,14 @@ public class MapTable {
             line.ColorStart = color;
             line.ColorEnd = color;
         }
-        // 左右炮识别: 侧边横线延伸 + L/R 字标
-        const float tagLen = 0.05f;     // 横线延伸量
+        // 左右炮识别: L 在左臂端 / R 在右臂端, 字形中心骑在横线上 (不延长横线)
         const float tagScale = 0.0225f; // L/R 字标宽 (0.03 缩到 3/4)
         float side = isLeft ? -1f : 1f;
         float armEnd = gap + armLen;
-        var barGo = new GameObject("FCS_AimTagBar");
-        barGo.transform.SetParent(root.transform, false);
-        var bar = barGo.AddComponent<Il2CppShapes.Line>();
-        bar.Thickness = 0.005f;
-        bar.Start = new Vector3(side * armEnd, 0f, 0f);
-        bar.End = new Vector3(side * (armEnd + tagLen), 0f, 0f);
-        bar.Color = color;
-        bar.ColorStart = color;
-        bar.ColorEnd = color;
-        float tagCenter = side * (armEnd + tagLen * 0.5f);
         var tagRoot = new GameObject("FCS_AimTag");
         tagRoot.transform.SetParent(root.transform, false);
-        tagRoot.transform.localPosition = new Vector3(tagCenter - tagScale * 0.5f, 0.0075f, 0f); // 抬 1/4 原字宽, 不压线
+        float tagCenter = side * (armEnd + tagScale * 1.5f); // 臂端外再让一个字符宽度, 不压线
+        tagRoot.transform.localPosition = new Vector3(tagCenter - tagScale * 0.5f, -0.8f * tagScale, 0f); // 字形中心骑线
         DrawCharSegments(tagRoot.transform, isLeft ? 'L' : 'R', color, 0f, tagScale);
         // 杀伤圈容器: 段在 SetAimRadius 按弹种重建 (半径定段数, 保持虚线周期一致)
         var circle = new GameObject("FCS_AimRadius");
@@ -662,7 +712,7 @@ public class MapTable {
 
     /// <summary>带穿甲效果的弹种: 圈内加 X 型穿甲指示线.</summary>
     private static bool IsArmorPierce(BulletType bt) => bt switch {
-        BulletType.AP or BulletType.EQKE or BulletType.ATMC => true,
+        BulletType.AP or BulletType.APHE or BulletType.EQKE or BulletType.ATMC => true,
         _ => false,
     };
 

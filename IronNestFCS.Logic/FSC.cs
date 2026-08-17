@@ -226,8 +226,11 @@ public class FSC
         _taskQueue.Clear();
     }
 
-    /// <summary>停止单炮的所有任务协程并清槽位; 常驻循环 (同步/超时/补药) 挂在 Left 槽位上, 跳过不杀.</summary>
-    private void StopGun(LeftRight gun) {
+    /// <summary>
+    /// 停止单炮的所有任务协程并清槽位; 常驻循环 (同步/超时/补药) 挂在 Left 槽位上, 跳过不杀.
+    /// resetLocks=false 用于单炮取消: 另一炮可能正持锁, 只能重置自己的 (协程被 Stop 时 finally 会正常还锁).
+    /// </summary>
+    private void StopGun(LeftRight gun, bool resetLocks = true) {
         for (int i = _runningCoroutines.Count - 1; i >= 0; i--) {
             var (handle, g) = _runningCoroutines[i];
             if (g != gun) continue;
@@ -236,8 +239,10 @@ public class FSC
             catch (Exception ex) { MelonLogger.Error($"[FCS] StopGun stop failed: {ex}"); }
             _runningCoroutines.RemoveAt(i);
         }
-        _deskLock.Reset();
-        _turretLock.Reset();
+        if (resetLocks) {
+            _deskLock.Reset();
+            _turretLock.Reset();
+        }
         if (gun == LeftRight.Left) LeftTask = null;
         else RightTask = null;
     }
@@ -267,7 +272,7 @@ public class FSC
     /// 必须在 TryBind 成功后启动并登记进 _runningCoroutines; Dispose 时随其它协程一起 Stop
     /// 迭代器被 Stop 时 Dispose 会执行 finally, 锁不会泄漏
     /// </summary>
-    /// <summary>右键菱形: 未入队 → 入队并亮标记; 已在队列 → 出队并清标记; 在炮上 → 忽略.</summary>
+    /// <summary>右键菱形: 未入队 → 入队 (双圈); 在队列再点 → 升级齐射 (三圈); 再点 → 出队; 已上炮 → 不许改计划只允许取消.</summary>
     public void ToggleEntityTask(Transform entity, BulletType bullet)
     {
         if (entity == null) return;
@@ -282,15 +287,48 @@ public class FSC
             EnqueueTask(task);
             return;
         }
-        if (_taskQueue.Contains(existing)) {
+        bool inQueue = _taskQueue.Contains(existing);
+        if (!MapTable.MarkIsSalvo(entity)) {
+            if (!inQueue) {
+                // 已上炮: 不许改计划, 只允许取消
+                CancelEntityTask(entity, existing);
+                return;
+            }
+            // 第二次右键: 创建跟随任务插到主任务正后方 (1 2 3 中 1 升级 → 1 1' 2 3)
+            var follower = CloneTask(existing);
+            follower.salvoFollower = true;
+            follower.salvoLeader = existing;
+            AssignFireControlId(follower);
             var arr = _taskQueue.ToList();
             _taskQueue.Clear();
             foreach (var t in arr) {
-                if (t != existing) _taskQueue.Enqueue(t);
+                _taskQueue.Enqueue(t);
+                if (t == existing) _taskQueue.Enqueue(follower);
             }
-            MapTable.ClearEntityMark(entity);
+            MapTable.SetMarkSalvo(entity, true);
+            return;
         }
-        // 在炮上: 不打断击发流程, 忽略
+        // 已齐射: 再点 = 取消 (队列里两条一起出队; 炮上两门一起中止)
+        CancelEntityTask(entity, existing);
+    }
+
+    /// <summary>取消实体任务: 主任务与跟随任务一起清理 — 队列出队 + 在炮的中止该炮流程 (不重试), 清标记.</summary>
+    private void CancelEntityTask(Transform entity, ArtilleryTask existing) {
+        var arr = _taskQueue.ToList();
+        _taskQueue.Clear();
+        foreach (var t in arr) {
+            if (t == existing) continue;
+            if (t.salvoFollower && t.salvoLeader == existing) continue;
+            _taskQueue.Enqueue(t);
+        }
+        MapTable.ClearEntityMark(entity);
+        if (existing == LeftTask) StopGun(LeftRight.Left, resetLocks: false);
+        else if (existing == RightTask) StopGun(LeftRight.Right, resetLocks: false);
+        // 齐射双炮在射: 另一门炮上的跟随任务也中止, 两炮一起空闲
+        var follower = existing == LeftTask ? RightTask : existing == RightTask ? LeftTask : null;
+        if (follower != null && follower.salvoFollower && follower.salvoLeader == existing) {
+            StopGun(follower == LeftTask ? LeftRight.Left : LeftRight.Right, resetLocks: false);
+        }
     }
 
     /// <summary>刷新点选目标的队列位置标签: 在炮上 = L/R, 在队列 = 1..n, 已完成 = 回单菱形.</summary>
@@ -298,12 +336,12 @@ public class FSC
     {
         foreach (var task in MapTable.TaskedTasks) {
             string? slot = null;
-            if (task == LeftTask) slot = "L";
-            else if (task == RightTask) slot = "R";
+            if (task == LeftTask) slot = "[L]";
+            else if (task == RightTask) slot = "[R]";
             else {
                 var queue = QueueCan.ToList();
                 int idx = queue.IndexOf(task);
-                if (idx >= 0) slot = (idx + 1).ToString();
+                if (idx >= 0) slot = (idx + 1).ToString("00"); // 两位数: 01 02 03 ...
             }
             MapTable.UpdateTaskMark(task, slot);
         }
@@ -419,6 +457,7 @@ public class FSC
     /// 必须在主线程调用(点击回调即是)
     /// </summary>
     public void EnqueueTask(ArtilleryTask task) {
+        AssignFireControlId(task);
         task.progress = Progress.Pending;
         _taskQueue.Enqueue(task);
         TryDispatch();
@@ -426,6 +465,7 @@ public class FSC
 
     /// <summary>插队到队列最前面(炮兵优先).</summary>
     public void EnqueueTaskFront(ArtilleryTask task) {
+        AssignFireControlId(task);
         task.progress = Progress.Pending;
         var existing = _taskQueue.ToArray();
         _taskQueue.Clear();
@@ -434,9 +474,46 @@ public class FSC
         TryDispatch();
     }
 
-    /// <summary>把队首任务派给空闲炮管, 直到没有空闲炮管或队列空. 暂停时只入队不派发 (计划模式可随时取消).</summary>
+    private int _fcCounter = 0;
+
+    /// <summary>火控 UID: 首次入队时递增分配, 已有编号 (重试/插队) 保持原号, 日志追溯用.</summary>
+    private void AssignFireControlId(ArtilleryTask task) {
+        if (task.fireControlId > 0) return;
+        task.fireControlId = ++_fcCounter;
+    }
+
+    /// <summary>
+    /// 把队首任务派给空闲炮管, 直到没有空闲炮管或队列空. 暂停时只入队不派发 (计划模式可随时取消).
+    /// 齐射对 (主任务 + 跟随任务): 要求两炮同时空闲, 一起出队走独立齐射流程 (RunSalvoRoutine).
+    /// </summary>
     private void TryDispatch() {
         while (!_paused && _taskQueue.Count > 0) {
+            var head = _taskQueue.Peek();
+            if (!head.salvoFollower) {
+                // 队首是主任务且队列里有它的跟随任务 → 齐射对
+                ArtilleryTask? salvoFollower = null;
+                foreach (var t in _taskQueue) {
+                    if (t.salvoFollower && t.salvoLeader == head) { salvoFollower = t; break; }
+                }
+                if (salvoFollower != null) {
+                    if (LeftTask != null || RightTask != null) break; // 齐射等两炮都空
+                    _taskQueue.Dequeue(); // 主任务出队
+                    var rest = _taskQueue.ToList();
+                    _taskQueue.Clear();
+                    foreach (var t in rest) {
+                        if (t == salvoFollower) continue; // 跟随任务随主任务一起出队
+                        _taskQueue.Enqueue(t);
+                    }
+                    LeftTask = head;
+                    RightTask = salvoFollower;
+                    MelonLogger.Msg($"[FCS] Dispatch SALVO fc#{head.fireControlId}+{salvoFollower.fireControlId} ({head.bulletType}, {head.distance:F1}km)");
+                    PreComputeFlightTime(head);
+                    PreComputeFlightTime(salvoFollower);
+                    var h = MelonCoroutines.Start(RunSalvoRoutine(head, salvoFollower));
+                    _runningCoroutines.Add((h, LeftRight.Left));
+                    continue;
+                }
+            }
             LeftRight slot;
             if (LeftTask == null) slot = LeftRight.Left;
             else if (RightTask == null) slot = LeftRight.Right;
@@ -445,12 +522,27 @@ public class FSC
             var task = _taskQueue.Dequeue();
             if (slot == LeftRight.Left) LeftTask = task;
             else RightTask = task;
-            // 任务上炮即预解飞行时间 (按计划装药), 面板 T: 不用等推药/抬炮; EAIM 时再按实际装药重闩
-            int plannedCharge = _sceneInteractor.maxCharge ? 6 : BallisticCalculator.MinimumCharge(task.distance);
-            task.impactTime = ShellData.FlightTime(task.distance, plannedCharge);
+            MelonLogger.Msg($"[FCS] Dispatch fc#{task.fireControlId} ({task.bulletType}, {task.distance:F1}km) → {slot}");
+            PreComputeFlightTime(task);
             StartTaskRoutine(slot, task);
         }
     }
+
+    /// <summary>任务上炮即预解飞行时间 (按计划装药), 面板 T: 不用等推药/抬炮; EAIM 时再按实际装药重闩.</summary>
+    private void PreComputeFlightTime(ArtilleryTask task) {
+        int plannedCharge = _sceneInteractor.maxCharge ? 6 : BallisticCalculator.MinimumCharge(task.distance);
+        task.impactTime = ShellData.FlightTime(task.distance, plannedCharge);
+    }
+
+    /// <summary>齐射跟随任务克隆: 同目标同弹种, 独立任务实例 (两炮各跑各的状态).</summary>
+    private static ArtilleryTask CloneTask(ArtilleryTask t) => new() {
+        targetId = t.targetId,
+        angel = t.angel,
+        distance = t.distance,
+        position = t.position,
+        bulletType = t.bulletType,
+        progress = Progress.Pending,
+    };
 
     /// <summary>
     /// 启动一个火控任务协程. 用 MelonCoroutines 跑协程实现延时 -
@@ -715,14 +807,29 @@ public class FSC
                     MarkProgress(leftRight, Progress.Aiming);
                     yield return gunSys.SetElevation(elevation);
                     task.impactTime = ShellData.FlightTime(task.distance, powderCount); // 仰角就位: 飞行时间按公式锁存 (行 2 T: 数据源)
-                    MelonLogger.Msg($"[FCS] {leftRight}: EAIM elev={elevation:F2} flightT={task.impactTime:F2}s (dist={task.distance:F2}km charge={powderCount} mult={ShellData.SpeedMult(powderCount):F4})");
+                    MelonLogger.Msg($"[FCS] {leftRight}: EAIM fc#{task.fireControlId} elev={elevation:F2} flightT={task.impactTime:F2}s (dist={task.distance:F2}km charge={powderCount} mult={ShellData.SpeedMult(powderCount):F4})");
                     // 3-2 HAIM: 等炮塔水平到位
                     task.progress = Progress.AimingAzimuth;
                     MarkProgress(leftRight, Progress.AimingAzimuth);
                     while (!turret.Ready) {
                         yield return null;
                     }
-                    // 3-3 WAIT: 击发
+                    // 3-3 WAIT: 击发前齐射相位同步 — 先标记自己到 WAIT, 再等搭档也到, 双方都到位才依次过确认台
+                    task.progress = Progress.WaitingForFire;
+                    MarkProgress(leftRight, Progress.WaitingForFire);
+                    ArtilleryTask? partner = null;
+                    if (task.salvoFollower) partner = task.salvoLeader;
+                    else {
+                        var other = leftRight == LeftRight.Left ? RightTask : LeftTask;
+                        if (other != null && other.salvoFollower && other.salvoLeader == task) partner = other;
+                    }
+                    if (partner != null) {
+                        MelonLogger.Msg($"[FCS] {leftRight}: SALVO sync fc#{task.fireControlId} waiting partner fc#{partner.fireControlId}");
+                        while (partner.progress < Progress.WaitingForFire) {
+                            if (partner.progress == Progress.Failed || (LeftTask != partner && RightTask != partner)) break; // 搭档失败/被取消不再等
+                            yield return new WaitForSeconds(0.1f);
+                        }
+                    }
                     yield return FireSequence(leftRight, task, gunSys, turret, false);
                     // 3-4 RSET: 回位
                     task.progress = Progress.BackToIdle;
@@ -744,25 +851,316 @@ public class FSC
         ReleaseSlot(leftRight);
     }
 
+    /// <summary>
+    /// 齐射主流程 (独立于单发 RunTaskRoutine, 详见 Function.md 5.6):
+    /// 一个齐射对驱动两门炮, 每个相位双炮并行执行, 双方都到位才推进.
+    /// 相位: CALL (药包 >= 2x需求 + 膛内检查) → DUMP 双炮退弹 → SELC/BLRD/BLLD 双炮装弹 →
+    /// PWDR (解算一次 + 双炮拉杆推药) → LOAD → COFM → EAIM 双炮仰角 → HAIM → 五步确认 + 双炮 Arm + 一击发 → RSET.
+    /// </summary>
+    private IEnumerator RunSalvoRoutine(ArtilleryTask leader, ArtilleryTask follower) {
+        var gunL = LeftGun;
+        var gunR = RightGun;
+        int need = _sceneInteractor.maxCharge ? 6 : BallisticCalculator.MinimumCharge(leader.distance);
+        float elevation = ShellData.ElevationDeg(leader.distance, need);
+        // 炮塔预约 (同目标, 方向角全炮塔共享, 用主任务方位角)
+        var turret = new TurretReservation();
+        _runningCoroutines.Add((MelonCoroutines.Start(ReserveTurretAndRotate(leader, turret)), LeftRight.Left));
+
+        for (int round = 0; round < 2; round++) {
+            // 1-1 CALL: 检查两炮 + 药包库存 >= 2 x 需求 (两炮共用池)
+            MarkSalvo(leader, follower, Progress.Calculating);
+            string? lCh = gunL.BulletInChamber();
+            string? rCh = gunR.BulletInChamber();
+            bool lWrong = lCh != null && lCh != leader.bulletType.ToString();
+            bool rWrong = rCh != null && rCh != leader.bulletType.ToString();
+            yield return _deskLock.Acquire();
+            try {
+                int buyAttempts = 0;
+                while (gunL.RemainingCharges() < 2 * need) {
+                    yield return _purchaseDeck.BuyPowders();
+                    if (++buyAttempts >= 10) break;
+                }
+            }
+            finally {
+                _deskLock.Release();
+            }
+
+            // 1-1 CALL: 两炮弹仓缺目标弹则采购 (共享采购台持锁, 左买完买右, 都买完下一步)
+            bool leftNeedBuy = !gunL.HaveBulletInCylinder(leader.bulletType);
+            bool rightNeedBuy = !gunR.HaveBulletInCylinder(leader.bulletType);
+            if (leftNeedBuy || rightNeedBuy) {
+                yield return _deskLock.Acquire();
+                try {
+                    if (leftNeedBuy && !gunL.HaveBulletInCylinder(leader.bulletType)) {
+                        if (!gunL.HaveEmptyShellInCylinder()) {
+                            MelonLogger.Error($"[FCS] SALVO Left cylinder full, no {leader.bulletType} slot, fail pair");
+                            FailSalvo(leader, follower, turret);
+                            yield break;
+                        }
+                        yield return _purchaseDeck.BuyShell(leader.bulletType, LeftRight.Left);
+                        float waited = 0f;
+                        while (!gunL.HaveBulletInCylinder(leader.bulletType) && waited < 3f) {
+                            yield return new WaitForSeconds(0.5f);
+                            waited += 0.5f;
+                        }
+                    }
+                    if (rightNeedBuy && !gunR.HaveBulletInCylinder(leader.bulletType)) {
+                        if (!gunR.HaveEmptyShellInCylinder()) {
+                            MelonLogger.Error($"[FCS] SALVO Right cylinder full, no {leader.bulletType} slot, fail pair");
+                            FailSalvo(leader, follower, turret);
+                            yield break;
+                        }
+                        yield return _purchaseDeck.BuyShell(leader.bulletType, LeftRight.Right);
+                        float waited = 0f;
+                        while (!gunR.HaveBulletInCylinder(leader.bulletType) && waited < 3f) {
+                            yield return new WaitForSeconds(0.5f);
+                            waited += 0.5f;
+                        }
+                    }
+                }
+                finally {
+                    _deskLock.Release();
+                }
+            }
+
+            if (lWrong || rWrong) {
+                // 1-3 DUMP: 双炮各自平射误弹, 机构循环后回 CALL
+                MarkSalvo(leader, follower, Progress.DumpingWrongShell);
+                yield return SalvoDump(LeftRight.Left, gunL, lWrong, leader, turret);
+                yield return SalvoDump(LeftRight.Right, gunR, rWrong, follower, turret);
+                yield return new WaitForSeconds(2f);
+                continue;
+            }
+
+            // 1-2 SELC + 2-1/2-2: 空膛侧转弹仓 + 推弹, 双炮并行
+            bool lEmpty = lCh == null;
+            bool rEmpty = rCh == null;
+            if (lEmpty || rEmpty) {
+                MarkSalvo(leader, follower, Progress.SelectingBullet);
+                yield return SalvoDual(g => SalvoLoadShell(g, leader.bulletType), lEmpty, rEmpty);
+            }
+
+            // 2-3 PWDR: 解算一次 (共享计算台) + 双炮拉杆推药
+            MarkSalvo(leader, follower, Progress.LoadingPowder);
+            yield return SalvoPowder(leader, follower, gunL, gunR, need);
+
+            // 2-4 LOAD: 两炮都 CanFire
+            MarkSalvo(leader, follower, Progress.WaitLoading);
+            while (!gunL.CanFire() || !gunR.CanFire()) {
+                yield return new WaitForSeconds(0.5f);
+            }
+
+            // 2-5 COFM: 两炮实装 vs 快照都一致
+            MarkSalvo(leader, follower, Progress.ConfirmingCharge);
+            int lc = gunL.LoadedPowderCharges();
+            int rc = gunR.LoadedPowderCharges();
+            if (lc <= 0) lc = leader.charge;
+            if (rc <= 0) rc = follower.charge;
+            if (lc != leader.charge || rc != follower.charge) {
+                MelonLogger.Msg($"[FCS] SALVO COFM mismatch L={lc}/{leader.charge} R={rc}/{follower.charge}, back to CALL");
+                continue;
+            }
+            break; // 装填确认完成, 出循环进击发
+        }
+
+        // 3-1 EAIM: 双炮同时升仰角, 都到位
+        MarkSalvo(leader, follower, Progress.Aiming);
+        yield return SalvoDual(g => g.SetElevation(elevation), true, true);
+        leader.impactTime = ShellData.FlightTime(leader.distance, leader.charge);
+        follower.impactTime = leader.impactTime;
+        MelonLogger.Msg($"[FCS] SALVO EAIM fc#{leader.fireControlId}+{follower.fireControlId} elev={elevation:F2} flightT={leader.impactTime:F2}s");
+
+        // 3-2 HAIM: 炮塔水平到位
+        MarkSalvo(leader, follower, Progress.AimingAzimuth);
+        while (!turret.Ready) yield return null;
+
+        // 3-3/3-4: 五步确认一次 + 双炮 Arm + 一击发 + 双炮 WaitFire
+        yield return SalvoFire(leader, follower, gunL, gunR, turret);
+
+        // 3-5 RSET: 双炮回位
+        MarkSalvo(leader, follower, Progress.BackToIdle);
+        yield return SalvoDual(g => g.WaitBackToIdle(), true, true);
+
+        MarkSalvo(leader, follower, Progress.Finished);
+        _sceneInteractor.TaskFinished(leader);
+        ReleaseSlot(LeftRight.Left);
+        ReleaseSlot(LeftRight.Right);
+    }
+
+    /// <summary>齐射对进度同步更新 (两行面板一致 + 超时监控时间戳).</summary>
+    private void MarkSalvo(ArtilleryTask leader, ArtilleryTask follower, Progress p) {
+        leader.progress = p;
+        follower.progress = p;
+        MarkProgress(LeftRight.Left, p);
+        MarkProgress(LeftRight.Right, p);
+    }
+
+    /// <summary>齐射对失败收尾: 双任务 Failed + 归还炮塔 + 双槽位释放.</summary>
+    private void FailSalvo(ArtilleryTask leader, ArtilleryTask follower, TurretReservation turret) {
+        turret.Canceled = true;
+        ReleaseTurretOnce(turret);
+        MarkSalvo(leader, follower, Progress.Failed);
+        ReleaseSlot(LeftRight.Left);
+        ReleaseSlot(LeftRight.Right);
+    }
+
+    /// <summary>齐射双炮并行驱动: 对指定侧并行执行同一动作, 双方都完成才返回.</summary>
+    private IEnumerator SalvoDual(Func<GunSystem, IEnumerator> step, bool doLeft, bool doRight) {
+        bool leftDone = !doLeft, rightDone = !doRight;
+        if (doLeft) {
+            var h = MelonCoroutines.Start(WrapSalvoStep(LeftGun, step, () => leftDone = true));
+            _runningCoroutines.Add((h, LeftRight.Left));
+        }
+        if (doRight) {
+            var h = MelonCoroutines.Start(WrapSalvoStep(RightGun, step, () => rightDone = true));
+            _runningCoroutines.Add((h, LeftRight.Right));
+        }
+        while (!leftDone || !rightDone) yield return null;
+    }
+
+    private static IEnumerator WrapSalvoStep(GunSystem gun, Func<GunSystem, IEnumerator> step, Action done) {
+        yield return step(gun);
+        done();
+    }
+
+    /// <summary>齐射双炮保险并行: 单侧 Arm 包装, 完成回调.</summary>
+    private IEnumerator WrapSalvoArm(LeftRight side, Action done) {
+        yield return TriggerConsole.Arm(side);
+        done();
+    }
+
+    /// <summary>单炮装弹段 (齐射双炮并行各跑): 转弹仓到目标弹种 → 按推弹 → 等推到位.</summary>
+    private static IEnumerator SalvoLoadShell(GunSystem gun, BulletType bullet) {
+        yield return gun.RotateCylinderTo(bullet);
+        yield return gun.PressRammer();
+        yield return gun.WaitShellRammed();
+    }
+
+    /// <summary>单炮退弹平射 (齐射 DUMP 相位的单炮侧): 有弹保证至少 1 药 → 装填 → 平射.</summary>
+    private IEnumerator SalvoDump(LeftRight side, GunSystem gun, bool needDump, ArtilleryTask dumpTask, TurretReservation turret) {
+        if (!needDump) yield break;
+        if (!gun.CanFire()) {
+            // 解锁药包杆 (计算台 charge=1) + 拉 1 杆 + 推药 + 等 CanFire
+            yield return _deskLock.Acquire();
+            try {
+                yield return BallisticCalculator.SetCharge(1);
+                yield return BallisticCalculator.Calculate();
+            }
+            finally {
+                _deskLock.Release();
+            }
+            if (gun.SelectedPowderCharges() <= 0) yield return gun.PullPowders(1);
+            yield return gun.RamPowder();
+            while (!gun.CanFire()) {
+                yield return new WaitForSeconds(0.5f);
+            }
+        }
+        yield return FireSequence(side, dumpTask, gun, turret, isDump: true);
+    }
+
+    /// <summary>2-3 PWDR (齐射): 解算一次 (同目标同装药, 一次 Calculate 供两炮) + 双炮并行拉杆推药.</summary>
+    private IEnumerator SalvoPowder(ArtilleryTask leader, ArtilleryTask follower, GunSystem gunL, GunSystem gunR, int need) {
+        yield return _deskLock.Acquire();
+        try {
+            yield return BallisticCalculator.SetDistance(leader.distance);
+            yield return BallisticCalculator.SetDirection(leader.angel);
+            yield return BallisticCalculator.SetCharge(need);
+            yield return BallisticCalculator.SetShellType(leader.bulletType);
+            yield return BallisticCalculator.Calculate(); // 游戏靠这次 Calculate 解锁两炮药包杆
+            leader.charge = need;
+            follower.charge = need;
+            leader.calculatedElevation = ShellData.ElevationDeg(leader.distance, need);
+            follower.calculatedElevation = leader.calculatedElevation;
+        }
+        finally {
+            _deskLock.Release();
+        }
+        yield return SalvoDual(g => PullAndRamPowder(g, need), true, true);
+    }
+
+    private static IEnumerator PullAndRamPowder(GunSystem gun, int need) {
+        int selected = gun.SelectedPowderCharges();
+        if (selected < need) yield return gun.PullPowders(need - selected);
+        yield return gun.RamPowder();
+    }
+
+    /// <summary>3-3/3-4 击发 (齐射): 五步确认走一遍 (确认台校验两门炮) → 双炮 Arm → 一击发 → 双炮 WaitFire.</summary>
+    private IEnumerator SalvoFire(ArtilleryTask leader, ArtilleryTask follower, GunSystem gunL, GunSystem gunR, TurretReservation turret) {
+        MarkSalvo(leader, follower, Progress.WaitingForFire);
+        try {
+            yield return _deskLock.Acquire();
+            try {
+                yield return TriggerConsole.ConfirmTask();
+                yield return TriggerConsole.ConfirmBullet();
+                yield return TriggerConsole.ConfirmRotation();
+                yield return TriggerConsole.ConfirmElevation();
+                yield return TriggerConsole.ReadyToFire();
+                // 双炮保险同帧按下: 并行驱动两根 ArmingLever (顺序调用会一前一后 0.2s)
+                bool leftArmed = false, rightArmed = false;
+                var armL = MelonCoroutines.Start(WrapSalvoArm(LeftRight.Left, () => leftArmed = true));
+                var armR = MelonCoroutines.Start(WrapSalvoArm(LeftRight.Right, () => rightArmed = true));
+                _runningCoroutines.Add((armL, LeftRight.Left));
+                _runningCoroutines.Add((armR, LeftRight.Right));
+                while (!leftArmed || !rightArmed) yield return null;
+                if (leader.impactTime <= 0f) leader.impactTime = ShellData.FlightTime(leader.distance, leader.charge);
+                follower.impactTime = leader.impactTime;
+                MarkSalvo(leader, follower, Progress.Fire);
+                if (_sceneInteractor.AutoFire) {
+                    TriggerConsole.Fire(); // 击发钮全局一个, 一按两炮齐射
+                }
+                yield return SalvoDual(g => g.WaitFire(), true, true);
+            }
+            finally {
+                _deskLock.Release();
+            }
+        }
+        finally {
+            ReleaseTurretOnce(turret);
+        }
+        // 击发快照: 取左炮计时表真值 (同目标同装药, 两炮飞时一致)
+        var sw = gunL.StopwatchLatch();
+        if (sw.HasValue && sw.Value.travelTime > 0.01f) {
+            leader.fireTime = sw.Value.startTime;
+            leader.impactTime = sw.Value.travelTime;
+            follower.fireTime = sw.Value.startTime;
+            follower.impactTime = sw.Value.travelTime;
+            MelonLogger.Msg($"[FCS] SALVO fire latch travel={sw.Value.travelTime:F2}s");
+        }
+        else {
+            leader.fireTime = Time.time;
+            follower.fireTime = Time.time;
+        }
+        _finished.Add(new FinishedTask { task = leader, fireTime = leader.fireTime });
+        if (_finished.Count > 8) { _finished.RemoveAt(0); _finishedOverflow++; }
+        _finished.Add(new FinishedTask { task = follower, fireTime = follower.fireTime });
+        if (_finished.Count > 8) { _finished.RemoveAt(0); _finishedOverflow++; }
+    }
+
     /// <summary>临界区 2 击发: 五步确认 + Arm + 拷贝飞行时间 + Fire + WaitFire. 非退弹轮归还炮塔.</summary>
     private IEnumerator FireSequence(LeftRight leftRight, ArtilleryTask task, GunSystem gunSys, TurretReservation turret, bool isDump) {
         task.progress = Progress.WaitingForFire;
         MarkProgress(leftRight, Progress.WaitingForFire);
         try {
-            yield return TriggerConsole.ConfirmTask();
-            yield return TriggerConsole.ConfirmBullet();
-            yield return TriggerConsole.ConfirmRotation();
-            yield return TriggerConsole.ConfirmElevation();
-            yield return TriggerConsole.ReadyToFire();
-            yield return TriggerConsole.Arm(leftRight);
-            // 总飞行时间正常在仰角就位时锁存; 这里兜底平射轮等未锁存的情况
-            if (task.impactTime <= 0f) task.impactTime = ShellData.FlightTime(task.distance, task.charge);
-            task.progress = Progress.Fire; // 3-4 FIRE: 击发瞬间 (自动/手动开火都一闪而过)
-            MarkProgress(leftRight, Progress.Fire);
-            if (_sceneInteractor.AutoFire) {
-                TriggerConsole.Fire();
+            yield return _deskLock.Acquire(); // 五步确认台全局唯一: 齐射两炮串行过台, 防抢台导致保险没开
+            try {
+                yield return TriggerConsole.ConfirmTask();
+                yield return TriggerConsole.ConfirmBullet();
+                yield return TriggerConsole.ConfirmRotation();
+                yield return TriggerConsole.ConfirmElevation();
+                yield return TriggerConsole.ReadyToFire();
+                yield return TriggerConsole.Arm(leftRight);
+                // 总飞行时间正常在仰角就位时锁存; 这里兜底平射轮等未锁存的情况
+                if (task.impactTime <= 0f) task.impactTime = ShellData.FlightTime(task.distance, task.charge);
+                task.progress = Progress.Fire; // 3-4 FIRE: 击发瞬间 (自动/手动开火都一闪而过)
+                MarkProgress(leftRight, Progress.Fire);
+                if (_sceneInteractor.AutoFire) {
+                    TriggerConsole.Fire();
+                }
+                yield return gunSys.WaitFire();
             }
-            yield return gunSys.WaitFire();
+            finally {
+                _deskLock.Release();
+            }
         }
         finally {
             // 炮塔方向角独占到实射这一发打出去为止; 退弹轮继续持有给下一轮

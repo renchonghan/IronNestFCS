@@ -23,7 +23,7 @@ public class TacticalRadar
     private bool showRadar = true;
     private Rect radarRect = new(0, 0, 0, 0);
 
-    public bool AutoPlaceMarkers { get; set; } = true;
+    public bool AutoPlaceMarkers { get; set; } = false; // 默认关: 玩家手动拖 T1-T4
 
     private readonly List<UnitEntry> units = new();
     private float lastScanTime;

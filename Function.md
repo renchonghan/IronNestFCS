@@ -98,7 +98,7 @@ Numpad 7/8/9 触发: 停该炮管全部协程 -> 强制释放两把锁 -> 清空
 | 2-5 | COFM | 击发前装药确认 (实装 vs 快照, 差异回 CALL) |
 | 3-1 | EAIM | 升仰角 (SetElevation 循环, 无进展检测); 跳过装填路径在此前解算 |
 | 3-2 | HAIM | 等炮塔水平到位 |
-| 3-3 | WAIT | 五步确认 + Arm + 待击发 |
+| 3-3 | WAIT | 齐射相位同步点 + 五步确认 + Arm + 待击发 |
 | 3-4 | FIRE | 击发瞬间 (AutoFire 秒过) |
 | 3-5 | RSET | 回位 (13s 最小恢复 + 机构空闲) |
 | 0-0 | IDLE / FAIL | 空闲 / 失败 |
@@ -165,7 +165,7 @@ LOAD > COFM
 6. **2-5 COFM 击发前装药确认**: 对比实际实装 vs task.charge 快照; 一致直接过; 差异回 CALL (不本地重算)
 7. **3-1 EAIM 升仰角** (退弹轮平射跳过): SetElevation 循环, 10s 无进展放弃; **仰角就位后锁存总飞行时间** (task.impactTime = 活变量 PredictedImpactTime)
 8. **3-2 HAIM**: 等炮塔水平到位 (turret.Ready)
-9. **3-3/3-4 击发**: 五步确认 (任务/弹种/旋转/仰角/准备) → Arm → 3-4 FIRE (AutoFire 秒过) → WaitFire (等 pendingReload). 游戏击发校验的是**实时状态** (实际仰角/膛内弹种/飞行时间/装填完成), 不读计算台; impactTime 未锁存时在 Arm 后兜底拷贝
+9. **3-3/3-4 击发**: 五步确认 (任务/弹种/旋转/仰角/准备) → Arm → 3-4 FIRE (AutoFire 秒过) → WaitFire (等 pendingReload). 游戏击发校验的是**实时状态** (实际仰角/膛内弹种/飞行时间/装填完成), 不读计算台; impactTime 未锁存时在 Arm 后兜底拷贝; **全程持 deskLock 串行过台** (确认台全局唯一, 防两炮抢台)
 10. **非退弹轮**: 3-5 RSET 回位 (13s + 机构空闲) → Finished → 释放槽位拉下一单; finally 归还炮塔锁. **退弹轮**: 不归还炮塔, 等 2s 进入下一轮
 11. **两轮未完 (兜底)**: 归还炮塔 → Failed → 释放槽位
 
@@ -176,6 +176,68 @@ LOAD > COFM
 - **面板两行**: 行 1 = 炮实际状态 (膛内弹种 / 实际仰角 / 实际方位角 / 实装药包 / FT 飞行时间); 行 2 = 火控解快照 (RQTA 占位 / 目标方位距离 / 弹种 / 解算仰角 / 装药 / T:- 目标倒计时)
 - **飞行时间两个变量**: 活变量 `GunController.PredictedImpactTime` 抬炮实时更新 (行 1 瞄准期 FT 数据源, 仰角就位时锁存进 task.impactTime); 击发后游戏炮兵计时表 (GunStopwatch) 倒数, `previousCountingDownRemainingSeconds` 是剩余秒数 (行 2 T:- 数据源)
 - **铁巢棋子自动吸附** (SyncIronNestLoop, 10fps): 真源 = `turretController.turretBase.localPosition` (MapRoot 网格空间, 归位/紧急转移由游戏更新); 经沙盘校准常数映射到棋子局部系 (格长 = 1/3.8164, 左下角经平射真值+目测校准), 棋子摆错不再导致火控打飞
+
+### 5.5 单独开火 (击发段) 步骤清单
+
+> 供齐射设计参考: 单任务从仰角就位到击发完成的完整步骤, 按代码顺序, 含硬件操作与锁.
+
+| # | 步骤 | 位置 | 操作与硬件 | 锁 |
+| --- | --- | --- | --- | --- |
+| 1 | 3-1 EAIM | RunTaskRoutine | SetElevation(计算仰角): 循环设仰角杆到到位; 10s 无进展放弃 (退弹轮平射跳过) | - |
+| 2 | 锁存飞时 | EAIM 后 | task.impactTime = 距离 x 10/7 / 速度倍率(药包) (射表公式) | - |
+| 3 | 3-2 HAIM | RunTaskRoutine | 等 turret.Ready — 后台炮塔预约早已转向目标方位角 | turretLock (后台预约持有) |
+| 4 | 3-3 WAIT | RunTaskRoutine | 标记自己 WaitingForFire; **齐射任务在此等搭档也到 WAIT** (搭档失败/被取消则不等) | - |
+| 5 | 抢控制台锁 | FireSequence | 五步确认台全局唯一, 两炮串行过台 | deskLock |
+| 6 | 五步确认 | TriggerConsole | ConfirmTask → ConfirmBullet → ConfirmRotation → ConfirmElevation → ReadyToFire: 依次拨 .Review Console Parent 的 5 个 .Check Switch | deskLock |
+| 7 | Arm 开保险 | TriggerConsole.Arm(炮) | 本炮 ArmingLever 按下 0.2s 松开 — **保险按炮分开** | deskLock |
+| 8 | 飞时兜底 | FireSequence | impactTime 未锁存时用公式补 | deskLock |
+| 9 | 3-4 FIRE | TriggerConsole.Fire | AutoFire: fire spinner AddEnergy(255) — **击发钮全局一个** | deskLock |
+| 10 | WaitFire | GunSystem | 等游戏 pendingReload 置位 (发射完成) | deskLock |
+| 11 | 放控制台锁 | FireSequence finally | | - |
+| 12 | 击发快照 | FireSequence | fireTime = 炮兵计时表 countdownStartTime; impactTime = latchedTravelTime (游戏真值, 消除固定时间差) | - |
+| 13 | 完成入列 | FireSequence | _finished 追加 (最多 8 条 + 溢出计数); 退弹轮不入列 | - |
+| 14 | 还炮塔锁 | FireSequence finally | 非退弹轮 ReleaseTurretOnce | turretLock |
+| 15 | 3-5 RSET | RunTaskRoutine | WaitBackToIdle (13s 最小恢复 + 机构空闲) | - |
+| 16 | Finished | RunTaskRoutine | ReleaseSlot → TryDispatch 拉下一单 | - |
+
+要点:
+- 游戏击发校验的是**实时状态** (实际仰角/膛内弹种/飞行时间/装填完成), 不读计算台输出
+- 五步确认台 (.Check Switch x5) 全局只有一套 — 校验的是**两门炮的实时状态**, 不区分炮; 只有 Arm 保险按炮分开 → 两炮同时走确认会互相踩 (齐射右炮保险没开即此因), 当前用 deskLock 串行
+- **齐射当前同步点 = 第 4 步 (WAIT)**: 双方都到才依次过台; 方案重设计方向 = 改到 EAIM 结束同步
+
+### 5.6 齐射流程 (RunSalvoRoutine, 独立实现)
+
+> 齐射 = **独立流程**, 不在单发状态机上堆分支: 一个齐射对 (主任务 + 跟随任务) 驱动两门炮,
+> 每个相位双炮并行执行, **双方都到位才推进** 下一相位.
+
+**相位表** (代号与单发一致, 语义双炮化):
+
+| 代号 | 名称 | 齐射语义 |
+| --- | --- | --- |
+| 1-0 | PEND | 齐射对等待调度: **两炮同时空闲**才一起出队 (主+随), 只空闲一门整对等待 |
+| 1-1 | CALL | 检查两炮: 药包库存 >= 2 x 需求 (两炮共用池), 膛内弹种正确才下一步 (误弹走 DUMP) |
+| 1-2 | SELC | 两炮弹仓都转到目标弹种, 双方对位才下一步 |
+| 1-3 | DUMP | 双炮退弹平射 (各自打掉误弹), 两炮都平射完回 CALL |
+| 2-1 | BLRD | 两炮一起按推弹按钮 (一闪而过) |
+| 2-2 | BLLD | 两炮都推弹到位 (离开 ShellRamming) |
+| 2-3 | PWDR | **解算一次** (计算台全局唯一, 同目标同距离同装药, 一次 Calculate 供两炮); 两炮同时拉杆, 都拉到位才推药 |
+| 2-4 | LOAD | 两炮都 CanFire |
+| 2-5 | COFM | 两炮实装 vs 快照都一致 (任一差异回 CALL) |
+| 3-1 | EAIM | 两炮同时升仰角 (同仰角), 都到位 — 齐射相位同步点之一 |
+| 3-2 | HAIM | 炮塔水平到位 (同目标, 方向角一致, 全炮塔共享) |
+| 3-3 | WAIT | 五步确认 **走一遍** (确认台本身校验两门炮实时状态) + 双炮 Arm + 待击发 |
+| 3-4 | FIRE | 击发: 击发钮全局一个, **一按两炮齐射** (AutoFire 秒过) |
+| 3-5 | RSET | 两炮都回位 (13s 最小恢复 + 机构空闲) |
+| 0-0 | IDLE / FAIL | 空闲 / 失败 |
+
+**与单发流程的差异**:
+
+1. **派发**: 齐射对要求两炮同时空闲, 主+随两条一起出队; 只空闲一门则整对等待 (不拆开)
+2. **相位同步**: 每个相位双炮并行执行 (各自子协程), 双方都完成才推进
+3. **解算**: PWDR 只做一次 (共享计算台), 同距离同装药两炮通用, 仰角/飞时按公式直算
+4. **击发**: 五步确认走一遍 → 两炮 Arm → 按一次击发钮 → 双炮各自 WaitFire; 飞时快照取左炮计时表真值 (两炮同飞时)
+5. **采购**: 药包库存按两炮总量保证 (>= 2 x 需求, 上限 12)
+6. **显示**: 面板主炮行正常, 跟随炮行 `>>>[SALVO]`; 地图目标顶部显示 S; 完成队列入两条
 
 ## 6. 硬件抽象层 (FCS/ 目录)
 
