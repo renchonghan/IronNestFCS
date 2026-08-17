@@ -216,6 +216,7 @@ public class MapTable {
     /// <summary>实体标记: 双菱形外圈 + 头上队列位置标签 (线段七段数码). 右键切换显示.</summary>
     private class TaskedMark {
         public GameObject holder = null!;
+        public bool ownsHolder; // T1-T4 虚拟目标自建底座, 清理标记时一并销毁
         public Transform entity = null!;
         public List<GameObject> outerSegs = new();
         public GameObject? labelRoot;
@@ -231,21 +232,48 @@ public class MapTable {
         public Color color;
         public ArtilleryTask? task;
         public bool visible;
+        public float lastDist = float.NaN;  // 上一帧目标距离 (TRAK 1 帧预测差分用)
+        public float lastAngel = float.NaN; // 上一帧目标方位
     }
     private readonly Dictionary<Transform, TaskedMark> _marks = new();
     public IReadOnlyList<ArtilleryTask> TaskedTasks =>
         _marks.Values.Where(m => m.task != null).Select(m => m.task!).ToList();
 
-    /// <summary>右键实体入队: 记录任务到标记并点亮双菱形+位置标签.</summary>
+    /// <summary>右键入队: 实体或 T1-T4 炮兵标记 (无 EntityLocation 的按标记 index 反查). 记录任务到标记并点亮双菱形+位置标签.</summary>
     public ArtilleryTask? TaskFromEntity(Transform entity)
     {
-        var task = TaskFromGridPosition(entity.localPosition);
+        ArtilleryTask? task;
+        if (entity.GetComponent<EntityLocation>() == null) {
+            // T1-T4 标记物: 虚拟目标, 没有实体单菱形, 按标记物当前位置生成任务
+            int markerId = -1;
+            foreach (var kv in artilleries) {
+                if (kv.Value == entity) { markerId = kv.Key; break; }
+            }
+            if (markerId < 0) return null;
+            task = GetMarkTarget(markerId);
+        }
+        else {
+            task = TaskFromGridPosition(entity.localPosition);
+        }
         if (task == null) return null;
+        AttachTaskMark(entity, task);
+        return task;
+    }
+
+    /// <summary>给目标挂任务标记 (点亮双菱形+位置标签). 实体与 T 标记物共用.</summary>
+    public void AttachTaskMark(Transform entity, ArtilleryTask task)
+    {
         var mark = GetOrCreateMark(entity);
         mark.task = task;
         mark.visible = true;
         SetMarkVisible(mark);
-        return task;
+    }
+
+    /// <summary>火控台按钮/键盘入队的虚拟目标: 给第 index 号 T 标记物挂任务标记.</summary>
+    public void AttachMarkerTask(int index, ArtilleryTask task)
+    {
+        if (!artilleries.TryGetValue(index, out var marker)) return;
+        AttachTaskMark(marker, task);
     }
 
     /// <summary>实体当前挂着的任务 (无则 null).</summary>
@@ -276,6 +304,7 @@ public class MapTable {
         if (mark.bulletRoot != null) UnityEngine.Object.Destroy(mark.bulletRoot);
         if (mark.timerRoot != null) UnityEngine.Object.Destroy(mark.timerRoot);
         if (mark.radiusRoot != null) UnityEngine.Object.Destroy(mark.radiusRoot);
+        if (mark.ownsHolder && mark.holder != null) UnityEngine.Object.Destroy(mark.holder); // 虚拟目标自建底座一起销毁
         _marks.Remove(entity);
     }
 
@@ -284,13 +313,25 @@ public class MapTable {
     {
         if (_marks.TryGetValue(entity, out var existing)) return existing;
         GameObject? holder = null;
+        bool ownsHolder = false;
         foreach (var (collider, e) in _entityClickTargets) {
             if (e == entity) { holder = collider.gameObject; break; }
         }
+        if (holder == null) {
+            // T1-T4 虚拟目标: 自建底座挂 Fire Mission Root 下 (与实体挂件同空间同图层), 每帧跟随标记物 (UpdateTaskMark 同步), T 标记拖到哪火控框跟到哪
+            holder = new GameObject("FCS_MarkerMarkHolder");
+            var parent = fireMissionRoot != null ? fireMissionRoot : entity.parent;
+            holder.transform.SetParent(parent, false);
+            var lp = parent.InverseTransformPoint(entity.position);
+            lp.z -= 0.02f;
+            holder.transform.localPosition = lp;
+            ownsHolder = true;
+        }
         var loc = entity.GetComponent<EntityLocation>();
-        bool hostile = loc != null && TacticalRadar.IsHostile(loc, entity);
+        // T1-T4 标记物无 EntityLocation, 视为敌方目标红色 (虚拟目标)
+        bool hostile = loc == null || TacticalRadar.IsHostile(loc, entity);
         var color = hostile ? Color.red : Color.blue;
-        var mark = new TaskedMark { holder = holder ?? entity.gameObject, entity = entity, color = color };
+        var mark = new TaskedMark { holder = holder, ownsHolder = ownsHolder, entity = entity, color = color };
         float r2 = 0.05f * Mathf.Sqrt(2f) * 1.35f;
         var pts = new[] {
             new Vector3(0f, r2, 0f), new Vector3(r2, 0f, 0f),
@@ -394,6 +435,41 @@ public class MapTable {
             if (m.task == task) { mark = m; break; }
         }
         if (mark == null) return;
+        // 追踪目标默认 = 任务参数本身 (静态目标); 虚拟目标下面覆盖为 1 帧预测值
+        task.trackDistance = task.distance;
+        task.trackAngel = task.angel;
+        if (mark.ownsHolder && mark.holder != null && fireMissionRoot != null) {
+            // 虚拟目标底座跟随标记物: 世界位置映射进 Fire Mission Root 局部 + 实体挂件同款 z 偏移 (浮出板面)
+            var lp = fireMissionRoot.InverseTransformPoint(mark.entity.position);
+            lp.z -= 0.02f;
+            mark.holder.transform.localPosition = lp;
+            // 任务实时跟随标记物: 按标记物当前位置重算距离/方位/位置 (动目标射击; 已上炮的落点指示随之刷新)
+            if (mark.task != null) {
+                int markerId = -1;
+                foreach (var kv in artilleries) {
+                    if (kv.Value == mark.entity) { markerId = kv.Key; break; }
+                }
+                if (markerId >= 0) {
+                    var fresh = GetMarkTarget(markerId);
+                    if (fresh != null) {
+                        mark.task.distance = fresh.distance;
+                        mark.task.angel = fresh.angel;
+                        mark.task.position = fresh.position;
+                        // TRAK 1 帧预测 (25fps): 当前 + 上一帧差分外推, PID 追预测点 (补偿机械延迟)
+                        if (float.IsNaN(mark.lastDist)) {
+                            mark.task.trackDistance = fresh.distance;
+                            mark.task.trackAngel = fresh.angel;
+                        }
+                        else {
+                            mark.task.trackDistance = fresh.distance + (fresh.distance - mark.lastDist);
+                            mark.task.trackAngel = fresh.angel + Mathf.DeltaAngle(mark.lastAngel, fresh.angel);
+                        }
+                        mark.lastDist = fresh.distance;
+                        mark.lastAngel = fresh.angel;
+                    }
+                }
+            }
+        }
         SetMarkRadius(mark, task.bulletType); // 杀伤圈随任务弹种
         if (mark.salvo && slot is "[L]" or "[R]") slot = "[S]"; // 齐射执行时顶部显示 [S], 队列内仍显示队列位
         if (slot == null) {
@@ -527,7 +603,7 @@ public class MapTable {
         ['A'] = A1|A2|B|C|E|F|G1|G2,
         ['B'] = A1|A2|F|E|G1|D1|D2|K|M,   // 左竖 + 三横 + 右侧斜边 k/m
         ['C'] = A1|A2|D1|D2|E|F,
-        ['D'] = F|E|K|M,   // 左竖 + 右侧尖角 k/m
+        ['D'] = F|E|J|L,   // 左竖 + 左侧尖角 j/l (上 \ 下 /)
         ['E'] = A1|A2|F|G1|G2|E|D1|D2,
         ['F'] = A1|A2|F|G1|G2|E,
         ['G'] = A1|A2|F|E|G2|C|D1|D2,
@@ -913,7 +989,14 @@ public class MapTable {
         Vector2 targetGrid = nest;
         var mark = _marks.Values.FirstOrDefault(m => m.task == task);
         if (mark != null && mark.entity != null) {
-            targetGrid = mark.entity.localPosition; // 实体实时位置
+            if (mark.ownsHolder) {
+                // T1-T4 虚拟目标: 标记物在板面局部系, 反解成网格坐标 (实体 localPosition 本来就是网格系, 直接可用)
+                Vector2 lp = mark.entity.localPosition;
+                targetGrid = new Vector2((lp.x - MapBottomLeft.x) / MapCellSize, (lp.y - MapBottomLeft.y) / MapCellSize);
+            }
+            else {
+                targetGrid = mark.entity.localPosition; // 实体实时位置
+            }
         }
         else {
             float rad = task.angel * Mathf.Deg2Rad;
@@ -926,6 +1009,17 @@ public class MapTable {
         line.Start = Vector3.zero;
         line.End = endLocal - startLocal;
         if (!go.activeSelf) go.SetActive(true);
+    }
+
+    /// <summary>T1-T4 炮兵标记物 (marker transform, 编号), 注册右键入队用.</summary>
+    public IReadOnlyList<(Transform marker, int id)> ArtilleryMarkers
+    {
+        get
+        {
+            var list = new List<(Transform, int)>();
+            foreach (var kv in artilleries) list.Add((kv.Value, kv.Key));
+            return list;
+        }
     }
 
     /// <summary>按地图网格位置创建打击任务 (铁巢 turretBase 为锚点). 点击实体菱形框入队用.</summary>
@@ -954,7 +1048,7 @@ public class MapTable {
     {
         // F9 热重载清理: 旧程序集的挂件引用已丢但物件还在场景里, 按名字清掉 (杀伤圈等挂件随底座一起销毁)
         foreach (var old in Resources.FindObjectsOfTypeAll<GameObject>()) {
-            if (old != null && old.name == "FCS_EntityDiamond") UnityEngine.Object.Destroy(old);
+            if (old != null && (old.name == "FCS_EntityDiamond" || old.name == "FCS_MarkerMarkHolder")) UnityEngine.Object.Destroy(old);
         }
         _entityClickTargets.Clear();
         _entityMarks.Clear();
@@ -968,18 +1062,46 @@ public class MapTable {
         MelonLogger.Msg("[FCS] SpawnEntityDiamonds: done");
     }
 
-    /// <summary>给单个实体挂菱形框 (holder + 点击 collider + 四条边).</summary>
+    /// <summary>给单个实体挂标识 (holder + 点击 collider): 敌红/友蓝菱形, 参考点绿十字. 中心标识线: 装甲=内正方形, FDC=六芒星, 炮兵=圆. 全部纯线, 与边框同宽.</summary>
     private void SpawnDiamondFor(Transform child, EntityLocation loc)
     {
         bool hostile = TacticalRadar.IsHostile(loc, child);
-        var color = hostile ? Color.red : Color.blue;
+        string icon = TacticalRadar.GetIcon(loc);
+        bool isRef = icon.Contains("Refrence"); // 参考点 (游戏拼错 Reference): 不是友军, 绿色十字
+        var color = isRef ? Color.green : (hostile ? Color.red : Color.blue);
+        var (armour, immune) = TacticalRadar.GetArmour(loc);
+        bool armoured = armour > 0 || immune > 0; // 装甲 = 有装甲值或免疫弹种 (只有非免疫弹种能处理)
+        // FDC 炮兵指挥中心: 打掉敌方打击计时器暂停. 不同关卡的 icon 名不一样 (Fire Direction Center / Artillery Observer), 实体名兜底 (fdc#/enemyfdc#)
+        bool isFdc = icon.Contains("Fire Direction Center") || icon.Contains("Artillery Observer") || child.name.ToLower().Contains("fdc");
+        bool isArty = icon.Contains("Field Artillery") || icon.Contains("Arty Turret"); // 炮兵: 打掉敌方打击计时器延长
+        bool isAa = icon.Contains("AA") || child.name.ToLower().Contains("aa"); // 防空炮: 两个短竖线
+        MelonLogger.Msg($"[FCS] Diamond: {child.name} hostile={hostile} ref={isRef} armoured={armoured} armour={armour} immune={immune} fdc={isFdc} arty={isArty} aa={isAa}");
         var holder = new GameObject("FCS_EntityDiamond");
         holder.transform.SetParent(child, false);
         holder.transform.localPosition = new Vector3(0f, 0f, -0.02f);
         var col = holder.AddComponent<BoxCollider>();
         col.size = new Vector3(0.15f, 0.15f, 0.02f);
-        _entityClickTargets.Add((col, child));
+        if (!isRef) _entityClickTargets.Add((col, child)); // 参考点不是目标, 不注册右键入队
         _entityMarks.Add((holder, loc, child.gameObject));
+        if (isRef) {
+            // 参考点: 绿色十字 (横竖两线), 半臂 0.05 与菱形视觉匹配
+            var cross = new[] {
+                (new Vector3(-0.05f, 0f, 0f), new Vector3(0.05f, 0f, 0f)),
+                (new Vector3(0f, -0.05f, 0f), new Vector3(0f, 0.05f, 0f)),
+            };
+            foreach (var (a, b) in cross) {
+                var lineGo = new GameObject("FCS_EntityRefSeg");
+                lineGo.transform.SetParent(holder.transform, false);
+                var line = lineGo.AddComponent<Il2CppShapes.Line>();
+                line.Thickness = 0.01f;
+                line.Start = a;
+                line.End = b;
+                line.Color = color;
+                line.ColorStart = color;
+                line.ColorEnd = color;
+            }
+            return;
+        }
         float r = 0.05f * Mathf.Sqrt(2f); // 菱形半对角线 (正方形边长 0.1)
         var pts = new[] {
             new Vector3(0f, r, 0f), new Vector3(r, 0f, 0f),
@@ -992,6 +1114,80 @@ public class MapTable {
             line.Thickness = 0.01f;
             line.Start = pts[s];
             line.End = pts[(s + 1) % 4];
+            line.Color = color;
+            line.ColorStart = color;
+            line.ColorEnd = color;
+        }
+        if (armoured) {
+            // 装甲: 正方与菱形叠加, 边长一致 (正方形边长 = 菱形边长 0.1, 顶点共圆交错 45°). 同心套圈已被任务/齐射标记占用, 方菱叠加不与任何现有标记冲突.
+            var sq = new[] {
+                new Vector3(0.05f, 0.05f, 0f), new Vector3(-0.05f, 0.05f, 0f),
+                new Vector3(-0.05f, -0.05f, 0f), new Vector3(0.05f, -0.05f, 0f),
+            };
+            AddEntityMarkLines(holder.transform, sq, "FCS_EntityArmourSeg", color);
+        }
+        if (isFdc) {
+            // FDC: 六芒星* (三条线 60° 交叉, 每线横穿中心一整段), 与装甲正方形可叠加. 半径 0.0267 (0.04 缩小 1/3)
+            const float rh = 0.0267f;
+            for (int a = 0; a < 3; a++) {
+                float ang = Mathf.PI / 3f * a;
+                var dir = new Vector3(Mathf.Cos(ang), Mathf.Sin(ang), 0f);
+                var lineGo = new GameObject("FCS_EntityFdcSeg");
+                lineGo.transform.SetParent(holder.transform, false);
+                var line = lineGo.AddComponent<Il2CppShapes.Line>();
+                line.Thickness = 0.01f;
+                line.Start = dir * rh;
+                line.End = dir * -rh;
+                line.Color = color;
+                line.ColorStart = color;
+                line.ColorEnd = color;
+            }
+        }
+        if (isArty) {
+            // 炮兵: 实线圆 (16 段折线, 游戏自带 Dashed 圆在短段上失效, 手写实线). 半径 0.0267 (0.04 缩小 1/3)
+            const int n = 16;
+            var circle = new Vector3[n];
+            for (int i = 0; i < n; i++) {
+                float a = Mathf.PI * 2f * i / n;
+                circle[i] = new Vector3(Mathf.Sin(a) * 0.0267f, Mathf.Cos(a) * 0.0267f, 0f);
+            }
+            AddEntityMarkLines(holder.transform, circle, "FCS_EntityArtySeg", color);
+        }
+        if (isAa) {
+            // 防空炮: 中间两根平行短竖线 (半长 0.0267 与星/圆一致, 间距 ±0.02) + 底座横线 (两倍粗, 竖线 3/4 高处)
+            for (int s = -1; s <= 1; s += 2) {
+                var lineGo = new GameObject("FCS_EntityAaSeg");
+                lineGo.transform.SetParent(holder.transform, false);
+                var line = lineGo.AddComponent<Il2CppShapes.Line>();
+                line.Thickness = 0.01f;
+                line.Start = new Vector3(s * 0.02f, -0.0267f, 0f);
+                line.End = new Vector3(s * 0.02f, 0.0267f, 0f);
+                line.Color = color;
+                line.ColorStart = color;
+                line.ColorEnd = color;
+            }
+            var baseGo = new GameObject("FCS_EntityAaBaseSeg");
+            baseGo.transform.SetParent(holder.transform, false);
+            var baseLine = baseGo.AddComponent<Il2CppShapes.Line>();
+            baseLine.Thickness = 0.02f;
+            baseLine.Start = new Vector3(-0.02f, -0.0133f, 0f); // 竖线从顶往下 3/4 全高 (靠下): -0.0267 + 0.25*0.0534
+            baseLine.End = new Vector3(0.02f, -0.0133f, 0f);
+            baseLine.Color = color;
+            baseLine.ColorStart = color;
+            baseLine.ColorEnd = color;
+        }
+    }
+
+    /// <summary>实体标记线段组: pts 按序首尾相连, 与菱形框同宽同色.</summary>
+    private static void AddEntityMarkLines(Transform parent, Vector3[] pts, string name, Color color)
+    {
+        for (int s = 0; s < pts.Length; s++) {
+            var lineGo = new GameObject(name);
+            lineGo.transform.SetParent(parent, false);
+            var line = lineGo.AddComponent<Il2CppShapes.Line>();
+            line.Thickness = 0.01f;
+            line.Start = pts[s];
+            line.End = pts[(s + 1) % pts.Length];
             line.Color = color;
             line.ColorStart = color;
             line.ColorEnd = color;

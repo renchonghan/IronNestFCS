@@ -35,11 +35,11 @@ public class FcsSceneInteractor {
         InitializeTargetButtons();
     }
 
-    /// <summary>火控总控按钮 (与两列同高, 列顶右侧): Start/Pause 冻结/恢复全流程 (绿=运行, 橙=暂停), Stop 中止两炮并清队列.</summary>
+    /// <summary>火控总控按钮: Start/Pause 冻结/恢复全流程 (绿=运行, 橙=暂停), Stop 中止两炮并清队列. 与弹种列同一条斜排线 (每格 x-0.05 / y-0.0045), 排在弹种列延长线的上方, 同款薄片贴桌面.</summary>
     private void InitializeControlButtons() {
         const float z = -18.4181f;
-        var x = 0.88f;
-        var y = -0.65f;
+        var x = 0.9f;     // 弹种列斜线往右上延长两格: 弹种列顶 AP 在 (0.8, -0.65)
+        var y = -0.641f;
 
         GameObject? pauseButton = null;
         pauseButton = AddButton(() => {
@@ -47,7 +47,7 @@ public class FcsSceneInteractor {
             SetColor(pauseButton, fcs.Paused ? new Color(1f, 0.6f, 0f) : Color.green);
         }, Color.green);
         pauseButton.transform.position = new Vector3(x, y, z);
-        pauseButton.transform.localScale = Vector3.one * 0.02f; // 与其他按钮同款立方体
+        pauseButton.transform.localScale = new Vector3(0.02f, 0.004f, 0.02f); // 与弹种按钮同款平面薄片: 薄在 Y, 躺平贴桌面
         var pauseText = AddText("Start/Pause", 14f);
         pauseText.transform.SetParent(pauseButton.transform, false);
         pauseText.transform.localPosition = new Vector3(-1.9f, 0, -10.6f);
@@ -61,7 +61,7 @@ public class FcsSceneInteractor {
             fcs.StopAll();
         }, Color.red);
         stopButton.transform.position = new Vector3(x, y, z);
-        stopButton.transform.localScale = Vector3.one * 0.02f; // 与其他按钮同款立方体
+        stopButton.transform.localScale = new Vector3(0.02f, 0.004f, 0.02f);
         var stopText = AddText("Stop", 14f);
         stopText.transform.SetParent(stopButton.transform, false);
         stopText.transform.localPosition = new Vector3(-1.9f, 0, -10.6f);
@@ -146,6 +146,7 @@ public class FcsSceneInteractor {
                 task.targetId = targetId;
                 task.bulletType = selectedBulletType;
                 fcs.EnqueueTask(task);
+                fcs.MapTable.AttachMarkerTask(targetId, task); // 虚拟目标: 沙盘 T 标记物上挂双菱形火控框
                 SetColor(button, Color.gray);
                 button.GetComponent<Collider>().enabled = false;
                 MelonCoroutines.Start(InvokeDelay(() => {
@@ -180,6 +181,26 @@ public class FcsSceneInteractor {
         }
     }
 
+    /// <summary>T1-T4 炮兵标记物右键入队: 标记物没 collider 就补个小点击盒, 不画任何东西 (虚拟目标, 无单菱形).</summary>
+    private readonly HashSet<Collider> _registeredMarkerColliders = new();
+    public void RegisterMarkerClickTargets() {
+        foreach (var (marker, id) in fcs.MapTable.ArtilleryMarkers) {
+            if (marker == null) continue;
+            var self = marker.GetComponent<Collider>();
+            var children = marker.GetComponentsInChildren<Collider>(true);
+            MelonLogger.Msg($"[FCS] Marker T{id} '{marker.name}' selfCollider={self != null} childColliders={children.Length} pos={marker.localPosition} scale={marker.lossyScale}");
+            var collider = self != null ? self : (children.Length > 0 ? children[0] : null);
+            if (collider == null) {
+                collider = marker.gameObject.AddComponent<BoxCollider>();
+                var box = (BoxCollider)collider;
+                box.size = new Vector3(0.1f, 0.1f, 0.05f); // 标记物大小的点击盒
+            }
+            if (!_registeredMarkerColliders.Add(collider)) continue; // 已注册过
+            var m = marker; // 闭包捕获
+            clicks.Register(collider, () => fcs.ToggleEntityTask(m, selectedBulletType), right: true); // 右键 (左键留给游戏自身拖拽)
+        }
+    }
+
     /// <summary>键盘快捷键触发射击目标(对应小键盘 1-4), 等价于点击 T1-T4 按钮.</summary>
     public void FireTarget(int targetId) {
         if (!targetButtons.TryGetValue(targetId, out var button)) return;
@@ -189,6 +210,7 @@ public class FcsSceneInteractor {
         task.targetId = targetId;
         task.bulletType = selectedBulletType;
         fcs.EnqueueTask(task);
+        fcs.MapTable.AttachMarkerTask(targetId, task); // 虚拟目标: 沙盘 T 标记物上挂双菱形火控框
         SetColor(button, Color.gray);
         button.GetComponent<Collider>().enabled = false;
         MelonCoroutines.Start(InvokeDelay(() => {

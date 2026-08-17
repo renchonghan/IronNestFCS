@@ -39,7 +39,21 @@ public class Turret {
         try { return Convert.ToSingle(_currentAngleProp.GetValue(_turret)); }
         catch { return float.NaN; }
     }
+
+    /// <summary>炮塔旋转速度反馈 (TRAK 双环速度环用, 未绑定时返回 0).</summary>
+    public float RotationVelocity() {
+        return _turret == null ? 0f : _turret.rotationVelocity;
+    }
     
+    /// <summary>只设炮塔目标方位一次, 不等待到位 (TRAK PID 追踪循环 25fps 调用).</summary>
+    public void SetDesiredRotation(float angle) {
+        if (_turret == null) {
+            MelonLogger.Error("[FCS] Aiming: unbound TurretController");
+            return;
+        }
+        _turret.DesiredRotation = -angle;
+    }
+
     public IEnumerator SetRotation(float angle) {
         if (_turret == null) {
             MelonLogger.Error("[FCS] Aiming: unbound TurretController");

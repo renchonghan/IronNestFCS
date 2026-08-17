@@ -82,7 +82,8 @@ public class TacticalRadar
                 bool hostile = IsHostile(loc, child);
                 bool isAlive = IsUnitAlive(loc, child.gameObject);
                 var entityInfo = GetEntityInfo(loc);
-                Log($"[Radar] Entity: {child.name}  hostile={hostile}  alive={isAlive}  icon={entityInfo.icon}  role={entityInfo.role}  roleNum={entityInfo.roleNum}");
+                Vector2 km = GetEntityKmPos(new UnitEntry { WorldPos = child.position, Location = loc });
+                Log($"[Radar] Entity: {child.name}  hostile={hostile}  alive={isAlive}  icon={entityInfo.icon}  role={entityInfo.role}  roleNum={entityInfo.roleNum}  km=({km.x:F2},{km.y:F2})");
                 if (!hostile) continue;
                 if (IsExcludedUnit(child.name)) continue;
                 units.Add(new UnitEntry
@@ -368,6 +369,59 @@ public class TacticalRadar
         catch { }
 
         return go.activeSelf;
+    }
+
+    /// <summary>实体装甲信息: (Armour 值, 免疫弹种数). 装甲目标 = Armour>0 或有免疫弹种 (只有非免疫弹种能处理).</summary>
+    /// <summary>实体 Icon 字符串 (如 "Enemy Field Artillery Observer"), 无则空串.</summary>
+    internal static string GetIcon(EntityLocation loc)
+    {
+        try
+        {
+            var type = loc.GetType();
+            var entityProp = type.GetProperty("Entity", BindingFlags.Public | BindingFlags.Instance);
+            if (entityProp == null) return "";
+            var entity = entityProp.GetValue(loc);
+            if (entity == null) return "";
+            var iconProp = entity.GetType().GetProperty("Icon", BindingFlags.Public | BindingFlags.Instance);
+            if (iconProp == null) return "";
+            var v = iconProp.GetValue(entity);
+            if (v is string s) return s;
+        }
+        catch { }
+        return "";
+    }
+
+    internal static (int armour, int immune) GetArmour(EntityLocation loc)
+    {
+        try
+        {
+            var type = loc.GetType();
+            var entityProp = type.GetProperty("Entity", BindingFlags.Public | BindingFlags.Instance);
+            if (entityProp == null) return (0, 0);
+            var entity = entityProp.GetValue(loc);
+            if (entity == null) return (0, 0);
+            var entType = entity.GetType();
+
+            int armour = 0;
+            var armourProp = entType.GetProperty("Armour", BindingFlags.Public | BindingFlags.Instance);
+            if (armourProp != null)
+            {
+                var v = armourProp.GetValue(entity);
+                if (v is int i) armour = i;
+            }
+
+            int immune = 0;
+            var immuneProp = entType.GetProperty("ImmuneShells", BindingFlags.Public | BindingFlags.Instance);
+            if (immuneProp != null)
+            {
+                var v = immuneProp.GetValue(entity);
+                var list = v as Il2CppSystem.Collections.Generic.List<string>;
+                if (list != null) immune = list.Count;
+            }
+            return (armour, immune);
+        }
+        catch { }
+        return (0, 0);
     }
 
     internal static bool IsHostile(EntityLocation loc, Transform t)

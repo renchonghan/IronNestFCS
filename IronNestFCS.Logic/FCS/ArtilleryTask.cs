@@ -41,6 +41,9 @@ public class ArtilleryTask {
     public ArtilleryTask? salvoLeader;
     /// <summary>火控解总飞行时间: WaitForFire 击发前从炮兵计时器拷贝, 未拷贝时为 0.</summary>
     public float impactTime;
+    /// <summary>TRAK 追踪预测目标: 1 帧后 (25fps) 的方位角/距离 (当前 + 上一帧差分外推), PID 追踪用; 静态目标与参数相同.</summary>
+    public float trackAngel;
+    public float trackDistance;
     /// <summary>击发时刻 (Time.time), 0 = 未击发. 地图菱形框下方的落点计时器用.</summary>
     public float fireTime;
     /// <summary>弹道计算器真实输出的仰角, 解算后快照 (计算器全局唯一, 必须按任务快照).</summary>

@@ -564,6 +564,15 @@ public class GunSystem {
         return null;
     }
 
+    /// <summary>只设仰角杆值一次, 不等待到位 (TRAK PID 追踪循环 25fps 调用).</summary>
+    public void SetElevationValue(float elevation) {
+        if (elevationLever == null) {
+            MelonLogger.Error($"[FCS] GunSystem {_surfix}: Elevation lever unbound");
+            return;
+        }
+        elevationLever.SetSliderValue(elevation);
+    }
+
     public IEnumerator SetElevation(float elevation) {
         if (elevationLever == null || gunController == null) {
             MelonLogger.Error($"[FCS] GunSystem {_surfix}: Elevation lever or gun controller unbound");
@@ -787,6 +796,11 @@ public class GunSystem {
             yield return new WaitForSeconds(0.1f);
         }
     }
+
+    /// <summary>击发完成标志 (pendingReload 已置位, TRAK 手动模式检测玩家击发用).</summary>
+    public bool HasFired() {
+        return gunController != null && gunController.pendingReload;
+    }
     
     public int RemainingCharges() {
         return (int)remainingCharges.CurrentNumber;
@@ -893,6 +907,11 @@ public class GunSystem {
     /// <summary>炮管实际仰角 (面板行 1 用, 未绑定时返回 NaN).</summary>
     public float ActualElevation() {
         return gunController == null ? float.NaN : gunController.CurrentElevation;
+    }
+
+    /// <summary>仰角速度反馈 (TRAK 双环速度环用, 未绑定时返回 0).</summary>
+    public float ElevationVelocity() {
+        return gunController == null ? 0f : gunController.elevationChangeVelocity;
     }
 
     /// <summary>
