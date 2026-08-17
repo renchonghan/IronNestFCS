@@ -30,8 +30,42 @@ public class FcsSceneInteractor {
     }
 
     public void Initialize() {
+        InitializeControlButtons();
         InitializeBulletTypeButtons();
         InitializeTargetButtons();
+    }
+
+    /// <summary>火控总控按钮 (与两列同高, 列顶右侧): Start/Pause 冻结/恢复全流程 (绿=运行, 橙=暂停), Stop 中止两炮并清队列.</summary>
+    private void InitializeControlButtons() {
+        const float z = -18.4181f;
+        var x = 0.88f;
+        var y = -0.65f;
+
+        GameObject? pauseButton = null;
+        pauseButton = AddButton(() => {
+            fcs.TogglePause();
+            SetColor(pauseButton, fcs.Paused ? new Color(1f, 0.6f, 0f) : Color.green);
+        }, Color.green);
+        pauseButton.transform.position = new Vector3(x, y, z);
+        pauseButton.transform.localScale = Vector3.one * 0.02f; // 与其他按钮同款立方体
+        var pauseText = AddText("Start/Pause", 14f);
+        pauseText.transform.SetParent(pauseButton.transform, false);
+        pauseText.transform.localPosition = new Vector3(-1.9f, 0, -10.6f);
+        pauseText.transform.localScale = Vector3.one * 1.0f;
+
+        x -= 0.05f;
+        y -= 0.0045f;
+
+        GameObject? stopButton = null;
+        stopButton = AddButton(() => {
+            fcs.StopAll();
+        }, Color.red);
+        stopButton.transform.position = new Vector3(x, y, z);
+        stopButton.transform.localScale = Vector3.one * 0.02f; // 与其他按钮同款立方体
+        var stopText = AddText("Stop", 14f);
+        stopText.transform.SetParent(stopButton.transform, false);
+        stopText.transform.localPosition = new Vector3(-1.9f, 0, -10.6f);
+        stopText.transform.localScale = Vector3.one * 1.0f;
     }
 
     private void InitializeBulletTypeButtons() {
@@ -49,7 +83,7 @@ public class FcsSceneInteractor {
                 }
             }, type == BulletType.AP ? Color.green : Color.white);
             button.transform.position = new Vector3(x, y, z);
-            button.transform.localScale = Vector3.one * 0.02f;
+            button.transform.localScale = new Vector3(0.02f, 0.004f, 0.02f); // 平面薄片: 薄在 Y, 躺平贴桌面 (XZ 平面, Y 高度), 保留 BoxCollider 点击
             bulletTypeBtns.Add(button);
             var text = AddText(type.ToString(), 14f);
             text.transform.SetParent(button.transform, false);
@@ -75,7 +109,7 @@ public class FcsSceneInteractor {
             SetColor(autoFireButton, AutoFire ? Color.red : Color.white);
         }, AutoFire ? Color.red : Color.white);
         autoFireButton.transform.position = new Vector3(x, y, z);
-        autoFireButton.transform.localScale = Vector3.one * 0.02f;
+        autoFireButton.transform.localScale = new Vector3(0.02f, 0.004f, 0.02f); // 平面薄片: 薄在 Y, 躺平贴桌面 (XZ 平面, Y 高度), 保留 BoxCollider 点击
         var autoFiretext = AddText("Auto Fire", 14f);
         autoFiretext.transform.SetParent(autoFireButton.transform, false);
         autoFiretext.transform.localPosition = new Vector3(-1.9f, 0, -10.6f);
@@ -90,7 +124,7 @@ public class FcsSceneInteractor {
             SetColor(maxChargeButton, maxCharge ? Color.red : Color.white);
         }, maxCharge ? Color.red : Color.white);
         maxChargeButton.transform.position = new Vector3(x, y, z);
-        maxChargeButton.transform.localScale = Vector3.one * 0.02f;
+        maxChargeButton.transform.localScale = new Vector3(0.02f, 0.004f, 0.02f); // 平面薄片: 薄在 Y, 躺平贴桌面 (XZ 平面, Y 高度), 保留 BoxCollider 点击
         var maxChargeText = AddText("Max Charge", 14f);
         maxChargeText.transform.SetParent(maxChargeButton.transform, false);
         maxChargeText.transform.localPosition = new Vector3(-1.9f, 0, -10.6f);
@@ -120,7 +154,7 @@ public class FcsSceneInteractor {
                 }, 1f));
             }, Color.red);
             button.transform.position = new Vector3(x, y, z);
-            button.transform.localScale = Vector3.one * 0.02f;
+            button.transform.localScale = new Vector3(0.02f, 0.004f, 0.02f); // 平面薄片: 薄在 Y, 躺平贴桌面 (XZ 平面, Y 高度), 保留 BoxCollider 点击
             targetButtons[targetId] = button;
             var text = AddText("T" + targetId, 14f);
             text.transform.SetParent(button.transform, false);
@@ -135,11 +169,14 @@ public class FcsSceneInteractor {
     public void TaskFinished(ArtilleryTask task) {
     }
 
-    /// <summary>[临时调试] 把地图实体菱形框注册为点击目标: 点击直接按实体当前位置入队.</summary>
+    /// <summary>把地图实体菱形框注册为右键点击目标: 点击直接按实体当前位置入队/取消. 内部去重.</summary>
+    private readonly HashSet<Collider> _registeredEntityColliders = new();
     public void RegisterEntityClickTargets(IReadOnlyList<(Collider collider, Transform entity)> targets) {
+        _registeredEntityColliders.RemoveWhere(c => c == null); // 清掉已销毁的 (阵亡删除挂件)
         foreach (var (collider, entity) in targets) {
+            if (!_registeredEntityColliders.Add(collider)) continue; // 已注册过
             var e = entity; // 闭包捕获
-            clicks.Register(collider, () => fcs.ToggleEntityTask(e, selectedBulletType), right: true); // 右键: 入队/取消
+            clicks.Register(collider, () => fcs.ToggleEntityTask(e, selectedBulletType), right: true);
         }
     }
 
@@ -229,6 +266,8 @@ public class FcsSceneInteractor {
         var button = GameObject.CreatePrimitive(PrimitiveType.Cube);
         destroyOnShutdown.Add(button);
         var collider = button.GetComponent<Collider>();
+        // 视觉是薄片 (Y 0.004), 从浅视角射线很难命中; 点击盒加高 10 倍成隐形厚盒兜住
+        if (collider is BoxCollider box) box.size = new Vector3(1f, 10f, 1f);
         clicks.Register(collider, onClick);
         SetColor(button, color);
         return button;

@@ -91,6 +91,7 @@
 - `Player Turret Piece` (**铁巢棋子**, DraggableItem, 玩家可拖动)
 - 令牌: `MapToken_Artillery` (炮击目标 1-4 = T1-T4) / `MapToken_RefrencePoint` (参考点) / `MapToken_Recon` (侦察)
 - 实体: `Fire Mission Root` 子物体, 每个带 `EntityLocation` (名字如 hostiletank#1 / allyinfantry#3 / enemytarget#1 / fdc#1)
+  - **实体坐标系单位 = km**: Fire Mission Root 1 单位 = 1 km = MapCellSize(0.262) 板面单位; 世界缩放 = 0.262 x 板面世界缩放 0.81 ≈ 0.212 (实体自身 localScale=1, lossyScale≈0.21). Draggable Surface 世界缩放 0.81. 挂在实体下的自绘元素: 半径/线宽都除以"实体世界缩放/板面世界缩放"即得 km 制局部值
 - `---ImpactMarkerManager` (ImpactMarkerManager + ImpactTracker):
   - `turretController` (真实炮塔引用)
   - `markerDataList` (每炮 MarkerData: gun/container/activeMarkerInstance/lastMarkerName)
@@ -102,7 +103,22 @@
 - 组件: `MapMarkerLineUI` (line/disc/pointerTip/pointerRotationOffsetDegrees/angleLabel/distanceLabel/minimumDragDistance=0.075/speedNormalizationRange=13) + `MapMarkerHitTarget` (测速, 对动射击可用)
 - 线条核心: **Il2CppShapesRuntime** 程序集的 `Il2CppShapes.Line`
   - `Start` / `End` (Vector3, 线的局部空间) / `Thickness` (0.003-0.01 板面单位可用) / `Color` / `ColorStart` / `ColorEnd` / `Dashed` / `endCaps` / `geometry=Flat2D`
+  - 虚线参数 (探针实读): `MatchDashSpacingToSize=true` (周期跟线宽走), `DashSize=4` / `DashSpacing=4` (即实/空 = 4 x 线宽), `DashOffset=0` - **虚线按整条线排周期, 短段上显不出虚线** (杀伤圈因此手排短实线弧+留空)
 - `Il2CppShapes.Disc`: `Radius` / `Color` / `HasThickness` (只读, 空心需 `type=Ring`, 但 DiscType 枚举 stub 不可见 - 改用四条 Line 画菱形)
+
+### 1.10 弹种定义 (ShellDefinition 资产, ScriptableObject)
+
+场景里有 21 个 ShellDefinition 资产 (名字如 `ShellDefinition_AP` / `ShellDefinition_STAR`), 通过 `Resources.FindObjectsOfTypeAll<ScriptableObject>()` + 类型名过滤扫描. 关键字段:
+
+- `ShellId` (string, 如 "AP"/"STAR"; 注意游戏侧 PCLM 叫 PLCM) / `DisplayName` / `Description`
+- **`ShellSpeed` = 0.7 (全部 21 个弹种同值)**
+- **`ImpactRadius` (float, km, 半径!) = 各弹种杀伤半径真值** (AP/LE/PCLM 0.15, APHE/HE/INCN 0.25, THRM 0.35, STAR/CLMN/PRPG 0.5, EQKE/HCHE 0.55, FLCH/PHGN 0.62, CYAN/TEAR/WP 0.75, SMK 1.0, DRIL 0.07, ATMC 3.0)
+- `maxPowderCharges` = 6 / `defaultPowderCharge` = 3
+- `chargeRangeMappings` (PowderChargeRangeMapping[]): 每药包 maxRange = 5/10/15/20/25/30 km (minRange 全 0)
+- **`chargeToSpeedMultiplier` (AnimationCurve, 全弹种同一条)**: c1=0.30 c2=0.3728 c3=0.5464 c4=0.7536 c5=0.9272 c6=1.0
+- `chargeToHorizontal/VerticalDispersionMultiplier` (AnimationCurve)
+
+弹种间的差异只有 ImpactRadius/Damage/ImpactGraph 等 - 弹道(速度/射程/装药)全弹种通用.
 
 ---
 
@@ -113,7 +129,11 @@
 - **网格**: A-T x 1-10 大格, 每大格 9x9 小格; 1 小格 ≈ 111 m ≈ 0.0291 板面单位
 - **世界偏移** (GetMarkTarget 的 position 换算): 板面局部 x 3.8164 + (10.016, 5.235)
 - **方向角约定**: `SignedAngle(target, Vector3.up, Vector3.forward)`, 0 = 北(+Y), 顺时针正; **必须在板面局部系算, 网格画布空间朝向不同会打飞**
-- **装药查表** MinimumCharge: <5km=1, <10km=2, <15km=3, <20km=4, <25km=5, 其余 6
+- **装药查表** MinimumCharge: <5km=1, <10km=2, <15km=3, <20km=4, <25km=5, 其余 6 (= 距离/5 向上取整, 与游戏 chargeRangeMappings 一致)
+- **射表公式** (用户射表, 与游戏计算器输出一致): 仰角(度) = 距离(km) x 12 / 药包; 每段末端正好 60° (5km@1包 ... 30km@6包)
+- **飞行时间公式** (探针实测拟合, 各药包全中): 飞行时间(s) = 距离(km) x 10/7 / 速度倍率. 等价: 仰角系数 D(c) = 1.4 x mult(c) x 6/c (实测 c1 2.52 / c2 1.57 / c3 1.53 / c4 1.58 / c5 1.56 / c6 1.40). 6 包时退化为 距离 x 10/7 (60°→42.86s 实测全段线性). 注意: 游戏 PredictedImpactTime 是活变量, 手动玩不重算时读数可能来自旧解
+- **杀伤半径**: 直接用游戏 `ShellDefinition.ImpactRadius` (km, 半径), 见 1.10 表; 未知弹种回落 0.625 (ShellData.KillRadiusKm)
+- **游戏弹道计算器仍需保留 Calculate 步骤**: 游戏只在按 Calculate 时存储"已计算装药数", 药包杆最多允许拉到该数 (推药杆解锁依赖), 仰角/飞行时间由 mod 公式直算, 不再读计算台输出
 
 ---
 
@@ -122,7 +142,7 @@
 1. `Transform.Find` / `FindChild` 只查**直接子级**, 不是递归 - 深层的用自己写 `FindChildDeep`
 2. `GetComponents<Component>()` 按基类封箱, `is` 判断失效 - 用 `Cast<T>()` try/catch 逐类型试
 3. `Font.CreateDynamicFontFromOSFont` 被 IL2CPP 裁剪 (Method unstripping failed) - 用游戏自带 `TMP_FontAsset.sourceFontFile` (Inconsolata-SemiBold 真等宽)
-4. 运行时 `AddComponent<TextMeshPro>()` 不渲染 (ForceMeshUpdate 也没救) - 改用 Il2CppShapes.Line 画七段数码
+4. 运行时 `AddComponent<TextMeshPro>()` 不渲染 (ForceMeshUpdate 也没救) - 改用 Il2CppShapes.Line 画十六段米字数码
 5. 枚举 stub 不可见 (`LineColorMode` / `DiscType` 等, 找不到命名空间) - 反射 `Enum.Parse` 设值或绕开
 6. `GameObject.CreatePrimitive` 默认材质着色器被裁剪 (渲染紫块); 克隆场景材质会带原贴图 - 用游戏自己的 `InteractionLight Green` (高发射) 等材质
 7. `FindObjectsOfTypeAll` 枚举可能含**销毁中的 null 组件**, 必须判空
@@ -149,6 +169,11 @@
 | ProbeArtilleryTimer | 炮兵计时器 (确认为 PredictedImpactTime) |
 | ProbeDrawnArrows | 玩家画的箭头 (MapMarkerLineUI + Line 字段) |
 | ProbeNestPrompt | 含"铁巢"的 TMP 文本扫描 |
+| ProbeBallisticData | 扫描全部 ShellDefinition 资产 (杀伤半径/速度曲线/射程映射) |
+| DumpShellDefinition | 单个 ShellDefinition dump (字段解箱 + 曲线 Evaluate + 映射表逐元素) |
+| ProbeFlightFormula | 每秒打印左炮仰角/飞行时间 (拟合飞行时间公式用) |
+| ProbeEntityScale | 实体缩放链 (发现 Fire Mission Root 0.21) |
+| ProbeDashParams | Line 虚线参数 (DashSize/DashSpacing = 4 x 线宽) |
 
 ---
 
@@ -157,5 +182,12 @@
 - **面板**: 两行火控状态 (行1 炮实际状态 FT:, 行2 火控解 T:-), 两列队列 (任务/完成, 固定 8 行), 荧光绿等宽字体
 - **CALL 枢纽状态机**: 检查点鲁棒性 (推弹中读数不可信), 计数器防死循环, 单次解算
 - **铁巢棋子吸附**: turretBase 真源, 10fps, 沙盘校准
-- **地图元素**: 实体菱形框 (敌对红/友军蓝), 右键入队/取消, 序列标签 (七段数码), 落点计时器 (整秒), 瞄准十字/X (CanFire 显示), 铁巢->目标虚线
+- **地图元素**: 实体菱形框 (敌对红/友军蓝), 右键入队/取消, 序列标签 (十六段米字数码), 落点计时器 (整秒), 瞄准十字/X (CanFire 显示), 铁巢->目标虚线
 - **炮兵计时表**: GunStopwatch 读数, 行 1 瞄准期读活变量 PredictedImpactTime
+
+## 6. 火控台实现方式 (设计方向)
+
+- **刷新帧率**: 25fps
+- **文字组件**: 16 画字 (外框"口" + 内部"米") 实现字符显示; 单文本框最多 4 字符, 中心对齐
+- **图形函数**: 复用现有 Line 形状的绘制实现 (菱形 / 十字 / X / 虚线)
+- **实体绑定**: 搜索到目标后为实体生成挂件, 图形和文本框隶属于实体, 点击针对实体, 实体消失挂件随之消失

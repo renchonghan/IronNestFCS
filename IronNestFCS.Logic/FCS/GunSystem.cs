@@ -812,6 +812,84 @@ public class GunSystem {
         return gunController == null ? 0f : gunController.PredictedImpactTime;
     }
 
+    /// <summary>
+    /// [临时调试] 弹道数据源探针: 扫描场景里所有 ShellDefinition 资产,
+    /// dump 速度倍率曲线/射程映射表/杀伤半径等弹道数值. 用完删.
+    /// </summary>
+    public void ProbeBallisticData() {
+        MelonLogger.Msg("[FCS_DEBUG] ===== ballistic data probe =====");
+        if (gunController != null) DumpNativeFields(gunController, "GunController");
+        int count = 0;
+        foreach (var so in Resources.FindObjectsOfTypeAll<ScriptableObject>()) {
+            if (so == null) continue;
+            if (so.GetIl2CppType().Name != "ShellDefinition") continue;
+            DumpShellDefinition(so, so.name);
+            count++;
+        }
+        MelonLogger.Msg($"[FCS_DEBUG]   ShellDef asset count = {count}");
+    }
+
+    /// <summary>dump 单个 ShellDefinition: 普通字段解箱打印, 曲线 Evaluate 1-6, 射程映射表逐元素.</summary>
+    private static void DumpShellDefinition(Il2CppSystem.Object def, string label) {
+        try {
+            var t = def.GetIl2CppType();
+            var flags = Il2CppSystem.Reflection.BindingFlags.Public
+                | Il2CppSystem.Reflection.BindingFlags.NonPublic
+                | Il2CppSystem.Reflection.BindingFlags.Instance;
+            MelonLogger.Msg($"[FCS_DEBUG] ==== ShellDef {label} ====");
+            foreach (var f in t.GetFields(flags)) {
+                try {
+                    if (f.Name == "chargeToSpeedMultiplier") {
+                        // 速度倍率曲线: Unity 结构体用 Pointer 构造包装, 打印 1-6 药包取值
+                        var boxed = f.GetValue(def);
+                        var curve = new AnimationCurve(boxed.Pointer);
+                        var sb = new System.Text.StringBuilder();
+                        for (int c = 1; c <= 6; c++) sb.Append($"c{c}={curve.Evaluate(c):F4} ");
+                        MelonLogger.Msg($"[FCS_DEBUG]   ShellDef.chargeToSpeedMultiplier: {sb}");
+                        continue;
+                    }
+                    if (f.Name == "chargeRangeMappings") {
+                        // 每药包射程映射表: 数组逐元素 dump 字段
+                        var arr = f.GetValue(def).Cast<Il2CppSystem.Array>();
+                        var sb3 = new System.Text.StringBuilder();
+                        sb3.Append($"length={arr.Length}");
+                        for (int i = 0; i < arr.Length; i++) {
+                            var elem = arr.GetValue(i);
+                            var et = elem.GetIl2CppType();
+                            sb3.Append($" [{i}]");
+                            foreach (var ef in et.GetFields(flags)) {
+                                try {
+                                    var ev = ef.GetValue(elem);
+                                    string val;
+                                    try { val = ev.Unbox<float>().ToString("F4"); }
+                                    catch { val = ev?.ToString() ?? "<null>"; }
+                                    sb3.Append($" {ef.Name}={val}");
+                                }
+                                catch { sb3.Append($" {ef.Name}=<err>"); }
+                            }
+                        }
+                        MelonLogger.Msg($"[FCS_DEBUG]   ShellDef.chargeRangeMappings: {sb3}");
+                        continue;
+                    }
+                    var v = f.GetValue(def);
+                    string val2;
+                    try { val2 = v.Unbox<float>().ToString("F4"); }
+                    catch {
+                        try { val2 = v.Unbox<int>().ToString(); }
+                        catch { val2 = v?.ToString() ?? "<null>"; }
+                    }
+                    MelonLogger.Msg($"[FCS_DEBUG]   nfield ShellDef.{f.Name} = {val2}");
+                }
+                catch {
+                    MelonLogger.Msg($"[FCS_DEBUG]   nfield ShellDef.{f.Name} = <err>");
+                }
+            }
+        }
+        catch (Exception ex) {
+            MelonLogger.Msg($"[FCS_DEBUG]   shell def dump err ({label}): {ex.Message}");
+        }
+    }
+
     /// <summary>炮管实际仰角 (面板行 1 用, 未绑定时返回 NaN).</summary>
     public float ActualElevation() {
         return gunController == null ? float.NaN : gunController.CurrentElevation;
@@ -843,6 +921,12 @@ public class GunSystem {
     public float CountdownRemainingSeconds() {
         if (_stopwatch == null || _stopwatch.state != "CountingDown") return float.NaN;
         return _stopwatch.previousCountingDownRemainingSeconds;
+    }
+
+    /// <summary>击发后取炮兵计时表真值: (倒计时起点, 闩锁总飞行时间). 未倒计时/表未绑返回 null.</summary>
+    public (float startTime, float travelTime)? StopwatchLatch() {
+        if (_stopwatch == null || _stopwatch.state != "CountingDown") return null;
+        return ((float)_stopwatch.countdownStartTime, _stopwatch.latchedTravelTime);
     }
 
     public float RemainingFlightSeconds() {
