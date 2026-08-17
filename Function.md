@@ -96,11 +96,9 @@ Numpad 7/8/9 触发: 停该炮管全部协程 -> 强制释放两把锁 -> 清空
 | 2-3 | PWDR | 解算 + 按差补拉药包杆 + 推药 (锁内, 唯一解算点之一) |
 | 2-4 | LOAD | 等装填完成 (CanFire) |
 | 2-5 | COFM | 击发前装药确认 (实装 vs 快照, 差异回 CALL) |
-| 3-1 | EAIM/TRAK | 仰角杆天顶星伺服设 1 帧预测目标仰角 + I 修正 (16 帧误差窗口和 × ki=0.05, 消除持续滞后) + D 阻尼 (误差差分 × kd=6.0 + 0.01° 差分死区, 抑制震荡与高频量化噪声); **套上并跟踪稳定** = 误差 0.01° 且速度收住连续 5 帧 (0.2s); 10s 无进展兜底 |
-| 3-2 | HAIM/TRAK | 方位与 3-1 **双轴并行** (同一 25fps 循环交替推进, 先等后台预约首转到位); 炮塔天顶星伺服设 1 帧预测方位 + I 修正 + D 阻尼 (同参数); 套上并跟踪稳定 = 误差 0.1° 且速度收住连续 5 帧; 10s 无进展兜底 |
-| 3-3 | WAIT/TRAK | **与 3-1/3-2 合并为持续追踪循环**: 套上后不停, 目标动了继续追; 双轴都套上并稳定 → 五步确认 + Arm 解除保险 (一次性); AutoFire 开则立即击发, 否则持续追踪等玩家击发 (pendingReload 检测) |
-| 3-4 | FIRE | 击发瞬间 (AutoFire 秒过) |
-| 3-5 | RSET | 回位 (13s 最小恢复 + 机构空闲) |
+| 3-1 | TRAK | 双轴并行持续追踪 (25fps, 同一循环, 不切相位): 天顶星伺服设 1 帧预测值 + I 修正 (16 帧误差窗口和 × ki=0.05, 消除持续滞后) + D 阻尼 (误差差分 × kd=6.0 + 0.01° 差分死区); **套上并跟踪稳定** = E 误差 0.01° / H 0.1° 且速度收住连续 5 帧 (0.2s); 套上后不停, 目标动了继续追; 套上后同一循环内五步确认 + Arm 解除保险 (一次性); 10s 无进展兜底 (放弃轴锁套上) |
+| 3-2 | FIRE | 击发瞬间 (TRAK 段内套上后解除保险: 五步确认 + Arm 一次性 → AutoFire 立即击发 / 手动等玩家击发) → 击发快照 + 完成入列 |
+| 3-3 | RSET | 回位 (13s 最小恢复 + 机构空闲) |
 | 0-0 | IDLE / FAIL | 空闲 / 失败 |
 
 ### 5.2 弹种保护状态机 (最多两轮)
@@ -163,11 +161,10 @@ LOAD > COFM
    - 实装 >= 需求: 跳过装填, 解算放 3-1 EAIM 前 (锁内)
    - **2-3 PWDR 唯一解算点**: 游戏只在按 Calculate 那一刻存储"已计算装药数", 药包杆最多允许拉到这个数; 弹道计算器全局唯一, 另一炮的解算会改写存储值 → 锁内完整重算 (距离/方向/装药/弹种 + Calculate) 后按差补拉 (实拉不足补拉差 / 超出回 CALL 带条件 / 符合或超时直接推药) → 2-4 LOAD 等 CanFire
 6. **2-5 COFM 击发前装药确认**: 对比实际实装 vs task.charge 快照; 一致直接过; 差异回 CALL (不本地重算)
-7. **3-1 EAIM 升仰角** (退弹轮平射跳过): SetElevation 循环, 10s 无进展放弃; **仰角就位后锁存总飞行时间** (task.impactTime = 活变量 PredictedImpactTime)
-8. **3-2 HAIM**: 等炮塔水平到位 (turret.Ready)
-9. **3-3/3-4 击发**: 五步确认 (任务/弹种/旋转/仰角/准备) → Arm → 3-4 FIRE (AutoFire 秒过) → WaitFire (等 pendingReload). 游戏击发校验的是**实时状态** (实际仰角/膛内弹种/飞行时间/装填完成), 不读计算台; impactTime 未锁存时在 Arm 后兜底拷贝; **全程持 deskLock 串行过台** (确认台全局唯一, 防两炮抢台)
-10. **非退弹轮**: 3-5 RSET 回位 (13s + 机构空闲) → Finished → 释放槽位拉下一单; finally 归还炮塔锁. **退弹轮**: 不归还炮塔, 等 2s 进入下一轮
-11. **两轮未完 (兜底)**: 归还炮塔 → Failed → 释放槽位
+7. **3-1 TRAK 持续追踪** (退弹轮平射跳过): 双轴并行 25fps 循环追 1 帧预测点, 套上并稳定后同一循环内五步确认 + Arm 解除保险; 击发快照 + 完成入列 (LatchFireTime + AddFinished); 退弹轮仍走旧 FireSequence
+8. **3-2 FIRE**: AutoFire 解除保险即击发 (TriggerConsole.Fire + WaitFire 等 pendingReload) / 手动持续追踪等玩家击发. 游戏击发校验的是**实时状态** (实际仰角/膛内弹种/飞行时间/装填完成), 不读计算台; **确认台串行过台** (deskLock, 防两炮抢台)
+9. **3-3 RSET 回位** (13s + 机构空闲) → Finished → 释放槽位拉下一单; finally 归还炮塔锁. **退弹轮**: 不归还炮塔, 等 2s 进入下一轮
+10. **两轮未完 (兜底)**: 归还炮塔 → Failed → 释放槽位
 
 ### 5.4 相关机制
 
@@ -215,7 +212,7 @@ LOAD > COFM
 | 代号 | 名称 | 齐射语义 |
 | --- | --- | --- |
 | 1-0 | PEND | 齐射对等待调度: **两炮同时空闲**才一起出队 (主+随), 只空闲一门整对等待 |
-| 1-1 | CALL | 检查两炮: 药包库存 >= 2 x 需求 (两炮共用池), 膛内弹种正确才下一步 (误弹走 DUMP) |
+| 1-1 | CALL | 检查两炮: 药包库存 >= 2 x 需求 (两炮共用池), 膛内弹种正确才下一步 (误弹走 DUMP); **快速路径**: 两炮同弹同装药 (实装 >= 需求, 均 CanFire) → 锁内解算一次直接进 TRAK, 跳过装填段 |
 | 1-2 | SELC | 两炮弹仓都转到目标弹种, 双方对位才下一步 |
 | 1-3 | DUMP | 双炮退弹平射 (各自打掉误弹), 两炮都平射完回 CALL |
 | 2-1 | BLRD | 两炮一起按推弹按钮 (一闪而过) |
@@ -223,11 +220,9 @@ LOAD > COFM
 | 2-3 | PWDR | **解算一次** (计算台全局唯一, 同目标同距离同装药, 一次 Calculate 供两炮); 两炮同时拉杆, 都拉到位才推药 |
 | 2-4 | LOAD | 两炮都 CanFire |
 | 2-5 | COFM | 两炮实装 vs 快照都一致 (任一差异回 CALL) |
-| 3-1 | EAIM | 两炮同时升仰角 (同仰角), 都到位 — 齐射相位同步点之一 |
-| 3-2 | HAIM | 炮塔水平到位 (同目标, 方向角一致, 全炮塔共享) |
-| 3-3 | WAIT | 五步确认 **走一遍** (确认台本身校验两门炮实时状态) + 双炮 Arm + 待击发 |
-| 3-4 | FIRE | 击发: 击发钮全局一个, **一按两炮齐射** (AutoFire 秒过) |
-| 3-5 | RSET | 两炮都回位 (13s 最小恢复 + 机构空闲) |
+| 3-1 | TRAK | 双炮持续追踪同一目标 (25fps, TrackAxis 与单发同构): 两炮各自仰角追踪 + 炮塔方位追踪 (共享), **三轴都套上并稳定** → 五步确认走一遍 + 双炮并行 Arm (一次性) |
+| 3-2 | FIRE | AutoFire 解除保险即击发 (击发钮全局一个, **一按两炮齐射**); 手动双炮持续追踪等玩家击发 |
+| 3-3 | RSET | 两炮都回位 (13s 最小恢复 + 机构空闲) |
 | 0-0 | IDLE / FAIL | 空闲 / 失败 |
 
 **与单发流程的差异**:
@@ -245,7 +240,6 @@ LOAD > COFM
 - 绑定游戏内"Balistic Calculator Controls": 距离拨盘, 装药拨盘, 方向拨盘, 弹种拨盘, 计算按钮, 仰角里程表
 - SetDistance/SetDirection/SetCharge/SetShellType 设拨盘值, Calculate 点计算, GetElevation 读结果
 - MinimumCharge 装药查表: <5km->1 号, <10km->2, <15km->3, <20km->4, <25km->5, 其余 6 号
-- FcsCalc (在 TacticalRadar.cs 内) 提供面板预览用: Elevation(distance)/Charge(distance) 分段线性拟合
 
 ### 6.2 GunSystem - 单管炮抽象
 - 绑定: 弹仓选择器, 转弹仓按钮, 推弹按钮, 装药按钮组 (PowderChargeController 下 Button Dispencer), 推药杆, GunController, 仰角杆, 装药余量表, 实拉药包数里程表 (递归查找), Shell ID 显示器, GunStopwatch 炮兵计时表 (watchedGun 匹配)
@@ -265,7 +259,6 @@ LOAD > COFM
 - GetMarkTarget: 标记位置 - 铁巢棋子位置 (同在地图局部系) -> 距离 (x3.8164f 比例) + 方向角
 - SyncIronNestToken: 铁巢棋子吸附到游戏真值 (turretController.turretBase.localPosition 经沙盘校准常数映射); 沙盘校准 = 格长 1/3.8164 + 左下角 (平射真值+目测校准)
 - SetMarkerWorldPos/SetMarkerByKmPos/SetMarkerLocalPos/ResetMarker: 四种标记设置方式 (雷达标点用)
-- GetAllFireMissionEntities: 枚举 Fire Mission Root 下全部实体
 
 ### 6.4 PurchaseDeck - 采购台
 - 绑定 Requisition Console: 解析全部 PunchcardRuntime 卡牌 (ID 去掉 SMOKE/Shell 前缀映射到 BulletType), PowderCharges 装药卡, 购买按钮
@@ -282,7 +275,7 @@ LOAD > COFM
 - SetRotation: 设 DesiredRotation (取负), 等 rotationVelocity 归零
 
 ### 6.7 ArtilleryTask / Progress - 任务数据
-- 字段: targetId, angel, distance, position, bulletType, progress, abortCount
+- 字段: targetId, angel, distance, position, bulletType, progress, abortCount, fireControlId (UID 日志追溯), salvoFollower/salvoLeader (齐射对), impactTime/fireTime (飞时锁存与击发时刻), calculatedElevation/charge (解算快照), trackAngel/trackDistance (TRAK 1 帧预测)
 - Progress 状态机: Pending -> Calculating -> SelectingBullet -> (DumpingWrongShell) -> LoadingBullet -> LoadingPowder -> WaitLoading -> Aiming -> WaitingForFire -> BackToIdle -> Finished / Failed
 
 ### 6.8 CoroutineLock - 协程互斥锁

@@ -34,8 +34,6 @@ public class TacticalRadar
     private static readonly Color ClrDead = new(0.40f, 0.40f, 0.40f);
     private static readonly Color ClrLabel = new(0.72f, 0.65f, 0.55f);
 
-    private static bool _loggedEntityFields;
-
     public TacticalRadar(FSC fcs) => this.fcs = fcs;
 
     public List<UnitEntry> AliveUnits => units.Where(u => u.IsAlive).ToList();
@@ -571,33 +569,5 @@ public class TacticalRadar
             return true;
         }
         return false;
-    }
-}
-
-public static class FcsCalc
-{
-    private static readonly (float factor, float min, float max)[] Config =
-    {
-        (12.0f, 0, 5),
-        (6.0f, 5, 10),
-        (4.0f, 10, 15),
-        (3.0f, 15, 20),
-        (2.4f, 20, 25),
-        (2.0f, 25, 30),
-    };
-
-    public static int Charge(float distance)
-    {
-        for (int i = 0; i < Config.Length; i++)
-            if (distance > Config[i].min && distance <= Config[i].max)
-                return i + 1;
-        return distance > 30 ? 6 : 1;
-    }
-
-    public static float Elevation(float distance)
-    {
-        int chg = Charge(distance);
-        float el = distance * Config[chg - 1].factor;
-        return el > 60 || distance > 30 ? float.NaN : el;
     }
 }

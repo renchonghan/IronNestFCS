@@ -138,22 +138,7 @@ public class FcsSceneInteractor {
         for (var i = 1; i <= 4; i++) {
             var targetId = i;
             GameObject button = null;
-            button = AddButton(() => {
-                var task = fcs.MapTable.GetMarkTarget(targetId);
-                if (task == null) {
-                    return; // 地图上没有这个编号的目标
-                }
-                task.targetId = targetId;
-                task.bulletType = selectedBulletType;
-                fcs.EnqueueTask(task);
-                fcs.MapTable.AttachMarkerTask(targetId, task); // 虚拟目标: 沙盘 T 标记物上挂双菱形火控框
-                SetColor(button, Color.gray);
-                button.GetComponent<Collider>().enabled = false;
-                MelonCoroutines.Start(InvokeDelay(() => {
-                    SetColor(button, Color.red);
-                    button.GetComponent<Collider>().enabled = true;
-                }, 1f));
-            }, Color.red);
+            button = AddButton(() => FireButton(targetId, button), Color.red);
             button.transform.position = new Vector3(x, y, z);
             button.transform.localScale = new Vector3(0.02f, 0.004f, 0.02f); // 平面薄片: 薄在 Y, 躺平贴桌面 (XZ 平面, Y 高度), 保留 BoxCollider 点击
             targetButtons[targetId] = button;
@@ -201,12 +186,11 @@ public class FcsSceneInteractor {
         }
     }
 
-    /// <summary>键盘快捷键触发射击目标(对应小键盘 1-4), 等价于点击 T1-T4 按钮.</summary>
-    public void FireTarget(int targetId) {
-        if (!targetButtons.TryGetValue(targetId, out var button)) return;
-        if (!button.GetComponent<Collider>().enabled) return;
+    /// <summary>按 T 标记物入队一次打击任务 + 1s 冷却灰显 (按钮与键盘共用).</summary>
+    private void FireButton(int targetId, GameObject button) {
+        if (!button.GetComponent<Collider>().enabled) return; // 冷却中
         var task = fcs.MapTable.GetMarkTarget(targetId);
-        if (task == null) return;
+        if (task == null) return; // 地图上没有这个编号的目标
         task.targetId = targetId;
         task.bulletType = selectedBulletType;
         fcs.EnqueueTask(task);
@@ -219,12 +203,19 @@ public class FcsSceneInteractor {
         }, 1f));
     }
 
-    public void FireAtWorldPos(int id, Vector3 worldPos)
+    /// <summary>键盘快捷键触发射击目标(对应小键盘 1-4), 等价于点击 T1-T4 按钮.</summary>
+    public void FireTarget(int targetId) {
+        if (!targetButtons.TryGetValue(targetId, out var button)) return;
+        FireButton(targetId, button);
+    }
+
+    /// <summary>按世界坐标创建打击任务 (扫荡用): front=true 插队到队首 (高优先级目标).</summary>
+    private ArtilleryTask? TaskFromWorldPos(int id, Vector3 worldPos)
     {
         var turret = fcs.MapTable.Turret;
-        if (turret == null) return;
+        if (turret == null) return null;
         var mapSurface = GameObject.Find("Draggable Surface")?.transform;
-        if (mapSurface == null) return;
+        if (mapSurface == null) return null;
         var localPos = mapSurface.InverseTransformPoint(worldPos);
         // 炮塔世界坐标 → 地图局部坐标, 统一坐标系后再相减(铁巢转移后依然正确)
         var turretLocalOnMap = mapSurface.InverseTransformPoint(turret.position);
@@ -232,7 +223,7 @@ public class FcsSceneInteractor {
         var dist = target.magnitude * 3.8164f;
         var angle = Vector3.SignedAngle(target, Vector3.up, Vector3.forward);
         if (angle < 0) angle += 360;
-        var task = new ArtilleryTask
+        return new ArtilleryTask
         {
             targetId = id,
             angel = angle,
@@ -240,31 +231,18 @@ public class FcsSceneInteractor {
             position = localPos * 3.8164f + new Vector3(10.016f, 5.235f, 0f),
             bulletType = selectedBulletType
         };
-        fcs.EnqueueTask(task);
+    }
+
+    public void FireAtWorldPos(int id, Vector3 worldPos)
+    {
+        var task = TaskFromWorldPos(id, worldPos);
+        if (task != null) fcs.EnqueueTask(task);
     }
 
     public void FireAtWorldPosFront(int id, Vector3 worldPos)
     {
-        var turret = fcs.MapTable.Turret;
-        if (turret == null) return;
-        var mapSurface = GameObject.Find("Draggable Surface")?.transform;
-        if (mapSurface == null) return;
-        var localPos = mapSurface.InverseTransformPoint(worldPos);
-        // 炮塔世界坐标 → 地图局部坐标, 统一坐标系后再相减(铁巢转移后依然正确)
-        var turretLocalOnMap = mapSurface.InverseTransformPoint(turret.position);
-        var target = localPos - turretLocalOnMap;
-        var dist = target.magnitude * 3.8164f;
-        var angle = Vector3.SignedAngle(target, Vector3.up, Vector3.forward);
-        if (angle < 0) angle += 360;
-        var task = new ArtilleryTask
-        {
-            targetId = id,
-            angel = angle,
-            distance = dist,
-            position = localPos * 3.8164f + new Vector3(10.016f, 5.235f, 0f),
-            bulletType = selectedBulletType
-        };
-        fcs.EnqueueTaskFront(task);
+        var task = TaskFromWorldPos(id, worldPos);
+        if (task != null) fcs.EnqueueTaskFront(task);
     }
     
     public void Update() {

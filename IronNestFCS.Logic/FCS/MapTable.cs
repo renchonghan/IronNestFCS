@@ -78,88 +78,6 @@ public class MapTable {
         turret.localPosition = local;
     }
 
-    /// <summary>
-    /// [临时调试] 在地图网格位置放一个纯色方块, 验证沙盘直接放置元素 (画箭头的地基).
-    /// 与令牌同空间: 挂 Draggable Surface 下, 用沙盘校准常数把网格坐标映射到棋子局部系.
-    /// </summary>
-    public void SpawnTestMarker(Vector2 gridPos, Color color)
-    {
-        if (mapSurface == null) return;
-        // 清理旧测试块 (F9 重载不销毁运行时物件, 会累积)
-        foreach (var old in Resources.FindObjectsOfTypeAll<GameObject>()) {
-            if (old != null && old.name == "FCS_MapElement_Test") UnityEngine.Object.Destroy(old);
-        }
-        var go = GameObject.CreatePrimitive(PrimitiveType.Quad);
-        go.name = "FCS_MapElement_Test";
-        go.transform.SetParent(mapSurface, false);
-        go.transform.localPosition = new Vector3(
-            MapBottomLeft.x + gridPos.x * MapCellSize,
-            MapBottomLeft.y + gridPos.y * MapCellSize,
-            -0.01f);
-        go.transform.localScale = new Vector3(0.06f, 0.06f, 1f);
-        var r = go.GetComponent<Renderer>();
-        if (r != null) {
-            // 优先用游戏自己的绿灯材质 (InteractionLight Green, 高发射, 沙盘按钮按下同款);
-            // 默认 primitive 材质着色器被裁剪 (紫块), 场景克隆材质会带原贴图
-            Material? mat = null;
-            foreach (var m in Resources.FindObjectsOfTypeAll<Material>()) {
-                if (m == null || m.name == null) continue;
-                if (m.name.Contains("InteractionLight Green")) { mat = new Material(m); break; }
-            }
-            if (mat == null) {
-                var src = mapSurface.GetComponentInChildren<Renderer>()?.material;
-                if (src != null) { mat = new Material(src); mat.color = color; }
-            }
-            if (mat != null) r.material = mat;
-        }
-        MelonLogger.Msg($"[FCS] TestMarker placed at grid {gridPos}");
-    }
-
-    /// <summary>
-    /// [临时调试] 沙盘箭头: 自建 Il2CppShapes.Line 形状组件 (不依赖场景标记/玩家画线).
-    /// 挂在 Draggable Surface 下 (3D 板面空间), 用沙盘校准常数映射网格坐标.
-    /// </summary>
-    private Il2CppShapes.Line? _testArrowLine;
-    private Vector2 _testArrowTarget;
-
-    public void SpawnArrow(Vector2 targetGrid, Color color)
-    {
-        // 清理旧测试箭头 (F9 重载会累积)
-        foreach (var old in Resources.FindObjectsOfTypeAll<GameObject>()) {
-            if (old != null && old.name == "FCS_Arrow_Test") UnityEngine.Object.Destroy(old);
-        }
-        if (mapSurface == null) return;
-        var go = new GameObject("FCS_Arrow_Test");
-        go.transform.SetParent(mapSurface, false);
-        go.transform.localPosition = new Vector3(0f, 0f, -0.02f);
-        _testArrowLine = go.AddComponent<Il2CppShapes.Line>();
-        _testArrowTarget = targetGrid;
-        _testArrowLine.Thickness = 0.003f;
-        _testArrowLine.Color = color;
-        _testArrowLine.ColorStart = color;
-        _testArrowLine.ColorEnd = color;
-        MelonLogger.Msg($"[FCS] SpawnArrow: self-built Line for target grid {targetGrid}");
-    }
-
-    /// <summary>箭头实时跟随铁巢: 起点 = turretBase 网格位置 (经校准映射到板面), 终点 = 目标格.</summary>
-    public void UpdateArrowToNest()
-    {
-        if (_testArrowLine == null || impactManager == null || impactManager.turretController == null) return;
-        var tb = impactManager.turretController.turretBase;
-        if (tb == null) return;
-        var nest = (Vector2)tb.localPosition;
-        var startLocal = new Vector3(MapBottomLeft.x + nest.x * MapCellSize, MapBottomLeft.y + nest.y * MapCellSize, 0f);
-        var endLocal = new Vector3(MapBottomLeft.x + _testArrowTarget.x * MapCellSize, MapBottomLeft.y + _testArrowTarget.y * MapCellSize, 0f);
-        _testArrowLine.transform.localPosition = startLocal;
-        _testArrowLine.Start = Vector3.zero;
-        _testArrowLine.End = endLocal - startLocal;
-    }
-
-    /// <summary>
-    /// [临时调试] 所有地图实体画菱形框: 敌对纯红, 友军纯蓝.
-    /// 正方形边长 0.1 转 45°, 四条边用 Il2CppShapes.Line 画 (线宽与箭头一致).
-    /// 挂实体子级, 实体移动/死亡自动跟随, 不需要更新循环.
-    /// </summary>
     /// <summary>实体菱形框的点击目标 (collider, 实体 transform), 由 FcsSceneInteractor 注册到 ClickRaycaster.</summary>
     private readonly List<(Collider collider, Transform entity)> _entityClickTargets = new();
     public IReadOnlyList<(Collider collider, Transform entity)> EntityClickTargets => _entityClickTargets;
@@ -167,28 +85,12 @@ public class MapTable {
     // 菱形框存活跟踪: 游戏不会反激活被消灭目标的标记, 需用雷达的 IsUnitAlive 判断后隐藏
     private readonly List<(GameObject holder, EntityLocation loc, GameObject entity)> _entityMarks = new();
 
-    /// <summary>按雷达存活判定隐藏已消灭目标的菱形框 (每秒调用).</summary>
     /// <summary>
     /// 实体菱形框刷新: 阵亡的销毁挂件 (无尽模式持续出实体, 隐藏会无限累积),
     /// 新出现的实体补挂件.
     /// </summary>
-    private static bool _scaleProbeRan = false;
-
-    /// <summary>[临时调试] 探针: 实体 transform 缩放链 (杀伤圈曾因挂实体下被压小).</summary>
-    private void ProbeEntityScale()
-    {
-        if (_scaleProbeRan || fireMissionRoot == null) return;
-        _scaleProbeRan = true;
-        MelonLogger.Msg("[FCS_DEBUG] ===== entity scale probe =====");
-        for (int i = 0; i < fireMissionRoot.childCount && i < 8; i++) {
-            var c = fireMissionRoot.GetChild(i);
-            MelonLogger.Msg($"[FCS_DEBUG]   {c.name} localScale={c.localScale}, lossyScale={c.lossyScale}, parent={c.parent?.name}");
-        }
-    }
-
     public void RefreshEntityMarks()
     {
-        // ProbeEntityScale(); // [临时调试] 已确认: Fire Mission Root 缩放 0.21 压小实体挂件, 备用
         var dead = new List<GameObject>();
         foreach (var (holder, loc, entity) in _entityMarks) {
             if (holder == null || loc == null || entity == null) continue;
@@ -897,7 +799,7 @@ public class MapTable {
         mark.radiusSegs = BuildKillCircle(mark.radiusRoot, r, KillDashLen, KillThick, 1f, mark.color, solid, pierce); // 瞄准圈挂板面下, 缩放 1
     }
 
-    /// <summary>[临时调试] 铁巢 → 当前目标虚线 (左右炮各一条, 荧光绿 0.006).</summary>
+    /// <summary>铁巢 → 当前目标虚线 (左右炮各一条, 荧光绿 0.006).</summary>
     private GameObject? _targetLineLeft;
     private GameObject? _targetLineRight;
     private Il2CppShapes.Line? _targetLineL;
@@ -916,43 +818,6 @@ public class MapTable {
         (_targetLineRight, _targetLineR) = BuildTargetLine(mapSurface, "FCS_TargetLineRight");
         _targetLineLeft.SetActive(false);
         _targetLineRight.SetActive(false);
-        // ProbeDashParams(); // [临时调试] 探针读游戏虚线周期参数, 已取到 DashSize/DashSpacing = 4 x 线宽, 备用
-    }
-
-    /// <summary>
-    /// [临时调试] 探针: 读虚线 Line 的 Dash* 属性真实数值 (游戏虚线周期参数),
-    /// 杀伤圈手排虚线需要同周期.
-    /// </summary>
-    private bool _dashProbeRan = false;
-
-    private void ProbeDashParams()
-    {
-        if (_dashProbeRan || _targetLineL == null) return;
-        _dashProbeRan = true;
-        try {
-            var t = _targetLineL.GetIl2CppType();
-            var flags = Il2CppSystem.Reflection.BindingFlags.Public
-                | Il2CppSystem.Reflection.BindingFlags.NonPublic
-                | Il2CppSystem.Reflection.BindingFlags.Instance;
-            MelonLogger.Msg("[FCS_DEBUG] ===== Line dash probe =====");
-            foreach (var p in t.GetProperties(flags)) {
-                if (!p.Name.StartsWith("Dash") && p.Name != "MatchDashSpacingToSize") continue;
-                try {
-                    var box = p.GetValue(_targetLineL);
-                    if (box == null) { MelonLogger.Msg($"[FCS_DEBUG]   dash {p.Name} = <null>"); continue; }
-                    try { MelonLogger.Msg($"[FCS_DEBUG]   dash {p.Name} (float) = {box.Unbox<float>()}"); continue; } catch { }
-                    try { MelonLogger.Msg($"[FCS_DEBUG]   dash {p.Name} (int) = {box.Unbox<int>()}"); continue; } catch { }
-                    try { MelonLogger.Msg($"[FCS_DEBUG]   dash {p.Name} (bool) = {box.Unbox<bool>()}"); continue; } catch { }
-                    MelonLogger.Msg($"[FCS_DEBUG]   dash {p.Name} = {box}");
-                }
-                catch (Exception ex) {
-                    MelonLogger.Msg($"[FCS_DEBUG]   dash {p.Name} = <err: {ex.Message}>");
-                }
-            }
-        }
-        catch (Exception ex) {
-            MelonLogger.Msg($"[FCS_DEBUG]   dash probe err: {ex.Message}");
-        }
     }
 
     private static (GameObject, Il2CppShapes.Line) BuildTargetLine(Transform parent, string name)
@@ -1257,18 +1122,4 @@ public class MapTable {
         };
         return task;
     }
-
-    public List<EntityLocation> GetAllFireMissionEntities() {
-        List<EntityLocation> res = new();
-        if (fireMissionRoot == null) {
-            return res;
-        }
-
-        for (var i = 0; i < fireMissionRoot.childCount; ++i) {
-            var m = fireMissionRoot.GetChild(i).GetComponent<EntityLocation>();
-            if (m != null) res.Add(m);
-        }
-        return res;
-    }
-    
 }

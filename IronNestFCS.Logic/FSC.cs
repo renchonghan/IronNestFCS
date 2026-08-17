@@ -132,16 +132,12 @@ public class FSC
             // 铁巢棋子自动吸附游戏网格位置 (四角校准映射), 摆错棋子不再导致火控打飞
             _syncLoopHandle = MelonCoroutines.Start(SyncIronNestLoop());
             _runningCoroutines.Add((_syncLoopHandle, LeftRight.Left));
-            // MapTable.SpawnTestMarker(new Vector2(2.85f, 8.95f), Color.green); // [临时调试] 沙盘直接放置元素验证, 备用
-            // MapTable.SpawnArrow(new Vector2(10f, 5f), Color.yellow);         // [临时调试] 铁巢→地图中心测试箭头, 备用
             MapTable.SpawnEntityDiamonds();                                   // 地图实体菱形框: 敌对红/友军蓝
             MapTable.SpawnAimMarks();                                         // 左右炮瞄准指示: 十字/X
             MapTable.SpawnTargetLines();                                      // 铁巢→当前目标虚线
-            // LeftGun.ProbeBallisticData(); // [临时调试] 弹道数据源探针: 已挖出 ShellDefinition (杀伤半径/速度曲线), 备用
             _sceneInteractor.RegisterEntityClickTargets(MapTable.EntityClickTargets); // 右键菱形框入队/取消
             _sceneInteractor.RegisterMarkerClickTargets(); // T1-T4 标记物右键: 虚拟目标入队/齐射/取消
         }
-        // _runningCoroutines.Add(MelonCoroutines.Start(ExposeAllEntities()));
 
         return IsBound;
     }
@@ -197,14 +193,6 @@ public class FSC
         else {
             TryDispatch();
         }
-    }
-    
-    /// <summary>
-    /// [临时调试] 飞行时间公式探针: 每秒无条件打印左炮 实际仰角/活飞行时间/CANFIRE,
-    /// 拟合"飞行时间=?"公式用, 用完删.
-    /// </summary>
-    private void ProbeFlightFormula() {
-        MelonLogger.Msg($"[FCS_DEBUG] FT elev={LeftGun.ActualElevation():F2} predicted={LeftGun.PredictedImpactTime():F2}s canFire={LeftGun.CanFire()}");
     }
 
     /// <summary>暂停/继续整个火控流程: 冻结调度/解算/装填/刷新, 再按一次恢复.</summary>
@@ -348,6 +336,18 @@ public class FSC
         }
     }
 
+    /// <summary>齐射跟随任务参数镜像主任务 (主任务实时重算, 跟随任务无 mark 不进 TaskedTasks, 单独同步).</summary>
+    private void SyncSalvoFollowers() {
+        foreach (var t in new[] { LeftTask, RightTask }) {
+            if (t == null || !t.salvoFollower || t.salvoLeader == null) continue;
+            t.angel = t.salvoLeader.angel;
+            t.distance = t.salvoLeader.distance;
+            t.position = t.salvoLeader.position;
+            t.trackAngel = t.salvoLeader.trackAngel;
+            t.trackDistance = t.salvoLeader.trackDistance;
+        }
+    }
+
     /// <summary>地图刷新循环 25fps (0.04s): 铁巢棋子吸附 / 标签 / 瞄准指示 / 目标虚线.</summary>
     private IEnumerator SyncIronNestLoop() {
         int tick = 0;
@@ -355,17 +355,14 @@ public class FSC
             // 总暂停不冻结沙盘刷新: 暂停是为了计划火控任务, 地图/瞄准/入队仍需实时
             yield return new WaitForSeconds(0.04f);
             MapTable.SyncIronNestToken();
-            // MapTable.UpdateArrowToNest(); // [临时调试] 测试箭头已停用, 备用
             UpdateTaskedMarks();          // 刷新点选目标的队列位置标签
+            SyncSalvoFollowers();         // 齐射跟随任务镜像主任务参数 (虚线/落点跟着目标走)
             MapTable.UpdateAimMarks(LeftGun.CanFire(), RightGun.CanFire(), LeftTask?.bulletType, RightTask?.bulletType); // 瞄准十字/X + 杀伤圈实时跟落点
             MapTable.UpdateTargetLines(LeftTask, RightTask);                  // 铁巢→当前目标虚线
             if (++tick % 25 == 0) {
                 MapTable.RefreshEntityMarks(); // 每秒: 阵亡销毁挂件 + 新实体补挂件
                 _sceneInteractor.RegisterEntityClickTargets(MapTable.EntityClickTargets); // 新挂件注册右键点击
-                // ProbeFlightFormula(); // [临时调试] 每秒打印左炮仰角/飞行时间, 已确认公式 = 仰角/(1.4x倍率), 备用
             }
-            // [临时调试] 计时表状态探针, 已确认 EAIM 读活变量 PredictedImpactTime, 备用:
-            // LeftGun.DebugTimerLine(); RightGun.DebugTimerLine();
         }
     }
 
@@ -437,19 +434,6 @@ public class FSC
         try { _harmony?.UnpatchSelf(); }
         catch (Exception ex) { MelonLogger.Error($"[FCS] UnpatchSelf failed: {ex}"); }
         _harmony = null;
-    }
-
-    public IEnumerator ExposeAllEntities() {
-        while (true) {
-            foreach (var m in MapTable.GetAllFireMissionEntities()) {
-                var vr = m.transform.FindChild("VisualRoot");
-                if (vr == null) continue;
-                vr.gameObject.SetActive(true);
-                var info = vr.FindChild("Info");
-                if (info != null) info.gameObject.SetActive(true);
-            }
-            yield return new WaitForSeconds(1f);
-        }
     }
 
     /// <summary>
@@ -808,89 +792,33 @@ public class FSC
                     task.progress = Progress.Aiming;
                     MarkProgress(leftRight, Progress.Aiming);
                     {
-                        // E/H 两轴都是天顶星伺服: 设 1 帧预测值 (trackDistance/trackAngel 已含预测) + 积分修正 (误差窗口和 × ki, 消除持续滞后) + 微分阻尼 (误差差分 × kd, 抑制震荡)
-                        const float TrackKi = 0.05f;
-                        const float TrackKd = 6.0f; // 稳定性条件 4Ki/Kd < 1: 4x0.05/6 = 0.033 < 1 ✓
-                        const float TrackDDeadband = 0.01f; // D 项差分死区: 小于此值的误差差分不计数 (抑制高频量化噪声抖动)
-                        var eErrWin = new Queue<float>(16);
-                        var aErrWin = new Queue<float>(16);
-                        float eLastErr = 0f, aLastErr = 0f;
+                        var eAxis = new TrackAxis(0.01f); // E 收敛标准 0.01°
+                        var aAxis = new TrackAxis(0.1f);   // H 收敛标准 0.1°
                         bool armed = false;
-                        bool eLocked = false, aLocked = false;
-                        float eStable = 0f, aStable = 0f;
-                        float eStuck = 0f, aStuck = 0f;
-                        float lastElev = float.NaN, lastAng = float.NaN;
                         while (true) {
-                            // E 轴: 仰角持续追踪
-                            {
+                            // E 轴: 仰角持续追踪 (天顶星伺服设 1 帧预测值 + TrackAxis 修正)
+                            if (!eAxis.GaveUp) {
                                 float target = ShellData.ElevationDeg(task.trackDistance, powderCount); // 预测点实时目标仰角
                                 float actual = gunSys.ActualElevation();
-                                float vel = gunSys.ElevationVelocity();
-                                float err = target - actual;
-                                // 套上并跟踪稳定: 误差+速度连续收住 5 帧 (0.2s) 才判定 (防瞬时过零); E 收敛标准 0.01°
-                                if (Mathf.Abs(err) <= 0.01f && Mathf.Abs(vel) <= 0.1f) {
-                                    eStable += 0.04f;
-                                    if (eStable >= 0.2f) eLocked = true;
-                                }
-                                else { eStable = 0f; eLocked = false; }
-                                eErrWin.Enqueue(err);
-                                if (eErrWin.Count > 16) eErrWin.Dequeue();
-                                float eSum = 0f;
-                                foreach (var e in eErrWin) eSum += e;
-                                float dErr = err - eLastErr;
-                                if (Mathf.Abs(dErr) < TrackDDeadband) dErr = 0f; // D 死区: 微幅差分不计数
-                                gunSys.SetElevationValue(target + TrackKi * eSum + TrackKd * dErr); // 预测值 + I 修正 + D 阻尼
-                                eLastErr = err;
-                                // 无进展保护: 仰角连续 10s 几乎不动且未套上 → 放弃本轴 (机构卡死兜底, 当作套上让流程可击发, 游戏校验兜底)
-                                if (!float.IsNaN(lastElev) && Mathf.Abs(actual - lastElev) < 0.05f) {
-                                    eStuck += 0.04f;
-                                    if (eStuck >= 10f) {
-                                        MelonLogger.Error($"[FCS] {leftRight}: TRAK elevation stuck {eStuck:F0}s at {actual:F2}, give up");
-                                        eLocked = true;
-                                    }
-                                }
-                                else eStuck = 0f;
-                                lastElev = actual;
+                                float corr = eAxis.Step(target - actual, gunSys.ElevationVelocity(), actual);
+                                if (eAxis.GaveUp) MelonLogger.Error($"[FCS] {leftRight}: TRAK elevation stuck {eAxis.Stuck:F0}s at {actual:F2}, give up");
+                                gunSys.SetElevationValue(target + corr);
                             }
                             // H 轴: 方位持续追踪 (先等后台预约首转到位)
-                            {
+                            if (!aAxis.GaveUp) {
                                 if (turret.Ready) {
                                     float cur = Turret.CurrentAngle();
-                                    if (float.IsNaN(cur)) aLocked = true; // 读不到方位: 不追踪 (退化为原等待逻辑)
+                                    if (float.IsNaN(cur)) aAxis.Locked = true; // 读不到方位: 不追踪 (退化为原等待逻辑)
                                     else {
-                                        float vel = Turret.RotationVelocity();
-                                        float err = Mathf.DeltaAngle(cur, task.trackAngel);
-                                        // 套上并跟踪稳定: 误差+速度连续收住 5 帧 (0.2s) 才判定 (防瞬时过零)
-                                        if (Mathf.Abs(err) <= 0.1f && Mathf.Abs(vel) <= 0.1f) {
-                                            aStable += 0.04f;
-                                            if (aStable >= 0.2f) aLocked = true;
-                                        }
-                                        else { aStable = 0f; aLocked = false; }
-                                        aErrWin.Enqueue(err);
-                                        if (aErrWin.Count > 16) aErrWin.Dequeue();
-                                        float aSum = 0f;
-                                        foreach (var e in aErrWin) aSum += e;
-                                        float dErr = err - aLastErr;
-                                        if (Mathf.Abs(dErr) < TrackDDeadband) dErr = 0f; // D 死区: 微幅差分不计数
-                                        Turret.SetDesiredRotation(task.trackAngel + TrackKi * aSum + TrackKd * dErr); // 预测值 + I 修正 + D 阻尼
-                                        aLastErr = err;
-                                        if (!float.IsNaN(lastAng) && Mathf.Abs(Mathf.DeltaAngle(lastAng, cur)) < 0.05f) {
-                                            aStuck += 0.04f;
-                                            if (aStuck >= 10f) {
-                                                MelonLogger.Error($"[FCS] {leftRight}: TRAK azimuth stuck {aStuck:F0}s at {cur:F2}, give up");
-                                                aLocked = true;
-                                            }
-                                        }
-                                        else aStuck = 0f;
-                                        lastAng = cur;
+                                        float corr = aAxis.Step(Mathf.DeltaAngle(cur, task.trackAngel), Turret.RotationVelocity(), cur);
+                                        if (aAxis.GaveUp) MelonLogger.Error($"[FCS] {leftRight}: TRAK azimuth stuck {aAxis.Stuck:F0}s at {cur:F2}, give up");
+                                        Turret.SetDesiredRotation(task.trackAngel + corr);
                                     }
                                 }
-                                else aLocked = false;
+                                else aAxis.Locked = false;
                             }
-                            // 套上且未解除保险: 五步确认 + Arm (一次性; 追踪循环不中断, 保险解除后目标动了继续追)
-                            if (!armed && eLocked && aLocked) {
-                                task.progress = Progress.WaitingForFire;
-                                MarkProgress(leftRight, Progress.WaitingForFire);
+                            // 套上且未解除保险: 五步确认 + Arm (一次性; 追踪循环不中断, 保险解除后目标动了继续追; 不切相位, 面板仍显示 3-1 TRAK)
+                            if (!armed && eAxis.Locked && aAxis.Locked) {
                                 yield return _deskLock.Acquire(); // 五步确认台全局唯一, 两炮串行过台
                                 try {
                                     yield return TriggerConsole.ConfirmTask();
@@ -910,7 +838,7 @@ public class FSC
                             // 击发: AutoFire 解除保险即击发; 手动模式等玩家击发 (持续追踪期间随时可打)
                             if (armed) {
                                 if (_sceneInteractor.AutoFire) {
-                                    task.progress = Progress.Fire; // 3-4 FIRE
+                                    task.progress = Progress.Fire; // 3-2 FIRE
                                     MarkProgress(leftRight, Progress.Fire);
                                     yield return _deskLock.Acquire();
                                     try {
@@ -926,21 +854,8 @@ public class FSC
                             }
                             yield return new WaitForSeconds(0.04f);
                         }
-                        // 击发快照: 游戏炮兵计时表真值 (消除固定时间差)
-                        var sw = gunSys.StopwatchLatch();
-                        if (sw.HasValue && sw.Value.travelTime > 0.01f) {
-                            task.fireTime = sw.Value.startTime;
-                            task.impactTime = sw.Value.travelTime;
-                            MelonLogger.Msg($"[FCS] {leftRight}: fire latch travel={sw.Value.travelTime:F2}s (formula 预测 {ShellData.FlightTime(task.distance, task.charge):F2}s)");
-                        }
-                        else {
-                            task.fireTime = Time.time;
-                        }
-                        _finished.Add(new FinishedTask { task = task, fireTime = Time.time }); // 完成入列 (最多 8 条 + 溢出计数)
-                        if (_finished.Count > 8) {
-                            _finished.RemoveAt(0);
-                            _finishedOverflow++;
-                        }
+                        LatchFireTime(leftRight, task, gunSys); // 击发快照: 游戏炮兵计时表真值 (消除固定时间差)
+                        AddFinished(task);                     // 完成入列 (最多 8 条 + 溢出计数)
                         ReleaseTurretOnce(turret); // 炮塔方向角独占到实射完成
                     }
                     // 3-4 RSET: 回位
@@ -973,7 +888,6 @@ public class FSC
         var gunL = LeftGun;
         var gunR = RightGun;
         int need = _sceneInteractor.maxCharge ? 6 : BallisticCalculator.MinimumCharge(leader.distance);
-        float elevation = ShellData.ElevationDeg(leader.distance, need);
         // 炮塔预约 (同目标, 方向角全炮塔共享, 用主任务方位角)
         var turret = new TurretReservation();
         _runningCoroutines.Add((MelonCoroutines.Start(ReserveTurretAndRotate(leader, turret)), LeftRight.Left));
@@ -1044,6 +958,30 @@ public class FSC
                 continue;
             }
 
+            // 快速路径: 两炮同弹同装药 (实装 >= 需求, 均 CanFire) → 跳过装填段, 锁内解算一次直接进 TRAK
+            int lLoaded = gunL.LoadedPowderCharges();
+            int rLoaded = gunR.LoadedPowderCharges();
+            if (gunL.CanFire() && gunR.CanFire() && lLoaded >= need && rLoaded >= need) {
+                int useCharge = Mathf.Max(lLoaded, need); // 实装足量按实装 (两炮同装药)
+                MelonLogger.Msg($"[FCS] SALVO fast-track fc#{leader.fireControlId}+{follower.fireControlId}: loaded L={lLoaded} R={rLoaded} need={need}, use={useCharge}");
+                yield return _deskLock.Acquire();
+                try {
+                    yield return BallisticCalculator.SetDistance(leader.distance);
+                    yield return BallisticCalculator.SetDirection(leader.angel);
+                    yield return BallisticCalculator.SetCharge(useCharge);
+                    yield return BallisticCalculator.SetShellType(leader.bulletType);
+                    yield return BallisticCalculator.Calculate(); // 保留: 游戏靠这次 Calculate 解锁药包杆
+                    leader.charge = useCharge;
+                    follower.charge = useCharge;
+                    leader.calculatedElevation = ShellData.ElevationDeg(leader.distance, useCharge);
+                    follower.calculatedElevation = leader.calculatedElevation;
+                }
+                finally {
+                    _deskLock.Release();
+                }
+                break; // 出装填循环, 进 TRAK
+            }
+
             // 1-2 SELC + 2-1/2-2: 空膛侧转弹仓 + 推弹, 双炮并行
             bool lEmpty = lCh == null;
             bool rEmpty = rCh == null;
@@ -1075,19 +1013,73 @@ public class FSC
             break; // 装填确认完成, 出循环进击发
         }
 
-        // 3-1 EAIM: 双炮同时升仰角, 都到位
+        // 3-1~3-3 SALVO TRAK 合并: 双炮持续追踪同一目标 (trackX 取主任务), 双炮都套上并稳定 → 五步确认 + 双炮 Arm → AutoFire 立即击发 / 手动等击发
         MarkSalvo(leader, follower, Progress.Aiming);
-        yield return SalvoDual(g => g.SetElevation(elevation), true, true);
-        leader.impactTime = ShellData.FlightTime(leader.distance, leader.charge);
-        follower.impactTime = leader.impactTime;
-        MelonLogger.Msg($"[FCS] SALVO EAIM fc#{leader.fireControlId}+{follower.fireControlId} elev={elevation:F2} flightT={leader.impactTime:F2}s");
-
-        // 3-2 HAIM: 炮塔水平到位
-        MarkSalvo(leader, follower, Progress.AimingAzimuth);
-        while (!turret.Ready) yield return null;
-
-        // 3-3/3-4: 五步确认一次 + 双炮 Arm + 一击发 + 双炮 WaitFire
-        yield return SalvoFire(leader, follower, gunL, gunR, turret);
+        {
+            var eAxisL = new TrackAxis(0.01f);
+            var eAxisR = new TrackAxis(0.01f);
+            var aAxis = new TrackAxis(0.1f);
+            bool armed = false;
+            while (true) {
+                // 左炮仰角追踪
+                if (!eAxisL.GaveUp) {
+                    float target = ShellData.ElevationDeg(leader.trackDistance, leader.charge); // 同目标同装药, 两炮同仰角
+                    float actual = gunL.ActualElevation();
+                    float corr = eAxisL.Step(target - actual, gunL.ElevationVelocity(), actual);
+                    if (eAxisL.GaveUp) MelonLogger.Error($"[FCS] SALVO Left: TRAK elevation stuck {eAxisL.Stuck:F0}s at {actual:F2}, give up");
+                    gunL.SetElevationValue(target + corr);
+                }
+                // 右炮仰角追踪
+                if (!eAxisR.GaveUp) {
+                    float target = ShellData.ElevationDeg(leader.trackDistance, leader.charge);
+                    float actual = gunR.ActualElevation();
+                    float corr = eAxisR.Step(target - actual, gunR.ElevationVelocity(), actual);
+                    if (eAxisR.GaveUp) MelonLogger.Error($"[FCS] SALVO Right: TRAK elevation stuck {eAxisR.Stuck:F0}s at {actual:F2}, give up");
+                    gunR.SetElevationValue(target + corr);
+                }
+                // 炮塔方位追踪 (全炮塔共享)
+                if (!aAxis.GaveUp) {
+                    if (turret.Ready) {
+                        float cur = Turret.CurrentAngle();
+                        if (float.IsNaN(cur)) aAxis.Locked = true;
+                        else {
+                            float corr = aAxis.Step(Mathf.DeltaAngle(cur, leader.trackAngel), Turret.RotationVelocity(), cur);
+                            if (aAxis.GaveUp) MelonLogger.Error($"[FCS] SALVO: TRAK azimuth stuck {aAxis.Stuck:F0}s at {cur:F2}, give up");
+                            Turret.SetDesiredRotation(leader.trackAngel + corr);
+                        }
+                    }
+                    else aAxis.Locked = false;
+                }
+                // 双炮都套上且未解除保险: 五步确认 (确认台校验两门炮) + 双炮 Arm (一次性)
+                if (!armed && eAxisL.Locked && eAxisR.Locked && aAxis.Locked) {
+                    yield return SalvoConfirmArm(leader, follower);
+                    armed = true;
+                }
+                // 击发: AutoFire 解除保险即击发; 手动等玩家击发
+                if (armed) {
+                    if (_sceneInteractor.AutoFire) {
+                        MarkSalvo(leader, follower, Progress.Fire);
+                        yield return SalvoShoot(gunL, gunR);
+                        break;
+                    }
+                    if (gunL.HasFired() || gunR.HasFired()) break;
+                }
+                yield return new WaitForSeconds(0.04f);
+            }
+            // 击发快照: 取左炮计时表真值 (同目标同装药, 两炮飞时一致) + 完成入列 + 归还炮塔
+            var sw = gunL.StopwatchLatch();
+            if (sw.HasValue && sw.Value.travelTime > 0.01f) {
+                leader.fireTime = follower.fireTime = sw.Value.startTime;
+                leader.impactTime = follower.impactTime = sw.Value.travelTime;
+                MelonLogger.Msg($"[FCS] SALVO fire latch travel={sw.Value.travelTime:F2}s");
+            }
+            else {
+                leader.fireTime = follower.fireTime = Time.time;
+            }
+            AddFinished(leader);
+            AddFinished(follower);
+            ReleaseTurretOnce(turret);
+        }
 
         // 3-5 RSET: 双炮回位
         MarkSalvo(leader, follower, Progress.BackToIdle);
@@ -1196,56 +1188,41 @@ public class FSC
         yield return gun.RamPowder();
     }
 
-    /// <summary>3-3/3-4 击发 (齐射): 五步确认走一遍 (确认台校验两门炮) → 双炮 Arm → 一击发 → 双炮 WaitFire.</summary>
-    private IEnumerator SalvoFire(ArtilleryTask leader, ArtilleryTask follower, GunSystem gunL, GunSystem gunR, TurretReservation turret) {
-        MarkSalvo(leader, follower, Progress.WaitingForFire);
+    /// <summary>齐射解除保险 (deskLock 内): 五步确认走一遍 (确认台校验两门炮) + 双炮并行 Arm + 飞时兜底锁存.</summary>
+    private IEnumerator SalvoConfirmArm(ArtilleryTask leader, ArtilleryTask follower) {
+        yield return _deskLock.Acquire();
         try {
-            yield return _deskLock.Acquire();
-            try {
-                yield return TriggerConsole.ConfirmTask();
-                yield return TriggerConsole.ConfirmBullet();
-                yield return TriggerConsole.ConfirmRotation();
-                yield return TriggerConsole.ConfirmElevation();
-                yield return TriggerConsole.ReadyToFire();
-                // 双炮保险同帧按下: 并行驱动两根 ArmingLever (顺序调用会一前一后 0.2s)
-                bool leftArmed = false, rightArmed = false;
-                var armL = MelonCoroutines.Start(WrapSalvoArm(LeftRight.Left, () => leftArmed = true));
-                var armR = MelonCoroutines.Start(WrapSalvoArm(LeftRight.Right, () => rightArmed = true));
-                _runningCoroutines.Add((armL, LeftRight.Left));
-                _runningCoroutines.Add((armR, LeftRight.Right));
-                while (!leftArmed || !rightArmed) yield return null;
-                if (leader.impactTime <= 0f) leader.impactTime = ShellData.FlightTime(leader.distance, leader.charge);
-                follower.impactTime = leader.impactTime;
-                MarkSalvo(leader, follower, Progress.Fire);
-                if (_sceneInteractor.AutoFire) {
-                    TriggerConsole.Fire(); // 击发钮全局一个, 一按两炮齐射
-                }
-                yield return SalvoDual(g => g.WaitFire(), true, true);
-            }
-            finally {
-                _deskLock.Release();
-            }
+            yield return TriggerConsole.ConfirmTask();
+            yield return TriggerConsole.ConfirmBullet();
+            yield return TriggerConsole.ConfirmRotation();
+            yield return TriggerConsole.ConfirmElevation();
+            yield return TriggerConsole.ReadyToFire();
+            // 双炮保险同帧按下: 并行驱动两根 ArmingLever (顺序调用会一前一后 0.2s)
+            bool leftArmed = false, rightArmed = false;
+            var armL = MelonCoroutines.Start(WrapSalvoArm(LeftRight.Left, () => leftArmed = true));
+            var armR = MelonCoroutines.Start(WrapSalvoArm(LeftRight.Right, () => rightArmed = true));
+            _runningCoroutines.Add((armL, LeftRight.Left));
+            _runningCoroutines.Add((armR, LeftRight.Right));
+            while (!leftArmed || !rightArmed) yield return null;
+            if (leader.impactTime <= 0f) leader.impactTime = ShellData.FlightTime(leader.distance, leader.charge);
+            follower.impactTime = leader.impactTime;
+            MelonLogger.Msg($"[FCS] SALVO armed fc#{leader.fireControlId}+{follower.fireControlId}");
         }
         finally {
-            ReleaseTurretOnce(turret);
+            _deskLock.Release();
         }
-        // 击发快照: 取左炮计时表真值 (同目标同装药, 两炮飞时一致)
-        var sw = gunL.StopwatchLatch();
-        if (sw.HasValue && sw.Value.travelTime > 0.01f) {
-            leader.fireTime = sw.Value.startTime;
-            leader.impactTime = sw.Value.travelTime;
-            follower.fireTime = sw.Value.startTime;
-            follower.impactTime = sw.Value.travelTime;
-            MelonLogger.Msg($"[FCS] SALVO fire latch travel={sw.Value.travelTime:F2}s");
+    }
+
+    /// <summary>齐射击发 (deskLock 内): 一击发 (击发钮全局一个, 一按两炮齐射) + 双炮 WaitFire.</summary>
+    private IEnumerator SalvoShoot(GunSystem gunL, GunSystem gunR) {
+        yield return _deskLock.Acquire();
+        try {
+            TriggerConsole.Fire();
+            yield return SalvoDual(g => g.WaitFire(), true, true);
         }
-        else {
-            leader.fireTime = Time.time;
-            follower.fireTime = Time.time;
+        finally {
+            _deskLock.Release();
         }
-        _finished.Add(new FinishedTask { task = leader, fireTime = leader.fireTime });
-        if (_finished.Count > 8) { _finished.RemoveAt(0); _finishedOverflow++; }
-        _finished.Add(new FinishedTask { task = follower, fireTime = follower.fireTime });
-        if (_finished.Count > 8) { _finished.RemoveAt(0); _finishedOverflow++; }
     }
 
     /// <summary>临界区 2 击发: 五步确认 + Arm + 拷贝飞行时间 + Fire + WaitFire. 非退弹轮归还炮塔.</summary>
@@ -1279,24 +1256,30 @@ public class FSC
             if (!isDump) ReleaseTurretOnce(turret);
         }
         if (!isDump) {
-            // 击发时刻: 以游戏炮兵计时表为准 (游戏击发有 fireDelay 等固定延迟, 用 Time.time 会早一个固定差)
-            var sw = gunSys.StopwatchLatch();
-            if (sw.HasValue && sw.Value.travelTime > 0.01f) {
-                task.fireTime = sw.Value.startTime;
-                task.impactTime = sw.Value.travelTime;
-                MelonLogger.Msg($"[FCS] {leftRight}: fire latch travel={sw.Value.travelTime:F2}s (formula 预测 {ShellData.FlightTime(task.distance, task.charge):F2}s)");
-            }
-            else {
-                task.fireTime = Time.time;
-            }
+            LatchFireTime(leftRight, task, gunSys); // 击发快照 (退弹轮不算完成任务)
+            AddFinished(task);
         }
-        if (!isDump) {
-            // 击发确认: 完成队列入列 (退弹轮不算完成任务), 最多 8 条, 溢出计数
-            _finished.Add(new FinishedTask { task = task, fireTime = Time.time });
-            if (_finished.Count > 8) {
-                _finished.RemoveAt(0);
-                _finishedOverflow++;
-            }
+    }
+
+    /// <summary>击发快照: 以游戏炮兵计时表真值锁存 fireTime/impactTime (游戏击发有 fireDelay 等固定延迟, 用 Time.time 会早一个固定差), 无表则用 Time.time.</summary>
+    private void LatchFireTime(LeftRight leftRight, ArtilleryTask task, GunSystem gunSys) {
+        var sw = gunSys.StopwatchLatch();
+        if (sw.HasValue && sw.Value.travelTime > 0.01f) {
+            task.fireTime = sw.Value.startTime;
+            task.impactTime = sw.Value.travelTime;
+            MelonLogger.Msg($"[FCS] {leftRight}: fire latch travel={sw.Value.travelTime:F2}s (formula 预测 {ShellData.FlightTime(task.distance, task.charge):F2}s)");
+        }
+        else {
+            task.fireTime = Time.time;
+        }
+    }
+
+    /// <summary>完成入列 (最多 8 条 + 溢出计数).</summary>
+    private void AddFinished(ArtilleryTask task) {
+        _finished.Add(new FinishedTask { task = task, fireTime = Time.time });
+        if (_finished.Count > 8) {
+            _finished.RemoveAt(0);
+            _finishedOverflow++;
         }
     }
 
