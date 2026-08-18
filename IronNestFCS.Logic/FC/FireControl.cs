@@ -57,6 +57,8 @@ public class FireControl {
     public int QueueCount => _queue.Count;
     public bool AutoFire { get; set; }
     public bool AutoTask { get; set; }
+    /// <summary>Pause: 冻结火控派发与炮塔控制输出 (豁免: 飞行计时/落点指示在 GC/DC 常驻线程, 不受影响); 在途动作 GC 自行跑完.</summary>
+    public bool Paused { get; set; }
     private bool _armedL;
     private bool _armedR;
     private object? _loopHandle;
@@ -94,6 +96,16 @@ public class FireControl {
     public void RequestTask(FireTask task) { task.Id = ++_fcCounter; _requests.Add(task); }
     public void RequestCancel(FireTask task) { _requests.Remove(task); _queue.Remove(task); if (_taskL == task) _taskL = null; if (_taskR == task) _taskR = null; }
 
+    /// <summary>Stop: 清队列 + 撤任务 (线程常驻不死, 只是改指令内容).</summary>
+    public void StopTasks() {
+        _queue.Clear();
+        _requests.Clear();
+        _taskL = _taskR = null;
+        _armedL = _armedR = false;
+        if (GunL != null) { GunL.DesiredShell = (BulletType)(-1); GunL.DesiredCharge = -1; }
+        if (GunR != null) { GunR.DesiredShell = (BulletType)(-1); GunR.DesiredCharge = -1; }
+    }
+
     /// <summary>模式推导 (DC 只传 AutoFire + AutoTask 开关位): 扫荡=FullAuto 强制自动开火; AF=Semi; AF off=PreAiming; ManualControl=Manual.</summary>
     public void SetManual(bool manual) {
         if (manual) Mode = FireMode.Manual;
@@ -105,7 +117,7 @@ public class FireControl {
     private IEnumerator Loop() {
         while (!_disposed) {
             yield return new WaitForSeconds(0.04f);
-            if (Mode == FireMode.Manual) continue;
+            if (Mode == FireMode.Manual || Paused) continue; // Manual 停机 / Pause 冻结派发与炮塔控制
             ProcessRequests();
             Dispatch();                       // 空闲炮 + 实装匹配派发
             UpdateFireSolutions();            // 每帧诸元 → GC 指令

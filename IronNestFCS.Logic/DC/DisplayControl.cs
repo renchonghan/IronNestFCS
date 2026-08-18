@@ -94,16 +94,17 @@ public class DisplayControl {
         PruneHistories(seen);
     }
 
-    /// <summary>TWS: 5 帧 (0.2s) 位置平均差分 → 速度矢量 (km/s, 局部系近似).</summary>
+    /// <summary>TWS: 5 帧 (0.2s) 最小二乘线性拟合斜率 → 速度矢量 (km/s).
+    /// 均匀采样 t=0..4, 分母 Σ(t-t̄)²=10; 保留时间序列, 以后升二阶导 (加速度) 时同样按最小二乘扩到二次拟合.</summary>
     private Vector2 TrackVelocity(GameObject go, Vector3 pos) {
         if (!_posHist.TryGetValue(go, out var hist)) _posHist[go] = hist = new List<Vector3>();
         hist.Add(pos);
         if (hist.Count > 5) hist.RemoveAt(0);
         if (hist.Count < 5) return Vector2.zero;
-        Vector2 p0 = hist[0], p1 = hist[^1];
-        Vector2 d = p1 - p0;
-        if (d.magnitude < 0.001f) return Vector2.zero;
-        return d / (hist.Count - 1) * 25f / 3.8164f; // 帧差 × 25fps → km/s
+        Vector2 slope = Vector2.zero;
+        for (int i = 0; i < hist.Count; i++) slope += (Vector2)hist[i] * (i - 2);
+        slope /= 10f;
+        return slope * 25f / 3.8164f; // 帧斜率 × 25fps → km/s
     }
 
     private void PruneHistories(HashSet<GameObject> alive) {

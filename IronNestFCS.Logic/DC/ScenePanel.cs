@@ -1,0 +1,201 @@
+using System.Collections.Generic;
+using Il2Cpp;
+using Il2CppTMPro;
+using MelonLoader;
+using UnityEngine;
+
+namespace IronNestFCS.Logic.FCS;
+
+/// <summary>
+/// [DC] ScenePanel — 2.0 场景交互层 (迁移期: 旧 FcsSceneInteractor 清退前不 Build, 无视觉冲突).
+/// 3D 按钮列 (沙盘右侧第二列, 原 T1-T4 位置): AutoFire / AutoTask / TWS / TightCharge(T) / NormalCharge(N) / ExtraCharge(X);
+/// 火控台右侧按钮列改为三个: Start / Pause-Resume / Stop; 弹种选择按钮列保持现状 (旧层).
+/// 目标输入: 实体右键 = 入队请求 (再点取消); 令牌拖放注册由 DisplayControl 方法承载.
+/// </summary>
+public class ScenePanel {
+    public DisplayControl? Dc;
+    public FireControl? Fc;
+    public Radar? RadarPort;
+
+    private readonly ClickRaycaster _clicks = new();
+    private readonly List<GameObject> _owned = new();
+    private readonly HashSet<Collider> _entityColliders = new();
+    private float _lastRegister;
+    private bool _built;
+    private bool _paused;
+
+    /// <summary>Build 3D 按钮列 + 右键注册 (旧交互层清退后由 FcsModule 调用一次).</summary>
+    public void Build() {
+        if (_built) return;
+        _built = true;
+        BuildModeButtons();
+        BuildControlButtons();
+    }
+
+    public void ShutDown() {
+        _clicks.Clear();
+        foreach (var go in _owned) UnityEngine.Object.Destroy(go);
+        _owned.Clear();
+        _entityColliders.Clear();
+        _built = false;
+    }
+
+    /// <summary>每帧: 点击检测 + 新实体右键注册 (1s 一批, 去重).</summary>
+    public void Update() {
+        if (!_built) return;
+        _clicks.Update();
+        if (Time.time - _lastRegister > 1f) {
+            _lastRegister = Time.time;
+            RegisterEntityRightClicks();
+        }
+    }
+
+    private void RegisterEntityRightClicks() {
+        if (RadarPort == null) return;
+        _entityColliders.RemoveWhere(c => c == null);
+        foreach (var c in RadarPort.Contacts) {
+            if (c == null || c.Entity == null) continue;
+            var col = c.Entity.GetComponent<Collider>();
+            if (col == null || !_entityColliders.Add(col)) continue;
+            var go = c.Entity;
+            _clicks.Register(col, () => {
+                Dc?.RightClickEntity(go);
+            }, right: true); // 右键 (左键留给游戏自身拖拽)
+        }
+    }
+
+    // ===== 沙盘右侧第二列: AutoFire / AutoTask / TWS / Tight / Normal / Extra (原 T1-T4 按钮位置) =====
+    private void BuildModeButtons() {
+        const float z = -18.5881f;
+        var x = 0.8f;
+        var y = -0.65f;
+
+        // 先声明再赋值: lambda 要捕获按钮引用, 不能在其声明表达式内部引用它
+        GameObject autoFire = null!;
+        autoFire = Button("Auto Fire", Color.white, () => {
+            if (Dc == null) return;
+            Dc.AutoFire = !Dc.AutoFire;
+            SetColor(autoFire, Dc.AutoFire ? Color.red : Color.white);
+        });
+        Place(autoFire, x, y, z); x -= 0.05f; y -= 0.0045f;
+
+        GameObject autoTask = null!;
+        autoTask = Button("Auto Task", Color.white, () => {
+            if (Dc == null) return;
+            Dc.SetAutoTask(!Dc.AutoTask);
+            if (Dc.AutoTask) { Dc.AutoFire = true; SetColor(autoFire, Color.red); }
+            SetColor(autoTask, Dc.AutoTask ? Color.red : Color.white);
+        });
+        Place(autoTask, x, y, z); x -= 0.05f; y -= 0.0045f;
+
+        GameObject tws = null!;
+        tws = Button("TWS", Color.white, () => {
+            if (Dc == null) return;
+            Dc.SetTws(!Dc.Tws);
+            SetColor(tws, Dc.Tws ? Color.cyan : Color.white);
+        });
+        Place(tws, x, y, z); x -= 0.05f; y -= 0.0045f;
+
+        GameObject tight = null!, normal = null!, extra = null!;
+        tight = Button("Tight(T)", Color.white, () => {
+            if (Dc == null) return;
+            Dc.ChargeModeSelection = ChargeMode.Tight;
+            SetChargeColors(tight);
+        });
+        Place(tight, x, y, z); x -= 0.05f; y -= 0.0045f;
+
+        normal = Button("Normal(N)", Color.green, () => {
+            if (Dc == null) return;
+            Dc.ChargeModeSelection = ChargeMode.Normal;
+            SetChargeColors(normal);
+        });
+        Place(normal, x, y, z); x -= 0.05f; y -= 0.0045f;
+
+        extra = Button("Extra(X)", Color.white, () => {
+            if (Dc == null) return;
+            Dc.ChargeModeSelection = ChargeMode.Extra;
+            SetChargeColors(extra);
+        });
+        Place(extra, x, y, z);
+
+        void SetChargeColors(GameObject? active) {
+            SetColor(tight, active == tight ? Color.green : Color.white);
+            SetColor(normal, active == normal ? Color.green : Color.white);
+            SetColor(extra, active == extra ? Color.green : Color.white);
+        }
+    }
+
+    // ===== 火控台右侧: Start / Pause-Resume / Stop =====
+    private void BuildControlButtons() {
+        const float z = -18.4181f;
+        var x = 0.9f;
+        var y = -0.641f;
+
+        GameObject start = null!, pause = null!;
+        start = Button("Start", Color.green, () => {
+            Fc?.SetManual(false); // Start: AutoFire 已开 → Semi-Auto; 否则默认 PreAiming (FC 推导)
+            SetColor(start, Color.green);
+        });
+        Place(start, x, y, z); x -= 0.05f; y -= 0.0045f;
+
+        pause = Button("Pause", Color.green, () => {
+            _paused = !_paused;
+            if (Fc != null) Fc.Paused = _paused; // 冻结派发与炮塔控制 (豁免: 飞行计时/落点指示不冻结)
+            SetColor(pause, _paused ? new Color(1f, 0.6f, 0f) : Color.green);
+        });
+        Place(pause, x, y, z); x -= 0.05f; y -= 0.0045f;
+
+        GameObject stop = Button("Stop", Color.red, () => {
+            Fc?.StopTasks(); // 清队列 + 撤任务 (线程常驻不死)
+            SetColor(start, Color.green);
+        });
+        Place(stop, x, y, z);
+    }
+
+    private GameObject Button(string label, Color color, System.Action onClick) {
+        var go = GameObject.CreatePrimitive(PrimitiveType.Cube);
+        _owned.Add(go);
+        var collider = go.GetComponent<Collider>();
+        if (collider is BoxCollider box) box.size = new Vector3(1f, 10f, 1f); // 薄片视觉 + 厚点击盒
+        _clicks.Register(collider, onClick);
+        SetColor(go, color);
+        var text = AddText(label, 14f);
+        text.transform.SetParent(go.transform, false);
+        text.transform.localPosition = new Vector3(-1.9f, 0, -10.6f);
+        text.transform.localScale = Vector3.one;
+        return go;
+    }
+
+    private static void Place(GameObject go, float x, float y, float z) {
+        go.transform.position = new Vector3(x, y, z);
+        go.transform.localScale = new Vector3(0.02f, 0.004f, 0.02f); // 平面薄片: 薄在 Y, 躺平贴桌面
+    }
+
+    private GameObject AddText(string label, float fontSize) {
+        var go = new GameObject("FcsText");
+        _owned.Add(go);
+        go.transform.Rotate(new Vector3(90, 0, 0));
+        go.transform.Rotate(new Vector3(0, 0, -90));
+        var tmp = go.AddComponent<TextMeshPro>();
+        if (tmp.font == null && TMP_Settings.defaultFontAsset != null) tmp.font = TMP_Settings.defaultFontAsset;
+        tmp.text = label;
+        tmp.fontSize = fontSize;
+        tmp.color = Color.white;
+        return go;
+    }
+
+    /// <summary>URP Unlit 材质换色 (同旧 FcsSceneInteractor.SetColor).</summary>
+    private static void SetColor(GameObject go, Color color) {
+        var renderer = go.GetComponent<Renderer>();
+        if (renderer == null) return;
+        var shader = Shader.Find("Universal Render Pipeline/Unlit") ?? Shader.Find("Universal Render Pipeline/Lit");
+        if (shader == null) {
+            if (renderer.material != null) renderer.material.color = color;
+            return;
+        }
+        var mat = new Material(shader);
+        mat.color = color;
+        if (mat.HasProperty("_BaseColor")) mat.SetColor("_BaseColor", color);
+        renderer.material = mat;
+    }
+}

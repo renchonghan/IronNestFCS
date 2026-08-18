@@ -90,9 +90,94 @@ public class SandboxRenderer {
         });
     }
 
-    /// <summary>实体图标差集回调 (DisplayControl 数据循环调用).</summary>
-    public void SpawnIcon(DcTarget t) { /* 骨架: 按类型/敌我画图标挂件 (装甲/FDC/炮兵/AA/参考点), 接线期实装 */ }
-    public void RemoveIcon(GameObject go) { if (_icons.TryGetValue(go, out var root)) { DestroyRoot(root); _icons.Remove(go); } }
+    /// <summary>实体图标差集回调 (DisplayControl 数据循环调用): 按类型/敌我画图标挂件
+    /// (与旧版同款等宽线风格: 装甲=方形+菱形叠加边长相等, FDC=三条线六芒星, 炮兵=圆, AA=两短竖线+2倍粗底座, 参考点=绿色十字).</summary>
+    public void SpawnIcon(DcTarget t) {
+        if (t == null || t.Entity == null || _icons.ContainsKey(t.Entity)) return;
+        var root = new GameObject("FCS2_EntityIcon");
+        root.transform.SetParent(t.Entity.transform, false);
+        root.transform.localPosition = new Vector3(0f, 0f, -0.02f); // 浮出板面
+        Color color = t.Side switch {
+            Side3.Friendly => new Color(0.3f, 0.6f, 1f),   // 友军蓝
+            Side3.Neutral => new Color(0.2f, 1f, 0.3f),    // 参考点绿
+            _ => new Color(1f, 0.25f, 0.2f),               // 敌对红
+        };
+        DrawIcon(root.transform, t.Kind, color);
+        _icons[t.Entity] = root;
+    }
+
+    public void RemoveIcon(GameObject go) {
+        if (_icons.TryGetValue(go, out var root)) { DestroyRoot(root); _icons.Remove(go); }
+    }
+
+    /// <summary>实体图标绘制 (实体局部系, 与旧版同款线宽 0.01/0.005).</summary>
+    private static void DrawIcon(Transform parent, EntityKind kind, Color color) {
+        const float thin = 0.01f, thick = 0.02f;
+        switch (kind) {
+            case EntityKind.Armour: {
+                // 方形 + 菱形叠加, 边长相等 (0.1)
+                float s = 0.05f; // 半边长
+                Line(parent, new Vector2(-s, -s), new Vector2(s, -s), thin, color);
+                Line(parent, new Vector2(s, -s), new Vector2(s, s), thin, color);
+                Line(parent, new Vector2(s, s), new Vector2(-s, s), thin, color);
+                Line(parent, new Vector2(-s, s), new Vector2(-s, -s), thin, color);
+                Line(parent, new Vector2(0f, s), new Vector2(s, 0f), thin, color);
+                Line(parent, new Vector2(s, 0f), new Vector2(0f, -s), thin, color);
+                Line(parent, new Vector2(0f, -s), new Vector2(-s, 0f), thin, color);
+                Line(parent, new Vector2(-s, 0f), new Vector2(0f, s), thin, color);
+                break;
+            }
+            case EntityKind.Fdc: {
+                // 三条线六芒星 (*): 过中心三条直线, 半径 0.0267, 夹角 60°
+                float r = 0.0267f;
+                for (int i = 0; i < 3; i++) {
+                    float a = i * 60f * Mathf.Deg2Rad;
+                    var dir = new Vector2(Mathf.Cos(a), Mathf.Sin(a));
+                    Line(parent, -dir * r, dir * r, thin, color);
+                }
+                break;
+            }
+            case EntityKind.Artillery: {
+                // 圆 r=0.0267 (24 段)
+                float r = 0.0267f;
+                const int n = 24;
+                for (int i = 0; i < n; i++) {
+                    float a0 = i * 2f * Mathf.PI / n, a1 = (i + 1) * 2f * Mathf.PI / n;
+                    Line(parent, new Vector2(Mathf.Cos(a0), Mathf.Sin(a0)) * r,
+                        new Vector2(Mathf.Cos(a1), Mathf.Sin(a1)) * r, thin, color);
+                }
+                break;
+            }
+            case EntityKind.Aa: {
+                // 两条短竖线 (x=±0.02, 高 0.0534) + 2 倍粗底座 (竖线靠下 3/4 处, |_|)
+                float half = 0.0267f, bx = 0.03f;
+                Line(parent, new Vector2(-0.02f, -half), new Vector2(-0.02f, half), thin, color);
+                Line(parent, new Vector2(0.02f, -half), new Vector2(0.02f, half), thin, color);
+                Line(parent, new Vector2(-bx, -half / 2f), new Vector2(bx, -half / 2f), thick, color);
+                break;
+            }
+            default: {
+                // 参考点/其他: 绿色十字 (非目标)
+                float r = 0.0267f;
+                Line(parent, new Vector2(-r, 0f), new Vector2(r, 0f), thin, color);
+                Line(parent, new Vector2(0f, -r), new Vector2(0f, r), thin, color);
+                break;
+            }
+        }
+    }
+
+    /// <summary>一段直线 (Il2CppShapes.Line, 实体局部系).</summary>
+    private static void Line(Transform parent, Vector2 a, Vector2 b, float thickness, Color color) {
+        var go = new GameObject("FCS2_IconSeg");
+        go.transform.SetParent(parent, false);
+        var line = go.AddComponent<Il2CppShapes.Line>();
+        line.Thickness = thickness;
+        line.Start = new Vector3(a.x, a.y, 0f);
+        line.End = new Vector3(b.x, b.y, 0f);
+        line.Color = color;
+        line.ColorStart = color;
+        line.ColorEnd = color;
+    }
 
     /// <summary>每帧: 落点指示器推进 — 弹头沿铁巢→落点直线按剩余时长移动; 结束自毁.</summary>
     private void UpdateImpacts() {
