@@ -126,16 +126,18 @@ public class FSC
 
     public bool IsBound { get; private set; } = false;
 
+    /// <summary>2.0 迁移开关: false = 不绑旧 MapTable 标记系统、不启动旧常驻循环与旧交互层 (新架构接管), 只保留硬件绑定.</summary>
+    public bool LegacyDisabled { get; set; } = false;
+
     /// <summary>查找并绑定游戏对象. 返回 false 表示当前场景还没有目标控件.</summary>
     public bool TryBind()
     {
         // 每次重载创建全新的 Harmony 实例, 避免与上一版补丁冲突
         _sceneInteractor = new FcsSceneInteractor(this);
-        _sceneInteractor.Initialize();
         _harmony = new HarmonyInstance(HarmonyId);
         _deskLock.Reset();
         _turretLock.Reset();
-        IsBound = MapTable.TryBind()
+        IsBound = (LegacyDisabled || MapTable.TryBind())
                   && BallisticCalculator.TryBind()
                   && LeftGun.TryBind("Left")
                   && RightGun.TryBind("Right")
@@ -143,6 +145,8 @@ public class FSC
                   && Turret.TryBind()
                   && TriggerConsole.TryBind();
         MelonLogger.Msg("[FCS] Initialize: " + (IsBound ? "success" : "failed"));
+        if (LegacyDisabled) return IsBound; // 新架构接管: 旧循环/旧标记/旧按钮一律不启动
+        _sceneInteractor.Initialize();
         _timeoutLoopHandle = MelonCoroutines.Start(ProgressTimeoutMonitor());
         _runningCoroutines.Add((_timeoutLoopHandle, LeftRight.Left)); // 监控用左槽位无关
         if (IsBound) {

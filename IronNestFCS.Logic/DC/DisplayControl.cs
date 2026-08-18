@@ -137,6 +137,7 @@ public class DisplayControl {
             if (t.Side != Side3.Enemy || _swept.Contains(t.Entity)) continue;
             _swept.Add(t.Entity);
             Requests.Add(new FireTask {
+                Entity = t.Entity,
                 Name = t.Name,
                 PositionSource = () => LivePos(t.Entity),
                 VelocitySource = () => Tws ? t.Velocity : Vector2.zero,
@@ -170,6 +171,7 @@ public class DisplayControl {
     public void RightClickEntity(GameObject go) {
         if (go == null) return;
         Requests.Add(new FireTask {
+            Entity = go,
             Name = go.name,
             PositionSource = () => LivePos(go),
             VelocitySource = () => {

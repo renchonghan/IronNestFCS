@@ -16,6 +16,7 @@ public enum FireMode { Manual, PreAiming, SemiAuto, FullAuto }
 public class FireTask {
     public int Id;
     public string Name = "";
+    public GameObject? Entity;                             // 绑定实体/令牌 (渲染绑定用)
     public System.Func<Vector3?>? PositionSource; // 世界位置 (实体/令牌每帧刷新), null = 位置源失效
     public System.Func<Vector2>? VelocitySource; // TWS 速度矢量 (km/s, 地图局部系), null = 无预瞄直瞄
     public BulletType Shell;
@@ -40,8 +41,8 @@ public class FireControl {
     public CoroutineLock? FireLock;           // 统一火控短锁 (与 GC 的 DUMP 平射共享)
     public Transform? NestRef;                // 铁巢/炮塔参考 (相对方位计算用)
     public Transform? MapSurfaceRef;          // "Draggable Surface" (局部系换算用)
-    /// <summary>队列显示 push (DC 渲染线程): 打击队列指示器数据.</summary>
-    public System.Action<IReadOnlyList<FireTask>, GunControl?, GunControl?>? OnQueueChanged;
+    /// <summary>队列显示 push (DC 渲染线程): 打击队列指示器数据 (FC 自引用传出).</summary>
+    public System.Action<FireControl>? OnQueueChanged;
     /// <summary>落点指示器创建 (DC): (落点世界坐标, 弹种, 飞行时长, 击发时刻任务时钟).</summary>
     public System.Action<Vector3, BulletType, float, float>? OnShellFired;
 
@@ -55,6 +56,9 @@ public class FireControl {
     // ===== 状态 =====
     public FireMode Mode { get; private set; } = FireMode.Manual;
     public int QueueCount => _queue.Count;
+    public IReadOnlyList<FireTask> Queue => _queue;
+    public FireTask? LeftTask => _taskL;
+    public FireTask? RightTask => _taskR;
     public bool AutoFire { get; set; }
     public bool AutoTask { get; set; }
     /// <summary>Pause: 冻结火控派发与炮塔控制输出 (豁免: 飞行计时/落点指示在 GC/DC 常驻线程, 不受影响); 在途动作 GC 自行跑完.</summary>
@@ -122,7 +126,7 @@ public class FireControl {
             Dispatch();                       // 空闲炮 + 实装匹配派发
             UpdateFireSolutions();            // 每帧诸元 → GC 指令
             FireArbiter();                    // 就绪 → 统一火控 → 收尾
-            OnQueueChanged?.Invoke(_queue, GunL, GunR);
+            OnQueueChanged?.Invoke(this);
         }
     }
 

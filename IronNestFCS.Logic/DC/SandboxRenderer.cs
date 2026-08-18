@@ -25,9 +25,9 @@ public class SandboxRenderer {
     private object? _loopHandle;
     private bool _disposed;
 
-    private const float ZGreen = 0f;      // 绿十字+瞄准圈 (最上)
-    private const float ZImpact = -0.02f; // 落点指示器 (浮一层)
-    private const float ZRed = -0.03f;    // 红杀伤圈+编号 (贴板)
+    private const float ZGreen = 0f;       // 绿十字+瞄准圈 (最上)
+    private const float ZImpact = -0.02f;  // 落点指示器 (浮一层)
+    private const float ZRed = -0.025f;    // 红杀伤圈+编号 (贴板; 旧版 -0.03 偶尔被拍回来的侦察照片盖住, 上提一点点)
 
     public void Start() {
         _disposed = false;
@@ -98,7 +98,34 @@ public class SandboxRenderer {
         RebuildCircle(mark.RadiusRoot.transform, killRadiusKm, ZGreen, Color.green, solid: false, pierce: false, ref mark.RadiusKm, ref mark.SegCount, ref mark.Pierce);
     }
 
-    /// <summary>打击队列指示器 (FC 调用): 红色杀伤圈 + 编号米字数码 (00T/01N/02X; 在炮上 L-N/R-X) + 预瞄线, z=-0.03 贴板.
+    /// <summary>打击队列指示器批量同步 (FC 每帧调用): 队列任务 + 在炮任务 → 逐实体更新指示器 (槽位/队列位/弹种/预瞄).</summary>
+    public void UpdateQueueIndicator(FireControl fc) {
+        var seen = new HashSet<GameObject>();
+        int idx = 1;
+        foreach (var t in fc.Queue) {
+            if (t.Entity != null) {
+                seen.Add(t.Entity);
+                UpdateQueueIndicator(t.Entity, Slot.Queue, idx++, false, t.Shell, 0f);
+            }
+        }
+        SyncOne(fc.LeftTask, Slot.Left, seen);
+        SyncOne(fc.RightTask, Slot.Right, seen);
+        // 不在队列也不在炮上的旧标记: 清退
+        var gone = new List<GameObject>();
+        foreach (var k in _queueMarks.Keys) if (!seen.Contains(k)) gone.Add(k);
+        foreach (var k in gone) {
+            DestroyRoot(_queueMarks[k].Root);
+            _queueMarks.Remove(k);
+        }
+    }
+
+    private void SyncOne(FireTask? task, Slot slot, HashSet<GameObject> seen) {
+        if (task?.Entity == null) return;
+        seen.Add(task.Entity);
+        UpdateQueueIndicator(task.Entity, slot, 0, false, task.Shell, 0f);
+    }
+
+    /// <summary>打击队列指示器 (FC 调用): 红色杀伤圈 + 编号米字数码 (00T/01N/02X; 在炮上 L-N/R-X) + 预瞄线, z 贴板.
     /// queuePos -1 = 移出队列 (清退).</summary>
     public void UpdateQueueIndicator(GameObject entity, Slot slot, int queuePos, bool salvo, BulletType shell, float leadOffset) {
         if (MapSurfaceRef == null) return;

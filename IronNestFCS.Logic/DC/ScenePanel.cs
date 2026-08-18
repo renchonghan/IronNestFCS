@@ -30,7 +30,31 @@ public class ScenePanel {
         _built = true;
         BuildModeButtons();
         BuildControlButtons();
+        BuildBulletButtons();
     }
+
+    // ===== 弹种选择按钮列 (保持现状: 火控台右侧斜线列, 全弹种枚举) =====
+    private void BuildBulletButtons() {
+        const float z = -18.4181f;
+        var x = 0.8f;
+        var y = -0.65f;
+        foreach (BulletType type in System.Enum.GetValues(typeof(BulletType))) {
+            BulletType captured = type;
+            GameObject button = null!;
+            button = Button(type.ToString(), Dc != null && Dc.SelectedShell == type ? Color.green : Color.white, () => {
+                if (Dc == null) return;
+                Dc.SelectedShell = captured;
+                foreach (var (bt, go) in _bulletButtons) {
+                    SetColor(go, bt == captured ? Color.green : Color.white);
+                }
+            });
+            Place(button, x, y, z);
+            _bulletButtons.Add((type, button));
+            x -= 0.05f;
+            y -= 0.0045f;
+        }
+    }
+    private readonly List<(BulletType, GameObject)> _bulletButtons = new();
 
     public void ShutDown() {
         _clicks.Clear();
