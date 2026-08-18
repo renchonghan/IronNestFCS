@@ -1,0 +1,214 @@
+using System.Collections;
+using System.Collections.Generic;
+using MelonLoader;
+using UnityEngine;
+
+namespace IronNestFCS.Logic.FCS;
+
+/// <summary>
+/// [DC] DisplayControl — 2.0 显控台数据循环 (迁移期: 未接线).
+/// 数据循环 25fps: 铁巢位置 / Radar SRC → Target 列表 (相对位置 + TWS 5 帧平均速度) / 实体图标差集 / 操作响应 (请求).
+/// 渲染不在这里 — 独立渲染线程 <see cref="SandboxRenderer"/>.
+/// 状态端口 (FC 读): Target 列表 + 火控请求 + AutoFire/AutoTask 开关位.
+/// </summary>
+public class DisplayControl {
+    public Radar? RadarPort;                 // SRC 数据源 (FcsModule 注入)
+    public Transform? NestRef;               // 铁巢 (相对位置基准)
+    public Transform? MapSurfaceRef;         // 沙盘表面 (局部系换算)
+
+    // ===== 状态端口 =====
+    public readonly List<DcTarget> Targets = new();
+    public readonly List<FireTask> Requests = new();   // 火控请求 (FC 消费后清)
+    public bool AutoFire;
+    public bool AutoTask;
+    public bool Tws;                                  // TWS 开关 (关 = 速度矢量给空, 火控自然无预瞄)
+
+    // ===== 内部 =====
+    private readonly Dictionary<GameObject, List<Vector3>> _posHist = new(); // 5 帧位置历史 (TWS)
+    private readonly HashSet<GameObject> _icons = new();                     // 已挂图标 (差集用)
+    private object? _loopHandle;
+    private bool _disposed;
+
+    /// <summary>显控排布 (舰长席): AutoTask 扫荡 = 只从敌对目标按优先级发请求; 优先级 FDC > 炮兵 > 装甲 > 其他.</summary>
+    public System.Action<IReadOnlyList<DcTarget>>? OnSweepQueue;
+
+    public void Start() {
+        _disposed = false;
+        _loopHandle = MelonCoroutines.Start(Loop());
+    }
+
+    public void Stop() {
+        _disposed = true;
+        if (_loopHandle != null) { try { MelonCoroutines.Stop(_loopHandle); } catch { } }
+        _loopHandle = null;
+        Targets.Clear();
+        Requests.Clear();
+        _posHist.Clear();
+        _icons.Clear();
+    }
+
+    /// <summary>数据循环 25fps.</summary>
+    private IEnumerator Loop() {
+        while (!_disposed) {
+            yield return new WaitForSeconds(0.04f);
+            if (RadarPort == null) continue;
+            RefreshTargets();
+            UpdateIcons();       // 实体图标差集 (在列表→画, 不在→删)
+            if (AutoTask) Sweep();
+        }
+    }
+
+    /// <summary>SRC → Target 列表: 相对位置 (方位/距离) + TWS 5 帧平均速度.</summary>
+    private void RefreshTargets() {
+        Targets.Clear();
+        var seen = new HashSet<GameObject>();
+        foreach (var c in RadarPort.Contacts) {
+            if (c == null || c.Entity == null) continue;
+            seen.Add(c.Entity);
+            Vector2 vel = Vector2.zero;
+            if (Tws) vel = TrackVelocity(c.Entity, c.WorldPos);
+            Targets.Add(new DcTarget {
+                Entity = c.Entity,
+                Name = c.Entity.name,
+                WorldPos = c.WorldPos,
+                Velocity = vel,
+                Side = c.Side,
+                Kind = c.Kind,
+                Armour = c.Armour,
+            });
+        }
+        // 令牌虚拟目标 (位置源由 DC 管理): 混在同一列表, 句柄为令牌
+        foreach (var tok in _tokens) {
+            if (tok.Key == null || tok.Key.gameObject == null) continue;
+            var pos = tok.Key.position;
+            seen.Add(tok.Key.gameObject);
+            Targets.Add(new DcTarget {
+                Entity = tok.Key.gameObject,
+                Name = tok.Value,
+                WorldPos = pos,
+                Velocity = Tws ? TrackVelocity(tok.Key.gameObject, pos) : Vector2.zero,
+                Side = Side3.Enemy,
+                Kind = EntityKind.Other,
+            });
+        }
+        PruneHistories(seen);
+    }
+
+    /// <summary>TWS: 5 帧 (0.2s) 位置平均差分 → 速度矢量 (km/s, 局部系近似).</summary>
+    private Vector2 TrackVelocity(GameObject go, Vector3 pos) {
+        if (!_posHist.TryGetValue(go, out var hist)) _posHist[go] = hist = new List<Vector3>();
+        hist.Add(pos);
+        if (hist.Count > 5) hist.RemoveAt(0);
+        if (hist.Count < 5) return Vector2.zero;
+        Vector2 p0 = hist[0], p1 = hist[^1];
+        Vector2 d = p1 - p0;
+        if (d.magnitude < 0.001f) return Vector2.zero;
+        return d / (hist.Count - 1) * 25f / 3.8164f; // 帧差 × 25fps → km/s
+    }
+
+    private void PruneHistories(HashSet<GameObject> alive) {
+        var dead = new List<GameObject>();
+        foreach (var k in _posHist.Keys) if (!alive.Contains(k)) dead.Add(k);
+        foreach (var k in dead) _posHist.Remove(k);
+    }
+
+    /// <summary>实体图标差集 (DC 自己的活): 在列表→画, 不在→删 (渲染线程执行 3D 挂件管理).</summary>
+    private void UpdateIcons() {
+        foreach (var t in Targets) {
+            if (_icons.Add(t.Entity)) OnIconSpawn?.Invoke(t);
+        }
+        var remove = new List<GameObject>();
+        foreach (var go in _icons) {
+            bool alive = false;
+            foreach (var t in Targets) if (t.Entity == go) { alive = true; break; }
+            if (!alive) remove.Add(go);
+        }
+        foreach (var go in remove) {
+            _icons.Remove(go);
+            OnIconRemove?.Invoke(go);
+        }
+    }
+
+    /// <summary>扫荡 (舰长席排布): 敌对目标按优先级 FDC > 炮兵 > 装甲 > 其他 发请求 (持续, 去重).</summary>
+    private readonly HashSet<GameObject> _swept = new();
+    private void Sweep() {
+        foreach (var t in Targets) {
+            if (t.Side != Side3.Enemy || _swept.Contains(t.Entity)) continue;
+            _swept.Add(t.Entity);
+            Requests.Add(new FireTask {
+                Name = t.Name,
+                PositionSource = () => LivePos(t.Entity),
+                VelocitySource = () => Tws ? t.Velocity : Vector2.zero,
+                Priority = PriorityOf(t),
+                Shell = SelectedShell,
+                Mode = ChargeModeSelection,
+            });
+        }
+        OnSweepQueue?.Invoke(Targets);
+    }
+
+    private static Vector3? LivePos(GameObject go) => go == null ? null : go.transform.position;
+
+    private static int PriorityOf(DcTarget t) {
+        switch (t.Kind) {
+            case EntityKind.Fdc: return 4;
+            case EntityKind.Artillery: return 3;
+            case EntityKind.Armour: return 2;
+            default: return 1;
+        }
+    }
+
+    // ===== 目标输入 (用户操作 → 请求) =====
+    /// <summary>当前选中弹种 (弹种按钮列, 右键时快照进请求).</summary>
+    public BulletType SelectedShell = BulletType.AP;
+    public ChargeMode ChargeModeSelection = ChargeMode.Normal;
+
+    private readonly Dictionary<Transform, string> _tokens = new(); // 令牌 → 虚拟目标名称
+
+    /// <summary>右键实体 → 入队请求 (再点取消由 FC 回调, 令牌离图自动取消由 RemoveToken 触发).</summary>
+    public void RightClickEntity(GameObject go) {
+        if (go == null) return;
+        Requests.Add(new FireTask {
+            Name = go.name,
+            PositionSource = () => LivePos(go),
+            VelocitySource = () => {
+                if (!Tws) return Vector2.zero;
+                var t = Targets.Find(x => x.Entity == go);
+                return t?.Velocity ?? Vector2.zero;
+            },
+            Priority = 1,
+            Shell = SelectedShell,
+            Mode = ChargeModeSelection,
+        });
+    }
+
+    /// <summary>拖令牌上地图 → 注册虚拟目标 (带名称); 拖离地图 → 移除 (位置源失效, FC 撤任务).</summary>
+    public void AddToken(Transform token, string name) => _tokens[token] = name;
+    public void RemoveToken(Transform token) => _tokens.Remove(token);
+
+    /// <summary>开关 (3D 按钮列/火控台按钮由场景交互层调用).</summary>
+    public void SetAutoTask(bool on) { AutoTask = on; }
+    public void SetTws(bool on) { Tws = on; if (!on) _posHist.Clear(); }
+
+    // ===== 渲染线程回调 (SandboxRenderer 挂接) =====
+    public System.Action<DcTarget>? OnIconSpawn;    // 新实体 → 画图标
+    public System.Action<GameObject>? OnIconRemove; // 阵亡/离图 → 删图标
+
+    /// <summary>火控请求消费 (FC 每帧取走).</summary>
+    public List<FireTask> DrainRequests() {
+        var copy = new List<FireTask>(Requests);
+        Requests.Clear();
+        return copy;
+    }
+}
+
+/// <summary>DC Target 列表元素 (实体 + 令牌虚拟目标混列).</summary>
+public class DcTarget {
+    public GameObject Entity = null!;
+    public string Name = "";
+    public Vector3 WorldPos;
+    public Vector2 Velocity;      // TWS 开启时 5 帧平均 (km/s); 关 = 零 (火控自然无预瞄)
+    public Side3 Side;
+    public EntityKind Kind;
+    public int Armour;
+}
