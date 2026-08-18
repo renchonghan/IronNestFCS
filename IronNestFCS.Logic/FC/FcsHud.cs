@@ -31,10 +31,13 @@ public class FcsHud {
 
     private void Draw() {
         const float h = 22f, lh = 24f;
-        float panelH = 4f + lh * 10 + 8f;
-        _panelRect.height = panelH;
+        // 面板尺寸按内容实测: 宽 = 64 字符实测宽 + 边距, 高 = 行数精确累计
+        float lineW = GUI.skin.label.CalcSize(new GUIContent(new string('-', LineWidth))).x;
+        _panelRect.width = lineW + 8f;
+        const int lines = 1 + 1 + 2 + 1 + 2 + 1 + 1 + 8; // 标题 + 分隔×3 + 两炮各2 + 队头 + 队列8行
+        _panelRect.height = 4f + lines * lh + 8f;
         GUI.Box(_panelRect, "");
-        float x = _panelRect.x + 2f, y = _panelRect.y + 4f;
+        float x = _panelRect.x + 4f, y = _panelRect.y + 4f;
 
         GUI.color = new Color(0f, 1f, 0.35f);
         GUI.Label(new Rect(x, y, _panelRect.width, h), TitleLine());
@@ -61,18 +64,21 @@ public class FcsHud {
         GUI.color = Color.white;
     }
 
-    /// <summary>队列行: [预定打击时间] 方位 距离 弹种 模式字母; 预定 -1 = [--:--:--].</summary>
+    /// <summary>队列行: [预定打击时间] 方位 距离 弹种 模式字母 (弹种不补宽, 固定两空格); 预定 -1 = [--:--:--].</summary>
     private static string QueueRow(FireTask t) {
         string planned = t.PlannedStrikeTime > 0f ? MissionClock.Format(t.PlannedStrikeTime) : "[--:--:--]";
         char mode = t.Mode switch { ChargeMode.Tight => 'T', ChargeMode.Extra => 'X', _ => 'N' };
-        return $"{planned} {t.Angle:000.0} {t.Distance:00.00}  {t.Shell,-4}  {mode}";
+        return $"{planned} {t.Angle:000.0} {t.Distance:00.00}  {t.Shell}  {mode}";
     }
 
-    /// <summary>完成行: 抵达时刻 [HH:MM:SS] 方位 距离 T:-剩余秒.</summary>
+    /// <summary>完成行: 抵达时刻 [HH:MM:SS] (无任务时钟 = 横线) 方位 距离 T:-剩余秒 (炮表倒计时, 与任务时钟无关).</summary>
     private static string FinishRow(FireControl.FinishedEntry f) {
         string arrival = MissionClock.Format(f.FireMission + f.Fly);
-        float now = MissionClock.Seconds;
-        float remain = float.IsNaN(now) ? 0f : f.Fly - (now - f.FireMission);
+        float remain = f.RemainingSource?.Invoke() ?? float.NaN;
+        if (float.IsNaN(remain)) {
+            float now = MissionClock.Seconds;
+            remain = float.IsNaN(now) ? 0f : f.Fly - (now - f.FireMission);
+        }
         string cd = remain > 0.01f ? $"{remain:00.0}S" : "--.-S";
         return $"{arrival} {f.Task.Angle:000.0} {f.Task.Distance:00.00} T:-{cd}";
     }
@@ -102,21 +108,36 @@ public class FcsHud {
             y += lh;
             return;
         }
-        var (code, name) = PhaseCode(gun.Action, Fc?.Mode ?? FireMode.Manual);
+        // 相位优先读游戏装填状态码 (真实状态); 但码只在装填动作期间生效 — 装填完成后码停在 BreachLocked,
+        // TRAK 起改用声称 Action (否则 HUD 永远卡 2-5 COFM)
+        var (code, name) = gun.Action < GunAction.Trak
+            ? (gun.ReloadPhase() ?? PhaseCode(gun.Action, Fc?.Mode ?? FireMode.Manual))
+            : PhaseCode(gun.Action, Fc?.Mode ?? FireMode.Manual);
         string chamber = gun.Chamber.Length > 0 ? gun.Chamber : (gun.Action == GunAction.Trak ? "----" : "NULL");
         string eStr = float.IsNaN(gun.Elevation) ? "--.--" : $"{gun.Elevation:00.00}";
         string aStr = float.IsNaN(gun.Azimuth) ? "---.-" : $"{gun.Azimuth:000.0}";
         string cStr = gun.Charges > 0 ? gun.Charges.ToString() : "-";
         string ft = !float.IsNaN(gun.FlyTime) && gun.FlyTime > 0.01f ? $"{gun.FlyTime:00.0}S" : "--.-S";
         var task = Fc != null ? (gun == GunL ? Fc.LeftTask : Fc.RightTask) : null;
-        char modeLetter = task == null ? 'N' : task.Mode switch { ChargeMode.Tight => 'T', ChargeMode.Extra => 'X', _ => 'N' };
-        string id = gun == GunL ? $"L-{modeLetter}" : $"R-{modeLetter}";
+        bool isL = gun == GunL;
+        // 前导位 = 预定打击时间 (默认 -1 → [--:--:--]); 齐射时右炮行前导 >>>[SALVO] (1.x 同款, 左炮为主炮)
+        string id = task != null && task.PlannedStrikeTime > 0f ? MissionClock.Format(task.PlannedStrikeTime) : "[--:--:--]";
+        if (!isL && task != null && task.SalvoPair && Fc != null && Fc.LeftTask == task) id = ">>>[SALVO]";
+        string ang = task != null ? $"{task.Angle:000.0}" : "---.-";
+        string dst = task != null ? $"{task.Distance:00.00}" : "--.--";
         GUI.Label(new Rect(x, y, _panelRect.width, h),
             $" [{label}] PHASE {code} {name} | [{Center(chamber, 4)}] E:{eStr} A:{aStr} C:{cStr} | FT:{ft}".PadRight(LineWidth));
         y += lh;
-        string t2 = !float.IsNaN(gun.FlyTime) && gun.Fired ? $"{gun.FlyTime:00.0}S" : "--.-S";
+        // 第二行 = 火控解析 (与炮无关, FC 解算持续刷新): 解算仰角/方位/装药; 无任务全横线
+        // T:- = 游戏炮表倒计时 (落地/未倒计时 → 横线); 不依赖任务时钟
+        float cd = gun.FlyRemaining;
+        string t2 = !float.IsNaN(cd) && cd > 0.01f ? $"{cd:00.0}S" : "--.-S";
+        float solE = Fc != null ? (isL ? Fc.SolElevL : Fc.SolElevR) : float.NaN;
+        int solC = Fc != null ? (isL ? Fc.SolChargeL : Fc.SolChargeR) : -1;
+        string solEStr = task != null && !float.IsNaN(solE) ? $"{solE:00.00}" : "--.--";
+        string solCStr = solC > 0 ? solC.ToString() : "-";
         GUI.Label(new Rect(x, y, _panelRect.width, h),
-            $" [{id}] ---.- --.-- | [{Center(chamber, 4)}] E:{eStr} A:{aStr} C:{cStr} | T:-{t2}".PadRight(LineWidth));
+            $" {id} {ang} {dst} | [{Center(chamber, 4)}] E:{solEStr} A:{ang} C:{solCStr} | T:-{t2}".PadRight(LineWidth));
         y += lh;
     }
 

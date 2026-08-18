@@ -54,6 +54,10 @@ public class GunControl {
     public bool AllReady { get; private set; }                     // 弹药确认且追踪稳定; 不稳定回退
     public bool Fired { get; private set; }                        // 本发已击发 (FC 收尾用)
     public bool KernelMode { get; private set; }                   // 内核态: 硬件动作执行中 (指令只记录不生效)
+    /// <summary>游戏 CANFIRE 信号 (膛内+装药+保险): 绿十字显示门槛 (1.x 同口径, 弹没装好不出落点).</summary>
+    public bool CanFire { get { try { return _gun.CanFire(); } catch { return false; } } }
+    /// <summary>击发后游戏炮表剩余秒数 (与游戏自身飞行指示器同一数据源, 消除检测时间差); 未倒计时 NaN.</summary>
+    public float FlyRemaining { get; private set; } = float.NaN;
 
     // ===== 内部 =====
     private readonly TrackAxis _eAxis = new(0.01f, 0.1f, 0.5f);  // E: 收敛 0.01°, 变积分 0.1~0.5
@@ -63,6 +67,8 @@ public class GunControl {
     private float _eStable;
     private float _hStable;
     private float _latchedFlyTime = float.NaN; // 击发后锁存总飞时
+    private string _lastStateKey = "";         // 装填状态码变化检测 (诊断用, 定位完删)
+    private float _lastLoadDiag;               // CanFire 不置位诊断节流 (定位完删)
     private bool _disposed;
 
     // 实时弹道指示器 push 目标 (FcsModule 注入 DC 回调): (瞄准点, 杀伤圈, 弹种)
@@ -106,24 +112,48 @@ public class GunControl {
         while (!_disposed) {
             yield return new WaitForSeconds(0.04f);
             ReadSensors();                     // 每帧: 俯仰/方位/飞时 (传感器值不受动作影响)
+            // 装填状态码诊断 (定位完删): 游戏状态机 stateKey 变化才打 — 玩家手动装填也能抓, 不用跑 mod 动作
+            var stateKey = _gun.ReloadStateKey() ?? "<null>";
+            if (stateKey != _lastStateKey) {
+                _lastStateKey = stateKey;
+                MelonLogger.Msg($"[GC] {_side}: reloadState '{stateKey}'");
+            }
             if (ManualControl) {               // 手动: 立即停手, 残局交玩家, 线程照跑
                 TryStop(_taskHandle);
                 _taskHandle = null;
                 KernelMode = false;
                 AllReady = false;
                 Action = GunAction.Idle;
+                SalvoActive = false;
                 PushBallistic(-1);             // 弹种 -1 = 未就绪不渲染
                 continue;
             }
+            // 方位追踪不受装弹影响: 被选中即全程追 (从派发起, 不等 LOAD/TRAK)
+            if (AzimuthSelect && !float.IsNaN(DesiredAzimuth) && !float.IsNaN(Azimuth)) {
+                float hCorr = _hAxis.Step(Mathf.DeltaAngle(Azimuth, DesiredAzimuth), FcsBus.TurretVelRead?.Invoke() ?? 0f, Azimuth);
+                if (!_hAxis.GaveUp && FcsBus.TurretSet != null) FcsBus.TurretSet(DesiredAzimuth + hCorr);
+            }
+            if (DesiredCharge < 0) SalvoActive = false; // 任务撤了/完成了: 导演标志复位, 下次派发才能重启
             if (_taskHandle == null) {
                 // 空闲: 周期性刷新实装快照 (FC 派发读实装匹配用, 不能陈), 有新任务则起链
                 if (DesiredCharge < 0 && Time.time - idleRefresh > 0.5f) {
                     RefreshSnapshot();
                     idleRefresh = Time.time;
                 }
-                if (DesiredShell != (BulletType)(-1) && DesiredCharge >= 0) {
+                if (DesiredShell != (BulletType)(-1) && DesiredCharge >= 0 && !SalvoActive) {
                     RefreshSnapshot();         // 任务上炮: 边界读实装快照
-                    _taskHandle = MelonCoroutines.Start(TaskChain());
+                    if (SyncCommand && SyncPeer != null) {
+                        // 齐射: 左炮启动导演 (一条协程带两炮), 右炮登记同一句柄不自己起链
+                        if (_side == LeftRight.Left) {
+                            MelonLogger.Msg($"[GC] {_side}: salvo director start shell={DesiredShell} charge={DesiredCharge}");
+                            _taskHandle = MelonCoroutines.Start(SalvoDirector.Run(this, SyncPeer));
+                            SyncPeer._taskHandle = _taskHandle;
+                        }
+                    }
+                    else {
+                        MelonLogger.Msg($"[GC] {_side}: chain start shell={DesiredShell} charge={DesiredCharge} chamber='{Chamber}' charges={Charges}");
+                        _taskHandle = MelonCoroutines.Start(TaskChain());
+                    }
                 }
             }
         }
@@ -136,71 +166,111 @@ public class GunControl {
         if (!Fired) {
             FlyTime = _gun.RemainingFlightSeconds(); // 瞄准期: 游戏按实际仰角自解; NaN = 未就绪
         }
+        else {
+            FlyRemaining = _gun.CountdownRemainingSeconds(); // 击发后: 游戏炮表倒计时 (红点进度同步游戏指示器)
+        }
     }
 
     /// <summary>动作边界: 刷新实装快照 (机构稳定期读数才可信).</summary>
-    private void RefreshSnapshot() {
+    internal void RefreshSnapshot() {
         Chamber = _gun.BulletInChamber() ?? "";
         Charges = _gun.LoadedPowderCharges();
     }
 
-    /// <summary>任务链: 弹药准备 → TRAK (持续) → 击发后 REST → IDLE. 每步短协程 + 看门狗.</summary>
+    /// <summary>任务链 (单发): 弹药准备 (逐步决策) → TRAK (持续) → 击发后 REST → IDLE. 齐射走 SalvoDirector.
+    /// 任务被撤 (DesiredCharge&lt;0) / 手动 / 停止 → 立即退出, 句柄 finally 清 (否则下个任务起不了链).</summary>
     private IEnumerator TaskChain() {
+        ResetForTask();
+        try {
+            while (!_disposed) {
+                if (ManualControl || DesiredCharge < 0) yield break; // 撤任务: 别把膛内弹当错弹 DUMP 掉
+                var step = DecidePrepStep();
+                if (step == null) break; // 弹药就绪 → TRAK
+                yield return Exec(step.Value.Action, step.Value.Deadline, step.Value.Routine);
+            }
+            if (ManualControl || _disposed) yield break;
+            yield return RunTrak(); // 3-1 TRAK: 持续追踪直到击发 (AllReady 供 FC 统一火控)
+            if (ManualControl || _disposed) yield break;
+            yield return RunRest(); // 3-3 REST 复位 → IDLE
+        }
+        finally { _taskHandle = null; }
+    }
+
+    /// <summary>任务开工复位: AllReady/Fired/飞时锁存/双轴稳定器 (单发与齐射导演共用).</summary>
+    internal void ResetForTask() {
         AllReady = false;
         Fired = false;
         _latchedFlyTime = float.NaN;
         _eAxis.ResetForTask();
         _hAxis.ResetForTask();
-        while (!_disposed) {
-            if (ManualControl) yield break;
-            RefreshSnapshot();
-            bool chamberOk = Chamber == DesiredShell.ToString();
-            bool chargeOk = !SyncCommand ? Charges >= DesiredCharge : Charges == DesiredCharge; // 齐射多药/少药都是错药
-            bool shellWrong = Chamber.Length > 0 && !chamberOk;
+    }
 
-            // 弹药准备 (齐射: 每步相位级同步, 两炮都完成才一起走下一步)
-            if (shellWrong) {
-                yield return WaitPeerPhase(GunAction.Dump);
-                yield return Exec(GunAction.Dump, 25f, DumpRoutine);
-                continue; // 平射打掉后回决策
+    /// <summary>弹药准备决策一步 (单发与齐射导演共用): 下一步动作, null = 弹药就绪.
+    /// 齐射口径: 多药/少药都是错药 (Charges == DesiredCharge).</summary>
+    internal SalvoStep? DecidePrepStep() {
+        RefreshSnapshot();
+        bool chamberOk = Chamber == DesiredShell.ToString();
+        bool chargeOk = !SyncCommand ? Charges >= DesiredCharge : Charges == DesiredCharge;
+        bool shellWrong = Chamber.Length > 0 && !chamberOk;
+        if (shellWrong) return new SalvoStep { Action = GunAction.Dump, Deadline = 25f, Routine = DumpRoutine };
+        if (Chamber.Length == 0) {
+            if (!_gun.HaveBulletInCylinder(DesiredShell)) {
+                return new SalvoStep { Action = GunAction.Selc, Deadline = 20f, Routine = SelcRoutine };
             }
-            if (Chamber.Length == 0) {
-                if (!_gun.HaveBulletInCylinder(DesiredShell)) {
-                    yield return WaitPeerPhase(GunAction.Selc);
-                    yield return Exec(GunAction.Selc, 20f, SelcRoutine);
-                    continue;
-                }
-                yield return WaitPeerPhase(GunAction.Shrd);
-                yield return Exec(GunAction.Shrd, 8f, ShrdRoutine);
-                continue;
-            }
-            if (Chamber.Length > 0 && !chargeOk) {
-                if (Charges > DesiredCharge && SyncCommand) { // 齐射多药: 只能整发打掉
-                    yield return WaitPeerPhase(GunAction.Dump);
-                    yield return Exec(GunAction.Dump, 25f, DumpRoutine);
-                    continue;
-                }
-                yield return WaitPeerPhase(GunAction.Pwdr);
-                yield return Exec(GunAction.Pwdr, 25f, PwdrRoutine);
-                continue;
-            }
-            if (!_gun.CanFire()) {
-                yield return WaitPeerPhase(GunAction.Load);
-                yield return Exec(GunAction.Load, 20f, LoadRoutine);
-                continue;
-            }
-            break; // 弹药就绪 → TRAK
+            // 选弹后必须推弹入膛 (固定两步, 否则膛永远空着死循环); 复合步相位跟真实动作
+            return new SalvoStep { Action = GunAction.Shrd, Deadline = 28f, Routine = ShrdShldStep };
         }
-        if (ManualControl || _disposed) yield break;
+        if (!chargeOk) {
+            if (Charges > DesiredCharge && SyncCommand) { // 齐射多药: 只能整发打掉
+                return new SalvoStep { Action = GunAction.Dump, Deadline = 25f, Routine = DumpRoutine };
+            }
+            // PWDR 拉杆只改"选药" (实装不变), 必须接 LOAD 推药入膛再回决策, 否则 loaded 永远 0 死循环
+            return new SalvoStep { Action = GunAction.Pwdr, Deadline = 45f, Routine = PwdrLoadStep };
+        }
+        // 弹对+药对 = 装填完成 (CanFire 含保险, 装填段不卡它 — 保险由 FC 在 TRAK 段解, 1.x 口径)
+        return null; // 弹药就绪
+    }
 
-        // 3-1 TRAK: 持续追踪直到击发 (AllReady 供 FC 统一火控; 追踪不稳回退)
-        yield return WaitPeerPhase(GunAction.Trak);
+    private IEnumerator ShrdShldStep() {
+        yield return ShrdRoutine();
+        Action = GunAction.Shld;
+        yield return ShldRoutine();
+    }
+
+    private IEnumerator PwdrLoadStep() {
+        yield return PwdrRoutine();
+        Action = GunAction.Load;
+        yield return LoadRoutine();
+    }
+
+    /// <summary>执行一步 (导演复用 Exec).</summary>
+    internal IEnumerator RunStep(SalvoStep s) => Exec(s.Action, s.Deadline, s.Routine);
+
+    /// <summary>游戏装填状态码 → HUD 相位 (真实状态优先; null = 码未覆盖的段, 用声称 Action 兜底).
+    /// 码序列 (实机抓): ShellRamming=推弹, SelectPowderCharge=拉药, RamCharges=推药,
+    /// CloseShellGuide/FinalSequence=收尾 (2-4 LOAD), BreachLocked=炮闩锁 (2-5 COFM, 一闪而过).</summary>
+    public (string code, string name)? ReloadPhase() {
+        switch (_gun.ReloadStateKey()) {
+            case "ShellRamming": return ("2-2", "BLLD");
+            case "SelectPowderCharge": return ("2-3", "PWDR");
+            case "RamCharges":
+            case "CloseShellGuide":
+            case "FinalSequence": return ("2-4", "LOAD"); // 推药+收尾 (1.x WaitLoading 口径)
+            case "BreachLocked": return ("2-5", "COFM");  // 炮闩锁定 (1.x 装填确认, 一闪而过)
+            default: return null;
+        }
+    }
+
+    /// <summary>3-1 TRAK: 持续追踪直到击发 (FC 击发或玩家); 任务被撤 (DesiredCharge<0) 退出不开火.
+    /// 击发判定看 pendingReload (HasFired): 击发后天然切 REST — CanFire 含保险, TRAK 期保险未解恒 false, 不能当击发信号.</summary>
+    internal IEnumerator RunTrak() {
         Action = GunAction.Trak;
+        yield return new WaitForSeconds(0.5f); // 装填机构停稳再追 (开头仰角杆不鬼畜)
         while (!_disposed) {
-            if (ManualControl) yield break;
+            if (ManualControl || DesiredCharge < 0) yield break;
             yield return new WaitForSeconds(0.04f);
-            if (!TrackOnce()) continue;     // 本帧追踪推进 (AllReady 内部维护)
-            if (Fired || _gun.HasFired()) break; // 击发 (FC 或玩家)
+            if (!TrackOnce()) continue; // 本帧追踪推进 (AllReady 内部维护)
+            if (_gun.HasFired()) break; // 击发 (pendingReload) → 天然切 REST; CanFire 含保险, TRAK 期保险未解恒 false, 不能当击发信号
         }
         if (_gun.HasFired() && !Fired) {
             Fired = true;
@@ -208,11 +278,13 @@ public class GunControl {
             if (sw.HasValue && sw.Value.travelTime > 0.01f) _latchedFlyTime = sw.Value.travelTime;
         }
         FlyTime = _latchedFlyTime; // 击发后: 锁存真值供 FC 落点计时
+    }
 
-        // 3-3 REST 复位 → IDLE
+    /// <summary>3-3 REST 复位 → IDLE; AllReady 一并清 (防残留误导下个任务装填期).</summary>
+    internal IEnumerator RunRest() {
         yield return Exec(GunAction.Rest, 30f, RestRoutine);
         Action = GunAction.Idle;
-        _taskHandle = null;
+        AllReady = false;
     }
 
     /// <summary>TRAK 单帧推进: E 恒追 (TrackAxis 天顶星伺服 = 设 1 帧预测目标 + 修正);
@@ -224,12 +296,7 @@ public class GunControl {
             if (!_eAxis.GaveUp) _gun.SetElevationValue(DesiredElevation + corr);
             eLock = _eAxis.Locked;
         }
-        bool hLock = !AzimuthSelect; // 未被选中: H 不归本炮, 不算就绪条件
-        if (AzimuthSelect && !float.IsNaN(DesiredAzimuth) && !float.IsNaN(Azimuth)) {
-            float corr = _hAxis.Step(Mathf.DeltaAngle(Azimuth, DesiredAzimuth), FcsBus.TurretVelRead != null ? FcsBus.TurretVelRead() : 0f, Azimuth);
-            if (!_hAxis.GaveUp && FcsBus.TurretSet != null) FcsBus.TurretSet(DesiredAzimuth + corr);
-            hLock = _hAxis.Locked;
-        }
+        bool hLock = !AzimuthSelect || _hAxis.Locked; // 未被选中不算; 选中时 H 稳定态由常驻循环的 _hAxis 维护 (方位全程追)
         bool ammoReady = Chamber == DesiredShell.ToString()
             && (!SyncCommand ? Charges >= DesiredCharge : Charges == DesiredCharge);
         AllReady = ammoReady && eLock && hLock; // 任一不稳 → 回退
@@ -304,29 +371,55 @@ public class GunControl {
         RefreshSnapshot();
     }
 
-    /// <summary>PWDR 给药: 查池不足锁内买药 (药包杆与计算台无关), 补拉差, 不推药.</summary>
+    /// <summary>PWDR 给药: 查池不足锁内买药 (药包杆与计算台无关), 补拉差, 不推药.
+    /// 齐射: 锁内一次买够两炮总量 (2×need, 1.x 同款), 双炮并行给药不抢池.
+    /// 拉杆前等游戏状态机进 SelectPowderCharge (推弹完全结束, 码确认; 超时兜底继续).</summary>
     private IEnumerator PwdrRoutine() {
+        if (!_gun.ReloadStateAtOrAfter("SelectPowderCharge")) yield return _gun.WaitReloadState("SelectPowderCharge");
         int selected = _gun.SelectedPowderCharges();
         int need = DesiredCharge;
         if (selected > need) yield break; // 超出 (齐射多药在决策层 DUMP; 单发多药由 FC 侧 useActual 处理)
+        int target = SyncCommand ? 2 * need : need; // 齐射查池按两倍药量
         yield return _purchaseLock.Acquire();
         try {
-            while (_gun.RemainingCharges() + selected < need) {
+            // 购买次数上限 (1.x 同款 10 次): 采购始终无效时 FALL, 不静默空转
+            int attempts = 0;
+            while (_gun.RemainingCharges() + selected < target) {
                 yield return _deck.BuyPowders();
-                if (_gun.RemainingCharges() + selected >= need) break;
+                if (_gun.RemainingCharges() + selected >= target) break;
+                if (++attempts >= 10) {
+                    throw new System.Exception($"PWDR buy powders {attempts} times still pool {_gun.RemainingCharges()} < {target}");
+                }
                 yield return new WaitForSeconds(0.5f);
             }
         }
         finally { _purchaseLock.Release(); }
         if (selected < need) yield return _gun.PullPowders(need - selected);
+        // 拉杆后等游戏"选药"读数到位 (分配器动画完成, 推药按钮才激活); 15s 兜底
+        float waited = 0f;
+        while (_gun.SelectedPowderCharges() < need && waited < 15f) {
+            yield return new WaitForSeconds(0.5f);
+            waited += 0.5f;
+        }
         RefreshSnapshot();
     }
 
-    /// <summary>LOAD 装填: 推药入膛 (CanFire 置位为止, 超时由 Exec 判 FALL).</summary>
+    /// <summary>LOAD 装填: 按装填钮 (药拉够后激活, 游戏据此推药入膛) + 实装确认 (2-5 COFM 弹对药对+炮闩锁).
+    /// CanFire 不卡 (含保险, 保险由 FC 在 TRAK 段解).</summary>
     private IEnumerator LoadRoutine() {
-        yield return _gun.RamPowder();
+        yield return _gun.RamPowder(); // 机构停稳 + 等装填钮激活点击
         float waited = 0f;
-        while (!_gun.CanFire() && waited < 15f) {
+        const float cofmTimeout = 25f; // 装填全流程 (RamCharges→BreachLocked) 实测 ~20s, 留裕量
+        // COFM 实装确认: 弹对 + 药对 (齐射多药/少药都是错药 ==) + 炮闩锁定 = 整体封膛完成
+        while (waited < cofmTimeout) {
+            bool shellOk = _gun.BulletInChamber() == DesiredShell.ToString();
+            bool powderOk = SyncCommand ? _gun.LoadedPowderCharges() == DesiredCharge : _gun.LoadedPowderCharges() >= DesiredCharge;
+            if (shellOk && powderOk && _gun.ReloadStateAtOrAfter("BreachLocked")) break;
+            // COFM 卡住诊断 (定位完删)
+            if (Time.time - _lastLoadDiag > 2f) {
+                _lastLoadDiag = Time.time;
+                MelonLogger.Msg($"[GC] {_side}: COFM wait — shell='{_gun.BulletInChamber()}' loaded={_gun.LoadedPowderCharges()} need={DesiredCharge} state='{_gun.ReloadStateKey()}'");
+            }
             yield return new WaitForSeconds(0.5f);
             waited += 0.5f;
         }
@@ -339,8 +432,13 @@ public class GunControl {
         if (Charges <= 0) {
             yield return _purchaseLock.Acquire();
             try {
+                int attempts = 0;
                 while (_gun.RemainingCharges() < 1) {
                     yield return _deck.BuyPowders();
+                    if (_gun.RemainingCharges() >= 1) break;
+                    if (++attempts >= 10) {
+                        throw new System.Exception($"DUMP buy powder {attempts} times still pool {_gun.RemainingCharges()}");
+                    }
                     yield return new WaitForSeconds(0.5f);
                 }
             }
@@ -368,23 +466,28 @@ public class GunControl {
         yield return _gun.WaitBackToIdle();
     }
 
-    /// <summary>齐射相位级同步 (仪式感): 进入动作前等对炮到达同一相位或更后; 对炮 FALL → 本炮 FALL (防陪死).
-    /// 非齐射或对端不存在时直接放行.</summary>
-    private IEnumerator WaitPeerPhase(GunAction next) {
-        if (!SyncCommand || SyncPeer == null) yield break;
-        while (SyncCommand && SyncPeer != null && !_disposed) {
-            if (SyncPeer.Action == GunAction.Fall) {
-                Action = GunAction.Fall; // 对炮挂了, 不陪死: 自己也报 FALL 交给 FC
-                MelonLogger.Error($"[GC] {_side}: salvo peer FALL, follow FALL");
-                yield break;
-            }
-            if (SyncPeer.Action >= next) yield break; // 对炮已到本相位或更后 → 一起走
-            yield return new WaitForSeconds(0.04f);
-        }
-    }
-
     /// <summary>每帧 push 实时弹道指示器数据给 DC (开火前的绿色瞄准十字/LR; 弹种 -1 = 未就绪不渲染).</summary>
     private void PushBallistic(int bulletType) {
         OnBallisticPush?.Invoke(_side, 0f, 0f, 0f, bulletType); // 瞄准点/杀伤圈坐标由 DC 渲染线程按 FC 数据画, GC 只出就绪态
+    }
+
+    // ===== 齐射导演接口 (SalvoDirector 驱动两门炮, 1.x 单协程带双炮同款) =====
+    /// <summary>弹药准备的一步 (导演每轮各自决策, 两炮动作并行, 都完成才走下一步).</summary>
+    internal struct SalvoStep {
+        public GunAction Action;
+        public float Deadline;
+        public System.Func<IEnumerator> Routine;
+    }
+
+    /// <summary>齐射导演接管中 (本炮不起自己的链; 任务撤/完成时由 Loop 复位).</summary>
+    internal bool SalvoActive;
+    /// <summary>导演可用性: 已停/手动 (导演循环退出条件).</summary>
+    internal bool Stopped => _disposed || ManualControl;
+    /// <summary>导演结束时清任务句柄 (两炮都指向导演协程句柄).</summary>
+    internal void ClearTaskHandle() { _taskHandle = null; }
+    /// <summary>导演收尾回 IDLE (FALL 保留不覆盖, 交 FC 判定); AllReady 一并清 (防残留误导下个任务).</summary>
+    internal void ResetActionIdle() {
+        if (Action != GunAction.Fall) Action = GunAction.Idle;
+        AllReady = false;
     }
 }

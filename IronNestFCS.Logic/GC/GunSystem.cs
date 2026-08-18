@@ -302,8 +302,10 @@ public class GunSystem {
         yield return SelectPowder(count);
     }
 
-    /// <summary>按推药按钮 (P4 推药入膛).</summary>
+    /// <summary>按推药按钮 (P4 推药入膛). 先等游戏机构停稳 (状态确认, 与 PressRammer 同款),
+    /// 避免拉杆/机构动作中按推药钮不激活 (Charge Rammer 9s 超时的根因).</summary>
     public IEnumerator RamPowder() {
+        yield return WaitForReloadReady();
         // 推药杆引用可能因 reload 重建而失效, 重新绑定
         if (loadPowderButton == null || loadPowderButton.gameObject == null) {
             var gunSystem = GameObject.Find("Gun System " + _surfix)?.transform;
@@ -372,6 +374,30 @@ public class GunSystem {
     /// <summary>推弹机是否正在把炮弹推入 (装填状态机 ShellRamming). 检查点用: 此时膛内读数不可信.</summary>
     public bool IsShellRamming() {
         return reloadController?.CurrentState?.stateKey == "ShellRamming";
+    }
+
+    /// <summary>游戏装填状态机当前状态码 (诊断用: 轮询找装弹/装药相位码).</summary>
+    public string? ReloadStateKey() {
+        try { return reloadController?.CurrentState?.stateKey; } catch { return null; }
+    }
+
+    /// <summary>装填状态码序判定: 当前码是否已达/超过目标码 (码已过时不盲等, 实机抓的完整序).</summary>
+    public bool ReloadStateAtOrAfter(string target) {
+        string[] order = { "GuideDeploy", "BreechOpen", "ShellRamming", "SelectPowderCharge", "RamCharges", "CloseShellGuide", "FinalSequence", "BreachLocked" };
+        var key = ReloadStateKey();
+        int iK = key == null ? -1 : System.Array.IndexOf(order, key);
+        return iK >= System.Array.IndexOf(order, target);
+    }
+
+    /// <summary>等装填状态机进入目标码 (状态确认替代盲等, 20s 兜底).</summary>
+    public IEnumerator WaitReloadState(string key, float timeout = 20f) {
+        float waited = 0f;
+        while (waited < timeout) {
+            if (ReloadStateKey() == key) yield break;
+            yield return new WaitForSeconds(0.5f);
+            waited += 0.5f;
+        }
+        MelonLogger.Msg($"[FCS] GunSystem {_surfix}: WaitReloadState '{key}' timeout (now '{ReloadStateKey()}')");
     }
 
     /// <summary>炮弹预计飞行时间 (游戏 GunController 弹道预测, 未解算时为 0).</summary>

@@ -31,6 +31,7 @@ public class Radar {
     private float _lastScan;
     private bool _disposed;
     private int _tick;
+    private bool _logFirstScan = true; // 首轮扫描打分类日志 (调试完关)
 
     public IReadOnlyList<SrcContact> Contacts => _contacts;
 
@@ -75,6 +76,7 @@ public class Radar {
             if (!n.StartsWith("Enemy") && !n.Contains("Tgt_")) continue;
             TryAdd(go.transform);
         }
+        _logFirstScan = false; // 首轮分类日志打完关
     }
 
     private void TryAdd(Transform t) {
@@ -84,12 +86,18 @@ public class Radar {
         var loc = t.GetComponent<EntityLocation>();
         if (loc != null) {
             if (!TacticalRadar.IsUnitAlive(loc, t.gameObject)) return; // 死了不报
+            var side = ClassifySide(loc, name);
+            var kind = ClassifyKind(loc, name);
+            var (armour, immune) = TacticalRadar.GetArmour(loc);
+            if (_logFirstScan) {
+                MelonLogger.Msg($"[RD] classify {name}: side={side} kind={kind} armour={armour} immune={immune} icon='{TacticalRadar.GetIcon(loc)}'");
+            }
             _contacts.Add(new SrcContact {
                 Entity = t.gameObject,
                 WorldPos = t.position,
-                Side = ClassifySide(loc, name),
-                Kind = ClassifyKind(loc, name),
-                Armour = TacticalRadar.GetArmour(loc).armour,
+                Side = side,
+                Kind = kind,
+                Armour = armour,
             });
             return;
         }
@@ -138,25 +146,25 @@ public class Radar {
         return Side3.Enemy;
     }
 
-    /// <summary>类型分类 (装甲/FDC/炮兵/AA/参考点): icon 字符串为主, 名字兜底.</summary>
+    /// <summary>类型分类 (装甲/FDC/炮兵/AA/参考点): icon 字符串为主, 名字兜底.
+    /// 注意游戏 icon 拼写: "Refrence" (少个 e), "Frendly" (少个 i); FDC 在部分关卡叫 "Artillery Observer" (须先于炮兵判定).</summary>
     private static EntityKind ClassifyKind(EntityLocation loc, string name) {
+        string n = name.ToLower();
         try {
             var icon = TacticalRadar.GetIcon(loc).ToLower();
-            if (icon.Contains("fire direction") || icon.Contains("fdc")) return EntityKind.Fdc;
+            if (icon.Contains("fire direction") || icon.Contains("observer") || n.Contains("fdc")) return EntityKind.Fdc;
             if (icon.Contains("artillery")) return EntityKind.Artillery;
             if (icon.Contains("anti") && icon.Contains("air")) return EntityKind.Aa;
-            if (icon.Contains("reference")) return EntityKind.Reference;
-            var (armour, _) = TacticalRadar.GetArmour(loc);
-            if (armour > 0) return EntityKind.Armour;
+            if (icon.Contains("refrence") || icon.Contains("reference")) return EntityKind.Reference;
+            var (armour, immune) = TacticalRadar.GetArmour(loc);
+            if (armour > 0 || immune > 0) return EntityKind.Armour; // 装甲 = 有装甲值或免疫弹种 (机械化 icon 带 armor 但值全 0, 不算)
         }
         catch { }
-        var n = name.ToLower();
         if (n.Contains("fdc")) return EntityKind.Fdc;
         if (n.Contains("artillery")) return EntityKind.Artillery;
         if (n.Contains("aa")) return EntityKind.Aa;
-        if (n.Contains("tank") || n.Contains("armour") || n.Contains("armor")) return EntityKind.Armour;
         if (n.Contains("infantry")) return EntityKind.Infantry;
-        if (n.Contains("reference") || n.Contains("ref")) return EntityKind.Reference;
+        if (n.Contains("refrence") || n.Contains("reference") || n.Contains("ref")) return EntityKind.Reference;
         return EntityKind.Other;
     }
 

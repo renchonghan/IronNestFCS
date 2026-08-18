@@ -23,7 +23,10 @@ public class ScenePanel {
     private readonly HashSet<Collider> _tokenColliders = new();
     private float _lastRegister;
     private bool _built;
-    private bool _paused;
+
+    /// <summary>火控台三态: 停止 (白/白/红) / 运行 (绿/白/白) / 暂停 (白/黄/白).</summary>
+    private enum PanelState { Stopped, Running, Paused }
+    private PanelState _state = PanelState.Stopped;
 
     /// <summary>Build 3D 按钮列 + 右键注册 (旧交互层清退后由 FcsModule 调用一次).</summary>
     public void Build() {
@@ -80,10 +83,18 @@ public class ScenePanel {
         _entityColliders.RemoveWhere(c => c == null);
         foreach (var c in RadarPort.Contacts) {
             if (c == null || c.Entity == null) continue;
-            var col = c.Entity.GetComponent<Collider>();
-            if (col == null || !_entityColliders.Add(col)) continue;
+            // 不用实体自带的 collider (游戏棋子的可能太小/位置偏), 统一挂 FCS 自有点击盒
+            if (_entityColliders.Any(x => x != null && x.transform.parent == c.Entity.transform)) continue;
+            var boxGo = new GameObject("FCS2_ClickBox");
+            boxGo.transform.SetParent(c.Entity.transform, false);
+            boxGo.transform.localPosition = new Vector3(0f, 0f, -0.01f);
+            var box = boxGo.AddComponent<BoxCollider>();
+            box.size = new Vector3(0.22f, 0.22f, 0.05f);
+            _owned.Add(boxGo); // 随 ShutDown 清理
+            _entityColliders.Add(box);
             var go = c.Entity;
-            _clicks.Register(col, () => {
+            _clicks.Register(box, () => {
+                MelonLogger.Msg($"[DC] right-click {go.name}");
                 Dc?.RightClickEntity(go);
             }, right: true); // 右键 (左键留给游戏自身拖拽)
         }
@@ -161,31 +172,57 @@ public class ScenePanel {
         }
     }
 
-    // ===== 火控台右侧: Start / Pause-Resume / Stop =====
+    // ===== 火控台右侧: Start / Pause-Resume / Stop (三按钮在弹种列延长线上方一格起, 避免压到 AP) =====
     private void BuildControlButtons() {
         const float z = -18.4181f;
-        var x = 0.9f;
-        var y = -0.641f;
+        var x = 0.95f;      // 比旧版 (0.9) 再上一格: 三按钮多占一格, 不能再往下伸
+        var y = -0.6365f;
 
-        GameObject start = null!, pause = null!;
-        start = Button("Start", Color.green, () => {
-            Fc?.SetManual(false); // Start: AutoFire 已开 → Semi-Auto; 否则默认 PreAiming (FC 推导)
-            SetColor(start, Color.green);
+        GameObject start = null!, pause = null!, stop = null!;
+        // 三态指示: 停止 (白/白/红) → 运行 (绿/白/白) → 暂停 (白/黄/白); 当前状态亮在对应按钮, 其余白
+        start = Button("Start", Color.white, () => {
+            _state = PanelState.Running;
+            if (Fc != null) { Fc.Paused = false; Fc.SetManual(false); } // Start/Resume: AutoFire 已开 → Semi-Auto; 否则 PreAiming
+            ApplyState(start, pause, stop);
         });
         Place(start, x, y, z); x -= 0.05f; y -= 0.0045f;
 
-        pause = Button("Pause", Color.green, () => {
-            _paused = !_paused;
-            if (Fc != null) Fc.Paused = _paused; // 冻结派发与炮塔控制 (豁免: 飞行计时/落点指示不冻结)
-            SetColor(pause, _paused ? new Color(1f, 0.6f, 0f) : Color.green);
+        pause = Button("Pause", Color.white, () => {
+            if (_state == PanelState.Running) {
+                _state = PanelState.Paused;
+                if (Fc != null) Fc.Paused = true; // 冻结派发与炮塔控制 (豁免: 飞行计时/落点指示不冻结)
+            }
+            else if (_state == PanelState.Paused) {
+                _state = PanelState.Running;
+                if (Fc != null) Fc.Paused = false;
+            }
+            ApplyState(start, pause, stop);
         });
         Place(pause, x, y, z); x -= 0.05f; y -= 0.0045f;
 
-        GameObject stop = Button("Stop", Color.red, () => {
-            Fc?.StopTasks(); // 清队列 + 撤任务 (线程常驻不死)
-            SetColor(start, Color.green);
+        stop = Button("Stop", Color.white, () => {
+            _state = PanelState.Stopped;
+            Fc?.StopTasks();  // 清队列 + 撤任务 (线程常驻不死)
+            Fc?.SetManual(true); // Stop 回 Manual
+            if (Fc != null) Fc.Paused = false;
+            ApplyState(start, pause, stop);
         });
         Place(stop, x, y, z);
+
+        void ApplyState(GameObject s, GameObject p, GameObject t) {
+            switch (_state) {
+                case PanelState.Stopped: // 白 / 白 / 红
+                    SetColor(s, Color.white); SetColor(p, Color.white); SetColor(t, Color.red);
+                    break;
+                case PanelState.Running: // 绿 / 白 / 白
+                    SetColor(s, Color.green); SetColor(p, Color.white); SetColor(t, Color.white);
+                    break;
+                default:                 // Paused: 白 / 黄 / 白
+                    SetColor(s, Color.white); SetColor(p, new Color(1f, 0.6f, 0f)); SetColor(t, Color.white);
+                    break;
+            }
+        }
+        ApplyState(start, pause, stop); // 默认态 = 停止 (白/白/红)
     }
 
     private GameObject Button(string label, Color color, System.Action onClick) {

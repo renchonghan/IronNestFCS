@@ -1,5 +1,6 @@
 using System.Collections;
 using System.Collections.Generic;
+using Il2Cpp;
 using MelonLoader;
 using UnityEngine;
 
@@ -52,12 +53,30 @@ public class DisplayControl {
     private IEnumerator Loop() {
         while (!_disposed) {
             yield return new WaitForSeconds(0.04f);
+            SyncNestToken();     // 铁巢棋子吸附实际炮位 (旧版同款: 棋子摆偏不导致火控打飞)
             if (RadarPort == null) continue;
             RefreshTargets();
             UpdateIcons();       // 实体图标差集 (在列表→画, 不在→删)
             TrackTokens();       // 令牌拖放: 上地图注册虚拟目标, 拖离自动取消
             if (AutoTask) Sweep();
         }
+    }
+
+    /// <summary>铁巢棋子吸附 (旧版 SyncIronNestToken 同款): 按炮塔实际网格位置放棋子, 紧急转移后跟得上.</summary>
+    private ImpactMarkerManager? _impactManager;
+    private void SyncNestToken() {
+        if (NestRef == null) return;
+        if (_impactManager == null) {
+            _impactManager = GameObject.Find("---ImpactMarkerManager")?.GetComponent<ImpactMarkerManager>();
+        }
+        if (_impactManager == null || _impactManager.turretController == null) return;
+        var tb = _impactManager.turretController.turretBase;
+        if (tb == null) return;
+        var grid = tb.localPosition;
+        NestRef.localPosition = new Vector3(
+            GeoMap.MapBottomLeft.x + grid.x * GeoMap.MapCellSize,
+            GeoMap.MapBottomLeft.y + grid.y * GeoMap.MapCellSize,
+            NestRef.localPosition.z);
     }
 
     /// <summary>SRC → Target 列表: 相对位置 (方位/距离) + TWS 5 帧平均速度.</summary>
@@ -174,11 +193,15 @@ public class DisplayControl {
         if (go == null) return;
         var existing = FcPort?.FindEntityTask(go);
         if (existing != null) {
-            if (!existing.SalvoPair) {
-                existing.SalvoPair = true; // 升级齐射 (FC 派发时两炮同任务 + SyncCommand)
+            // 上炮任务不许改计划 (只能取消, 1.x 口径); 队列中: 右键升级齐射, 再右键取消
+            if (existing.SalvoPair || (FcPort != null && FcPort.IsOnGun(existing))) {
+                FcPort.RequestCancel(existing);
+                MelonLogger.Msg($"[DC] cancel task on {existing.Name}");
+            }
+            else {
+                existing.SalvoPair = true;
                 MelonLogger.Msg($"[DC] upgrade salvo on {existing.Name}");
             }
-            else FcPort.RequestCancel(existing);
             return;
         }
         Requests.Add(new FireTask {

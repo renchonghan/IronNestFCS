@@ -62,7 +62,8 @@ public class FcsModule : IFcsModule
         radar2.Start();
         var surface = GameObject.Find("Draggable Surface")?.transform;
         var nest = GameObject.Find("Player Turret Piece")?.transform;
-        renderer2 = new SandboxRenderer { MapSurfaceRef = surface, NestRef = nest };
+        var fmr = GameObject.Find("Fire Mission Root")?.transform;
+        renderer2 = new SandboxRenderer { MapSurfaceRef = surface, FireMissionRootRef = fmr, NestRef = nest };
         display = new DisplayControl {
             RadarPort = radar2,
             NestRef = nest,
@@ -87,9 +88,9 @@ public class FcsModule : IFcsModule
             NestRef = nest,
             MapSurfaceRef = surface,
         };
-        fireControl.OnShellFired = (pos, shell, fly, fireMission) => renderer2.CreateImpact(pos, shell, fly);
+        fireControl.OnShellFired = (pos, shell, fly, fireMission, rem) => renderer2.CreateImpact(pos, shell, fly, rem);
         fireControl.OnQueueChanged = fc => renderer2.UpdateQueueIndicator(fc);
-        fireControl.OnAimChanged = (side, pos, r, b) => renderer2.PushBallistic(side, pos, r, b);
+        fireControl.OnAimChanged = (side, pos, r, b, ready, fly) => renderer2.PushBallistic(side, pos, r, b, ready, fly);
         fireControl.Start();
         display.FcPort = fireControl;
         hud = new FcsHud { Fc = fireControl, GunL = gunL, GunR = gunR };

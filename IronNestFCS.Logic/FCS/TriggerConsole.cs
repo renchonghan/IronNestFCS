@@ -58,6 +58,16 @@ public class TriggerConsole {
         arm?.OnClickUp();
         yield return new WaitForSeconds(1f);
     }
+
+    /// <summary>齐射: 两炮保险同时解除 (两个旋钮并行按, 不许一先一后).</summary>
+    public IEnumerator ArmBoth() {
+        _armLeft?.OnClickDown();
+        _armRight?.OnClickDown();
+        yield return new WaitForSeconds(0.2f);
+        _armLeft?.OnClickUp();
+        _armRight?.OnClickUp();
+        yield return new WaitForSeconds(1f);
+    }
     
     public IEnumerator ConfirmTask() {
         yield return FcsSceneInteractor.WaitAndClick(_taskCheck);
