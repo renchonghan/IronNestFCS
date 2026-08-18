@@ -33,6 +33,9 @@ public class FcsWindow
     private static readonly Color ClrDiv = new(0.10f, 0.70f, 0.30f);
     private static readonly Color ClrSweep = new(1.00f, 0.50f, 0.15f);
 
+    /// <summary>面板整行宽 (字符数): 标题/分隔线按此宽排版, 时钟右对齐到同一列.</summary>
+    private const int LineWidth = 60;
+
     public bool AutoSweepEnabled { get; set; }
 
     public FcsWindow(FSC fcs) => this.fcs = fcs;
@@ -83,7 +86,12 @@ public class FcsWindow
 
         var oldColor = GUI.color;
         GUI.color = ClrTitle;
-        GUI.Label(new Rect(x, y, w, h), "IronNest FCS");
+        // 标题行 (60 列): 左标题 | 中间反炮兵倒计时 CBC:sssS (未激活/已停 CBC:---S, 8 字符块在 60 列里左右各 26 完美居中) | 右任务时钟 [HH:MM:SS] (无表 [--:--:--])
+        float cbt = fcs.CbtSeconds;
+        string cbtStr = $"CBC:{(float.IsNaN(cbt) ? "---" : $"{Mathf.CeilToInt(cbt):000}")}S";
+        string titleLine = "IronNest FCS".PadRight(26) + cbtStr;
+        titleLine += MissionClockStr(fcs.MissionSeconds).PadLeft(Math.Max(10, LineWidth - titleLine.Length));
+        GUI.Label(new Rect(x, y, w, h), titleLine);
         GUI.color = oldColor;
         y += lineH;
 
@@ -209,6 +217,13 @@ public class FcsWindow
         }
     }
 
+    /// <summary>任务时钟秒数 -> [HH:MM:SS], 无时钟/未走时 [--:--:--].</summary>
+    private static string MissionClockStr(float missionSec)
+    {
+        if (float.IsNaN(missionSec) || missionSec <= 0f) return "[--:--:--]";
+        return $"[{(int)missionSec / 3600:00}:{(int)missionSec / 60 % 60:00}:{(int)missionSec % 60:00}]";
+    }
+
     /// <summary>在固定宽度内居中 (弹种位: HE -> "  HE  ", HCHE -> " HCHE ").</summary>
     private static string CenterPad(string s, int width)
     {
@@ -276,26 +291,28 @@ public class FcsWindow
             // 真实解算快照: 仰角与装药量来自弹道计算器输出, 未解算时显示横线
             string solE = task.calculatedElevation > 0.01f ? $"{task.calculatedElevation:00.00}" : "--.--";
             string solC = task.charge > 0 ? task.charge.ToString() : "-";
+            // 击发后前导位显示抵达时刻 (击发时钟 + 飞行时间), 击发前保持占位
+            string arrival = task.fireMissionTime > 0f ? MissionClockStr(task.fireMissionTime + task.impactTime) : "[--:--:--]";
             GUI.Label(new Rect(x, y, w, 22f),
-                $"{(task.salvoFollower ? ">>>[SALVO]" : "[--:--:--]")} {task.angel:000.0} {task.distance:00.00} | {CenterPad(task.bulletType.ToString(), 4)} E:{solE} A:{task.angel:000.0} C:{solC} | T:-{cdStr}");
+                $"{(task.salvoFollower ? ">>>[SALVO]" : arrival)} {task.angel:000.0} {task.distance:00.00} | {CenterPad(task.bulletType.ToString(), 4)} E:{solE} A:{task.angel:000.0} C:{solC} | T:-{cdStr}");
         }
         GUI.color = oldColor;
         return y + lineH;
     }
 
-    /// <summary>完成队列行: 完成时刻占位 [--:--:--] + 目标方位距离 + 该发的实时剩余飞行时间 T:- (落地后横线).</summary>
+    /// <summary>完成队列行: 抵达时刻 [HH:MM:SS] (击发时钟+飞行时间, 无时钟占位) + 目标方位距离 + 该发的实时剩余飞行时间 T:- (落地后横线).</summary>
     private static string BuildFinishLine(FinishedTask f)
     {
         float remain = f.task.impactTime - (Time.time - f.fireTime);
         string cd = remain > 0.01f ? $"{remain:00.0}S" : "--.-S"; // T:- 前缀自带一个杠, 这里只需 --.-S
-        return $"[--:--:--] {f.task.angel:000.0} {f.task.distance:00.00} T:-{cd}";
+        return $"{MissionClockStr(f.task.fireMissionTime + f.task.impactTime)} {f.task.angel:000.0} {f.task.distance:00.00} T:-{cd}";
     }
 
     private static void DrawDivider(float x, float y, float w)
     {
         var oldColor = GUI.color;
         GUI.color = ClrDiv;
-        GUI.Label(new Rect(x, y, w, 22f), new string('-', 60)); // 等宽横分割线, 按用户排版 60 字符
+        GUI.Label(new Rect(x, y, w, 22f), new string('-', LineWidth)); // 等宽横分割线, 与标题行同宽
         GUI.color = oldColor;
     }
 

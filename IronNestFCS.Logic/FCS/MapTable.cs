@@ -372,6 +372,29 @@ public class MapTable {
                 }
             }
         }
+        else if (mark.entity != null && mapSurface != null && turret != null) {
+            // 实体目标 (右键点选/自动扫荡): 从实体实时世界位置重算距离/方位, 动目标 (列车) 任务参数持续刷新 + 1 帧预测
+            var turretLocalOnMap = mapSurface.InverseTransformPoint(turret.position);
+            var local = mapSurface.InverseTransformPoint(mark.entity.position);
+            var target = local - turretLocalOnMap;
+            float freshDist = target.magnitude * 3.8164f;
+            float freshAngel = Vector3.SignedAngle(target, Vector3.up, Vector3.forward);
+            if (freshAngel < 0) freshAngel += 360;
+            mark.task.distance = freshDist;
+            mark.task.angel = freshAngel;
+            mark.task.position = local * 3.8164f + new Vector3(10.016f, 5.235f, 0f);
+            // TRAK 1 帧预测 (25fps): 当前 + 上一帧差分外推, 与虚拟目标同款
+            if (float.IsNaN(mark.lastDist)) {
+                mark.task.trackDistance = freshDist;
+                mark.task.trackAngel = freshAngel;
+            }
+            else {
+                mark.task.trackDistance = freshDist + (freshDist - mark.lastDist);
+                mark.task.trackAngel = freshAngel + Mathf.DeltaAngle(mark.lastAngel, freshAngel);
+            }
+            mark.lastDist = freshDist;
+            mark.lastAngel = freshAngel;
+        }
         SetMarkRadius(mark, task.bulletType); // 杀伤圈随任务弹种
         if (mark.salvo && slot is "[L]" or "[R]") slot = "[S]"; // 齐射执行时顶部显示 [S], 队列内仍显示队列位
         if (slot == null) {

@@ -70,6 +70,27 @@ public class FSC
     private bool _paused = false;
     public bool Paused => _paused;
 
+    /// <summary>任务时钟 (玩家手腕 MissionWatch 的 GenericTimerSceneSync): 自 10:00:00 起向上累计的秒数, 无表/未走时 NaN. 缓存引用, 失效自动重找.</summary>
+    private GenericTimerSceneSync? _missionClock;
+    public float MissionSeconds
+    {
+        get
+        {
+            if (_missionClock == null)
+            {
+                foreach (var s in Resources.FindObjectsOfTypeAll<GenericTimerSceneSync>())
+                {
+                    if (s == null || s.TimerID != "MissionTime" || s.CurrentTime <= 0f) continue;
+                    _missionClock = s;
+                    break;
+                }
+            }
+            if (_missionClock == null) return float.NaN;
+            try { return _missionClock.CurrentTime; }
+            catch { _missionClock = null; return float.NaN; }
+        }
+    }
+
     // 常驻共享循环的协程句柄: 按炮清协程 (AbortGun/StopGun) 时跳过, 它们挂在 Left 槽位上
     private object? _syncLoopHandle;
     private object? _timeoutLoopHandle;
@@ -569,6 +590,17 @@ public class FSC
         // 否则热重载后旧 ALC 的它仍被 Unity 驱动 → 崩溃
         _runningCoroutines.Add((MelonCoroutines.Start(ReserveTurretAndRotate(task, turret)), leftRight));
 
+        // 外层 try/finally 兜底: 取消/中止/热重载在任意 yield 处 Stop 时归还炮塔锁
+        // (正常路径已在内部 ReleaseTurretOnce, 幂等不双释放)
+        try {
+            yield return RunTaskRoutineBody(leftRight, task, gunSys, turret);
+        }
+        finally {
+            ReleaseTurretOnce(turret);
+        }
+    }
+
+    private IEnumerator RunTaskRoutineBody(LeftRight leftRight, ArtilleryTask task, GunSystem gunSys, TurretReservation turret) {
         int callCount = 0; // CALL 枢纽计数器, PEND 后最多 2 次完整检查
 
         for (int round = 0; round < 2; round++) {
@@ -792,9 +824,10 @@ public class FSC
                     task.progress = Progress.Aiming;
                     MarkProgress(leftRight, Progress.Aiming);
                     {
-                        var eAxis = new TrackAxis(0.01f); // E 收敛标准 0.01°
-                        var aAxis = new TrackAxis(0.1f);   // H 收敛标准 0.1°
+                        var eAxis = new TrackAxis(0.01f, 0.1f, 0.5f); // E 收敛标准 0.01°, 变积分 0.1~0.5
+                        var aAxis = new TrackAxis(0.1f, 0.3f, 1.0f);  // H 收敛标准 0.1°, 变积分 0.3~1
                         bool armed = false;
+                        bool confirmStarted = false;
                         while (true) {
                             // E 轴: 仰角持续追踪 (天顶星伺服设 1 帧预测值 + TrackAxis 修正)
                             if (!eAxis.GaveUp) {
@@ -817,23 +850,11 @@ public class FSC
                                 }
                                 else aAxis.Locked = false;
                             }
-                            // 套上且未解除保险: 五步确认 + Arm (一次性; 追踪循环不中断, 保险解除后目标动了继续追; 不切相位, 面板仍显示 3-1 TRAK)
-                            if (!armed && eAxis.Locked && aAxis.Locked) {
-                                yield return _deskLock.Acquire(); // 五步确认台全局唯一, 两炮串行过台
-                                try {
-                                    yield return TriggerConsole.ConfirmTask();
-                                    yield return TriggerConsole.ConfirmBullet();
-                                    yield return TriggerConsole.ConfirmRotation();
-                                    yield return TriggerConsole.ConfirmElevation();
-                                    yield return TriggerConsole.ReadyToFire();
-                                    yield return TriggerConsole.Arm(leftRight);
-                                    armed = true;
-                                    if (task.impactTime <= 0f) task.impactTime = ShellData.FlightTime(task.distance, task.charge); // 飞时兜底锁存
-                                    MelonLogger.Msg($"[FCS] {leftRight}: TRAK armed fc#{task.fireControlId} (elev={gunSys.ActualElevation():F2} dist={task.distance:F2}km)");
-                                }
-                                finally {
-                                    _deskLock.Release();
-                                }
+                            // 套上且未解除保险: 后台五步确认 + Arm (不阻塞 TRAK, 双轴持续追踪; 一次性, 中止时随本炮协程组一起停)
+                            if (!armed && !confirmStarted && eAxis.Locked && aAxis.Locked) {
+                                confirmStarted = true;
+                                var h = MelonCoroutines.Start(ConfirmArmBackground(leftRight, task, gunSys, () => armed = true));
+                                _runningCoroutines.Add((h, leftRight));
                             }
                             // 击发: AutoFire 解除保险即击发; 手动模式等玩家击发 (持续追踪期间随时可打)
                             if (armed) {
@@ -892,6 +913,16 @@ public class FSC
         var turret = new TurretReservation();
         _runningCoroutines.Add((MelonCoroutines.Start(ReserveTurretAndRotate(leader, turret)), LeftRight.Left));
 
+        // 中止兜底: 取消/中止在任意 yield 处 Stop 时归还炮塔锁 (正常路径已释放, 幂等)
+        try {
+            yield return RunSalvoRoutineBody(leader, follower, gunL, gunR, need, turret);
+        }
+        finally {
+            ReleaseTurretOnce(turret);
+        }
+    }
+
+    private IEnumerator RunSalvoRoutineBody(ArtilleryTask leader, ArtilleryTask follower, GunSystem gunL, GunSystem gunR, int need, TurretReservation turret) {
         for (int round = 0; round < 2; round++) {
             // 1-1 CALL: 检查两炮 + 药包库存 >= 2 x 需求 (两炮共用池)
             MarkSalvo(leader, follower, Progress.Calculating);
@@ -1016,10 +1047,11 @@ public class FSC
         // 3-1~3-3 SALVO TRAK 合并: 双炮持续追踪同一目标 (trackX 取主任务), 双炮都套上并稳定 → 五步确认 + 双炮 Arm → AutoFire 立即击发 / 手动等击发
         MarkSalvo(leader, follower, Progress.Aiming);
         {
-            var eAxisL = new TrackAxis(0.01f);
-            var eAxisR = new TrackAxis(0.01f);
-            var aAxis = new TrackAxis(0.1f);
+            var eAxisL = new TrackAxis(0.01f, 0.1f, 0.5f); // E 收敛标准 0.01°, 变积分 0.1~0.5
+            var eAxisR = new TrackAxis(0.01f, 0.1f, 0.5f);
+            var aAxis = new TrackAxis(0.1f, 0.3f, 1.0f);   // H 收敛标准 0.1°, 变积分 0.3~1
             bool armed = false;
+            bool confirmStarted = false;
             while (true) {
                 // 左炮仰角追踪
                 if (!eAxisL.GaveUp) {
@@ -1050,10 +1082,11 @@ public class FSC
                     }
                     else aAxis.Locked = false;
                 }
-                // 双炮都套上且未解除保险: 五步确认 (确认台校验两门炮) + 双炮 Arm (一次性)
-                if (!armed && eAxisL.Locked && eAxisR.Locked && aAxis.Locked) {
-                    yield return SalvoConfirmArm(leader, follower);
-                    armed = true;
+                // 双炮都套上且未解除保险: 后台五步确认 + 双炮 Arm (不阻塞 TRAK, 三轴持续追踪; 一次性, 中止时随协程组停)
+                if (!armed && !confirmStarted && eAxisL.Locked && eAxisR.Locked && aAxis.Locked) {
+                    confirmStarted = true;
+                    var h = MelonCoroutines.Start(SalvoConfirmArm(leader, follower, () => armed = true));
+                    _runningCoroutines.Add((h, LeftRight.Left)); // 主炮槽位, 齐射中止时连它一起停
                 }
                 // 击发: AutoFire 解除保险即击发; 手动等玩家击发
                 if (armed) {
@@ -1188,8 +1221,28 @@ public class FSC
         yield return gun.RamPowder();
     }
 
+    /// <summary>后台五步确认 + Arm (TRAK 套上后启动): 与追踪循环并行, 确认台流程不冻结 E/H 追踪.
+    /// 登记进本炮协程组: AbortGun/StopGun 会连它一起停 (finally 释放 deskLock).</summary>
+    private IEnumerator ConfirmArmBackground(LeftRight leftRight, ArtilleryTask task, GunSystem gunSys, Action onArmed) {
+        yield return _deskLock.Acquire(); // 五步确认台全局唯一, 两炮串行过台
+        try {
+            yield return TriggerConsole.ConfirmTask();
+            yield return TriggerConsole.ConfirmBullet();
+            yield return TriggerConsole.ConfirmRotation();
+            yield return TriggerConsole.ConfirmElevation();
+            yield return TriggerConsole.ReadyToFire();
+            yield return TriggerConsole.Arm(leftRight);
+            if (task.impactTime <= 0f) task.impactTime = ShellData.FlightTime(task.distance, task.charge); // 飞时兜底锁存
+            MelonLogger.Msg($"[FCS] {leftRight}: TRAK armed fc#{task.fireControlId} (elev={gunSys.ActualElevation():F2} dist={task.distance:F2}km)");
+            onArmed();
+        }
+        finally {
+            _deskLock.Release();
+        }
+    }
+
     /// <summary>齐射解除保险 (deskLock 内): 五步确认走一遍 (确认台校验两门炮) + 双炮并行 Arm + 飞时兜底锁存.</summary>
-    private IEnumerator SalvoConfirmArm(ArtilleryTask leader, ArtilleryTask follower) {
+    private IEnumerator SalvoConfirmArm(ArtilleryTask leader, ArtilleryTask follower, Action onArmed) {
         yield return _deskLock.Acquire();
         try {
             yield return TriggerConsole.ConfirmTask();
@@ -1207,6 +1260,7 @@ public class FSC
             if (leader.impactTime <= 0f) leader.impactTime = ShellData.FlightTime(leader.distance, leader.charge);
             follower.impactTime = leader.impactTime;
             MelonLogger.Msg($"[FCS] SALVO armed fc#{leader.fireControlId}+{follower.fireControlId}");
+            onArmed();
         }
         finally {
             _deskLock.Release();
@@ -1274,8 +1328,25 @@ public class FSC
         }
     }
 
+    /// <summary>反炮兵 (敌方下一轮炮击) 剩余秒数: 未激活/已停止/已过期 = NaN; 暂停 (打掉 FDC) 时数值冻结.</summary>
+    public float CbtSeconds
+    {
+        get
+        {
+            try
+            {
+                var cbt = CounterBatteryTimer.Instance;
+                if (cbt == null || !cbt.IsRunning || cbt.IsExpired || cbt.IsPermanentlyStopped) return float.NaN;
+                return cbt.TimeRemaining;
+            }
+            catch { return float.NaN; }
+        }
+    }
+
     /// <summary>完成入列 (最多 8 条 + 溢出计数).</summary>
     private void AddFinished(ArtilleryTask task) {
+        // 抵达时刻基准: 回推击发瞬间的任务时钟秒数 (任务时钟与 Time.time 同速), 无时钟时为 NaN
+        task.fireMissionTime = MissionSeconds - (Time.time - task.fireTime);
         _finished.Add(new FinishedTask { task = task, fireTime = Time.time });
         if (_finished.Count > 8) {
             _finished.RemoveAt(0);
@@ -1301,9 +1372,10 @@ public class FSC
     /// 此后炮塔由主流程在击发完成时归还(若转向期间被取消则在此自行归还)
     /// </summary>
     /// <summary>
-    /// PWDR 段: 锁内完整重算 (距离/方向/装药/弹种 + Calculate) + 按差补拉药包杆 + 按推药按钮.
+    /// PWDR 段: 锁内只做重算 (距离/方向/装药/弹种 + Calculate, 秒级短临界区), 拉药包杆+推药在锁外.
     /// 游戏只在按 Calculate 那一刻存储"已计算装药数", 药包杆最多允许拉到这个数;
-    /// 弹道计算器全局唯一, 另一炮的解算会改写存储值 → 必须锁内重算, 否则拉杆/推药被游戏锁死.
+    /// 弹道计算器全局唯一, 另一炮的解算会改写存储值. 拉杆放锁外有被中途改写的可能 (上限被改小 → 少拉),
+    /// 由 CALL 回读实装兜底补拉 (与齐射 SalvoPowder 同款短临界区, 长等待不再堵住另一炮的解算).
     /// </summary>
     private IEnumerator LoadPowderWithDialLock(ArtilleryTask task, GunSystem gunSys, int calcCharge, int pullCount) {
         yield return _deskLock.Acquire();
@@ -1315,14 +1387,14 @@ public class FSC
             yield return BallisticCalculator.Calculate(); // 游戏靠这次 Calculate 解锁药包杆, 保留
             task.calculatedElevation = ShellData.ElevationDeg(task.distance, calcCharge); // 仰角按射表直算, 快照供 EAIM 用
             task.charge = calcCharge;
-            if (pullCount > 0) {
-                yield return gunSys.PullPowders(pullCount);
-            }
-            yield return gunSys.RamPowder();
         }
         finally {
             _deskLock.Release();
         }
+        if (pullCount > 0) {
+            yield return gunSys.PullPowders(pullCount);
+        }
+        yield return gunSys.RamPowder();
     }
 
     private IEnumerator ReserveTurretAndRotate(ArtilleryTask task, TurretReservation res) {

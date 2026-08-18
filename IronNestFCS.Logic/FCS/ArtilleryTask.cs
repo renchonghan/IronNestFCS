@@ -46,6 +46,8 @@ public class ArtilleryTask {
     public float trackDistance;
     /// <summary>击发时刻 (Time.time), 0 = 未击发. 地图菱形框下方的落点计时器用.</summary>
     public float fireTime;
+    /// <summary>击发瞬间的任务时钟秒数 (AddFinished 按 Time.time 差值回推), 0/NaN = 未击发或无时钟. 抵达时刻 = fireMissionTime + impactTime.</summary>
+    public float fireMissionTime;
     /// <summary>弹道计算器真实输出的仰角, 解算后快照 (计算器全局唯一, 必须按任务快照).</summary>
     public float calculatedElevation;
     /// <summary>本轮实际用于计算的装药量 (实装足量按实装, 否则按需求, 退弹轮为已装或 1).</summary>
