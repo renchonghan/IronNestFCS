@@ -1,5 +1,4 @@
 using IronNestFCS.Logic.FCS;
-using Il2CppTMPro;
 using MelonLoader;
 using UnityEngine;
 
@@ -175,47 +174,8 @@ public class FcsWindow
         _ => ("0-0", "IDLE"),
     };
 
-    /// <summary>
-    /// 面板字体: Font.CreateDynamicFontFromOSFont 被游戏 IL2CPP 裁剪 (Method unstripping failed),
-    /// 所有 OS 字体都创建不了. 改走游戏自带 TMP 字体的 sourceFontFile:
-    /// 游戏里有 Inconsolata-SemiBold (真等宽), 优先它; 否则取第一个有 sourceFontFile 的; 最后回退默认字体.
-    /// </summary>
-    private static Font? _monoFont;
-    private static Font MonoFont
-    {
-        get
-        {
-            if (_monoFont == null)
-            {
-                try
-                {
-                    Font? fallback = null;
-                    foreach (var tf in Resources.FindObjectsOfTypeAll<TMP_FontAsset>())
-                    {
-                        if (tf == null || tf.name == null || tf.sourceFontFile == null) continue;
-                        var lower = tf.name.ToLower();
-                        if (lower.Contains("inconsolata") || lower.Contains("typewriter"))
-                        {
-                            _monoFont = tf.sourceFontFile;
-                            MelonLogger.Msg($"[FCS] MonoFont: picked {tf.name}");
-                            break;
-                        }
-                        fallback ??= tf.sourceFontFile;
-                    }
-                    if (_monoFont == null && fallback != null)
-                    {
-                        _monoFont = fallback;
-                        MelonLogger.Msg("[FCS] MonoFont: fallback to first available TMP font");
-                    }
-                }
-                catch (Exception ex)
-                {
-                    MelonLogger.Msg($"[FCS] MonoFont: TMP scan failed: {ex.Message}");
-                }
-            }
-            return _monoFont ?? GUI.skin.font;
-        }
-    }
+    // 面板字体抽到 Shared/UiFont (2.0 共享), 这里直接复用
+    private static Font MonoFont => UiFont.Mono;
 
     /// <summary>任务时钟秒数 -> [HH:MM:SS], 无时钟/未走时 [--:--:--].</summary>
     private static string MissionClockStr(float missionSec)

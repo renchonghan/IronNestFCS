@@ -32,6 +32,11 @@ public class FcsModule : IFcsModule
     private GunControl? gunR;
     private CoroutineLock? gcPurchaseLock;
     private CoroutineLock? gcFireLock;
+    private Radar? radar2;
+    private DisplayControl? display;
+    private SandboxRenderer? renderer2;
+    private FireControl? fireControl;
+    private FcsHud? hud;
 
     private bool autoSweep;
     private readonly HashSet<EntityLocation> swept = new(new EntityLocationComparer());
@@ -64,6 +69,36 @@ public class FcsModule : IFcsModule
         gunR.SyncPeer = gunL;
         gunL.Start();
         gunR.Start();
+
+        // RD → DC → FC 数据链接线 (RD-DC_U-FC-GC-DC_D)
+        radar2 = new Radar();
+        radar2.Start();
+        display = new DisplayControl {
+            RadarPort = radar2,
+            NestRef = GameObject.Find("Player Turret Piece")?.transform,
+            MapSurfaceRef = GameObject.Find("Draggable Surface")?.transform,
+        };
+        renderer2 = new SandboxRenderer();
+        display.OnIconSpawn = t => renderer2.SpawnIcon(t);
+        display.OnIconRemove = go => renderer2.RemoveIcon(go);
+        display.Start();
+        renderer2.Start();
+        gunL.OnBallisticPush = (side, x, y, r, b) => renderer2.PushBallistic(side, x, y, r, b);
+        gunR.OnBallisticPush = (side, x, y, r, b) => renderer2.PushBallistic(side, x, y, r, b);
+
+        fireControl = new FireControl {
+            GunL = gunL,
+            GunR = gunR,
+            ConsolePort = fcs.TriggerConsole,
+            Calculator = fcs.BallisticCalculator,
+            FireLock = gcFireLock,
+            NestRef = GameObject.Find("Player Turret Piece")?.transform,
+            MapSurfaceRef = GameObject.Find("Draggable Surface")?.transform,
+        };
+        fireControl.OnShellFired = (pos, shell, fly, fireMission) =>
+            renderer2.CreateImpact(pos, shell, fly, 0f, 0f);
+        fireControl.Start();
+        hud = new FcsHud { Fc = fireControl, GunL = gunL, GunR = gunR };
     }
 
     public void Update()
@@ -217,13 +252,25 @@ public class FcsModule : IFcsModule
     {
         window?.OnGui();
         radar?.OnGui();
+        // 2.0 HUD 直出: 迁移期画在旧窗口下方 (接线完成后再取代)
+        hud?.OnGui();
     }
 
     public void Shutdown()
     {
+        fireControl?.Stop();
+        display?.Stop();
+        renderer2?.Stop();
+        radar2?.Stop();
         gunL?.Stop();
         gunR?.Stop();
         gunL = gunR = null;
+        radar2 = null;
+        display = null;
+        renderer2 = null;
+        fireControl = null;
+        hud = null;
+        MissionClock.Reset();
         FcsBus.TurretRead = null;
         FcsBus.TurretVelRead = null;
         FcsBus.TurretSet = null;

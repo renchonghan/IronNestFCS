@@ -54,6 +54,7 @@ public class FireControl {
 
     // ===== 状态 =====
     public FireMode Mode { get; private set; } = FireMode.Manual;
+    public int QueueCount => _queue.Count;
     public bool AutoFire { get; set; }
     public bool AutoTask { get; set; }
     private bool _armedL;
