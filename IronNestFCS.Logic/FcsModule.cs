@@ -83,8 +83,8 @@ public class FcsModule : IFcsModule
         display.OnIconRemove = go => renderer2.RemoveIcon(go);
         display.Start();
         renderer2.Start();
-        gunL.OnBallisticPush = (side, x, y, r, b) => renderer2.PushBallistic(side, x, y, r, b);
-        gunR.OnBallisticPush = (side, x, y, r, b) => renderer2.PushBallistic(side, x, y, r, b);
+        gunL.OnBallisticPush = (side, x, y, r, b) => renderer2.PushBallistic(side, new Vector2(x, y), r, b);
+        gunR.OnBallisticPush = (side, x, y, r, b) => renderer2.PushBallistic(side, new Vector2(x, y), r, b);
 
         fireControl = new FireControl {
             GunL = gunL,
@@ -96,7 +96,7 @@ public class FcsModule : IFcsModule
             MapSurfaceRef = GameObject.Find("Draggable Surface")?.transform,
         };
         fireControl.OnShellFired = (pos, shell, fly, fireMission) =>
-            renderer2.CreateImpact(pos, shell, fly, 0f, 0f);
+            renderer2.CreateImpact(pos, shell, fly);
         fireControl.Start();
         hud = new FcsHud { Fc = fireControl, GunL = gunL, GunR = gunR };
     }
