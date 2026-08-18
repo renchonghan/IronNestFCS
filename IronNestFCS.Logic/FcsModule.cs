@@ -89,7 +89,9 @@ public class FcsModule : IFcsModule
         };
         fireControl.OnShellFired = (pos, shell, fly, fireMission) => renderer2.CreateImpact(pos, shell, fly);
         fireControl.OnQueueChanged = fc => renderer2.UpdateQueueIndicator(fc);
+        fireControl.OnAimChanged = (side, pos, r, b) => renderer2.PushBallistic(side, pos, r, b);
         fireControl.Start();
+        display.FcPort = fireControl;
         hud = new FcsHud { Fc = fireControl, GunL = gunL, GunR = gunR };
 
         // DC 场景交互层 (新按钮列 + 右键)

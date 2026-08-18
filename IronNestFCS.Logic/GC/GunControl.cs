@@ -102,6 +102,7 @@ public class GunControl {
 
     /// <summary>25fps 常驻循环: 传感器每帧读, 实装快照动作边界读; 任务链在独立协程里跑.</summary>
     private IEnumerator Loop() {
+        float idleRefresh = 0f;
         while (!_disposed) {
             yield return new WaitForSeconds(0.04f);
             ReadSensors();                     // 每帧: 俯仰/方位/飞时 (传感器值不受动作影响)
@@ -114,9 +115,16 @@ public class GunControl {
                 PushBallistic(-1);             // 弹种 -1 = 未就绪不渲染
                 continue;
             }
-            if (_taskHandle == null && DesiredShell != (BulletType)(-1) && DesiredCharge >= 0) {
-                RefreshSnapshot();             // 任务上炮: 边界读实装快照
-                _taskHandle = MelonCoroutines.Start(TaskChain());
+            if (_taskHandle == null) {
+                // 空闲: 周期性刷新实装快照 (FC 派发读实装匹配用, 不能陈), 有新任务则起链
+                if (DesiredCharge < 0 && Time.time - idleRefresh > 0.5f) {
+                    RefreshSnapshot();
+                    idleRefresh = Time.time;
+                }
+                if (DesiredShell != (BulletType)(-1) && DesiredCharge >= 0) {
+                    RefreshSnapshot();         // 任务上炮: 边界读实装快照
+                    _taskHandle = MelonCoroutines.Start(TaskChain());
+                }
             }
         }
     }

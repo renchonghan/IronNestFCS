@@ -47,9 +47,34 @@ public class FcsHud {
         DrawGunBlock(GunR, "GUN-R", x, ref y, lh, h);
         GUI.Label(new Rect(x, y, _panelRect.width, h), new string('-', LineWidth));
         y += lh;
-        // 队列区: 骨架只出队头 (FC 队列 push 待接)
-        GUI.Label(new Rect(x, y, _panelRect.width, h), $" Task Queue({Fc?.QueueCount ?? 0})                 |Finish Queue");
+        // 队列区: 左任务队列 (8 行固定) | 右完成队列
+        GUI.Label(new Rect(x, y, _panelRect.width, h), $" Task Queue({Fc?.QueueCount ?? 0})                 |Finish Queue({Fc?.Finished.Count ?? 0})");
+        y += lh;
+        var queue = Fc?.Queue ?? System.Array.Empty<FireTask>();
+        var finished = Fc?.Finished ?? System.Array.Empty<FireControl.FinishedEntry>();
+        for (int i = 0; i < 8; i++) {
+            string left = i < queue.Count ? QueueRow(queue[i]) : "";
+            string right = i < finished.Count ? FinishRow(finished[i]) : "";
+            GUI.Label(new Rect(x, y, _panelRect.width, h), $" {left,-30}|{right}");
+            y += lh;
+        }
         GUI.color = Color.white;
+    }
+
+    /// <summary>队列行: [预定打击时间] 方位 距离 弹种 模式字母; 预定 -1 = [--:--:--].</summary>
+    private static string QueueRow(FireTask t) {
+        string planned = t.PlannedStrikeTime > 0f ? MissionClock.Format(t.PlannedStrikeTime) : "[--:--:--]";
+        char mode = t.Mode switch { ChargeMode.Tight => 'T', ChargeMode.Extra => 'X', _ => 'N' };
+        return $"{planned} {t.Angle:000.0} {t.Distance:00.00}  {t.Shell,-4}  {mode}";
+    }
+
+    /// <summary>完成行: 抵达时刻 [HH:MM:SS] 方位 距离 T:-剩余秒.</summary>
+    private static string FinishRow(FireControl.FinishedEntry f) {
+        string arrival = MissionClock.Format(f.FireMission + f.Fly);
+        float now = MissionClock.Seconds;
+        float remain = float.IsNaN(now) ? 0f : f.Fly - (now - f.FireMission);
+        string cd = remain > 0.01f ? $"{remain:00.0}S" : "--.-S";
+        return $"{arrival} {f.Task.Angle:000.0} {f.Task.Distance:00.00} T:-{cd}";
     }
 
     /// <summary>标题行: [IronNest FCS] + [模式档] + [CBC:---S] + 任务时钟, 64 字符定宽.</summary>
@@ -83,7 +108,8 @@ public class FcsHud {
         string aStr = float.IsNaN(gun.Azimuth) ? "---.-" : $"{gun.Azimuth:000.0}";
         string cStr = gun.Charges > 0 ? gun.Charges.ToString() : "-";
         string ft = !float.IsNaN(gun.FlyTime) && gun.FlyTime > 0.01f ? $"{gun.FlyTime:00.0}S" : "--.-S";
-        string modeLetter = "N"; // 骨架: 装药模式由 FC 任务传出 (待接)
+        var task = Fc != null ? (gun == GunL ? Fc.LeftTask : Fc.RightTask) : null;
+        char modeLetter = task == null ? 'N' : task.Mode switch { ChargeMode.Tight => 'T', ChargeMode.Extra => 'X', _ => 'N' };
         string id = gun == GunL ? $"L-{modeLetter}" : $"R-{modeLetter}";
         GUI.Label(new Rect(x, y, _panelRect.width, h),
             $" [{label}] PHASE {code} {name} | [{Center(chamber, 4)}] E:{eStr} A:{aStr} C:{cStr} | FT:{ft}".PadRight(LineWidth));

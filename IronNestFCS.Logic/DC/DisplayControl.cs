@@ -15,6 +15,7 @@ public class DisplayControl {
     public Radar? RadarPort;                 // SRC 数据源 (FcsModule 注入)
     public Transform? NestRef;               // 铁巢 (相对位置基准)
     public Transform? MapSurfaceRef;         // 沙盘表面 (局部系换算)
+    public FireControl? FcPort;              // 右键 toggle (入队/升级齐射/取消) 用
 
     // ===== 状态端口 =====
     public readonly List<DcTarget> Targets = new();
@@ -167,9 +168,18 @@ public class DisplayControl {
 
     private readonly Dictionary<Transform, string> _tokens = new(); // 令牌 → 虚拟目标名称
 
-    /// <summary>右键实体 → 入队请求 (再点取消由 FC 回调, 令牌离图自动取消由 RemoveToken 触发).</summary>
+    /// <summary>右键实体 toggle: 无任务 → 入队; 已有 → 升级齐射; 已齐射 → 取消.</summary>
     public void RightClickEntity(GameObject go) {
         if (go == null) return;
+        var existing = FcPort?.FindEntityTask(go);
+        if (existing != null) {
+            if (!existing.SalvoPair) {
+                existing.SalvoPair = true; // 升级齐射 (FC 派发时两炮同任务 + SyncCommand)
+                MelonLogger.Msg($"[DC] upgrade salvo on {existing.Name}");
+            }
+            else FcPort.RequestCancel(existing);
+            return;
+        }
         Requests.Add(new FireTask {
             Entity = go,
             Name = go.name,
