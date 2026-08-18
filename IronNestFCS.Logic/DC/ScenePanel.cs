@@ -20,6 +20,7 @@ public class ScenePanel {
     private readonly ClickRaycaster _clicks = new();
     private readonly List<GameObject> _owned = new();
     private readonly HashSet<Collider> _entityColliders = new();
+    private readonly HashSet<Collider> _tokenColliders = new();
     private float _lastRegister;
     private bool _built;
     private bool _paused;
@@ -85,6 +86,17 @@ public class ScenePanel {
             _clicks.Register(col, () => {
                 Dc?.RightClickEntity(go);
             }, right: true); // 右键 (左键留给游戏自身拖拽)
+        }
+        // 地图令牌 (MapToken_* 棋子): 右键 = 虚拟目标入队 (拖放由 DC 数据循环检测)
+        _tokenColliders.RemoveWhere(c => c == null);
+        foreach (var go in GameObject.FindObjectsOfType<GameObject>()) {
+            if (go == null || !go.name.StartsWith("MapToken")) continue;
+            var col = go.GetComponent<Collider>();
+            if (col == null || !_tokenColliders.Add(col)) continue;
+            var token = go;
+            _clicks.Register(col, () => {
+                Dc?.RightClickToken(token);
+            }, right: true);
         }
     }
 

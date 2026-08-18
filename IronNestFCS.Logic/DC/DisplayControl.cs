@@ -55,6 +55,7 @@ public class DisplayControl {
             if (RadarPort == null) continue;
             RefreshTargets();
             UpdateIcons();       // 实体图标差集 (在列表→画, 不在→删)
+            TrackTokens();       // 令牌拖放: 上地图注册虚拟目标, 拖离自动取消
             if (AutoTask) Sweep();
         }
     }
@@ -197,7 +198,75 @@ public class DisplayControl {
 
     /// <summary>拖令牌上地图 → 注册虚拟目标 (带名称); 拖离地图 → 移除 (位置源失效, FC 撤任务).</summary>
     public void AddToken(Transform token, string name) => _tokens[token] = name;
-    public void RemoveToken(Transform token) => _tokens.Remove(token);
+    public void RemoveToken(Transform token) {
+        _tokens.Remove(token);
+        // 位置源失效 → FC 撤任务 (令牌被拿离地图)
+        var task = FcPort?.FindEntityTask(token.gameObject);
+        if (task != null) FcPort?.RequestCancel(task);
+    }
+
+    // ===== 令牌拖放检测 (MapToken_* 棋子) =====
+    private readonly HashSet<Transform> _trackedTokens = new();
+    private readonly Dictionary<Transform, bool> _tokenOnMap = new();
+    private float _lastTokenScan;
+
+    /// <summary>每帧: 新令牌发现 (1s 一批) + 上下地图边界判定.</summary>
+    private void TrackTokens() {
+        if (Time.time - _lastTokenScan > 1f) {
+            _lastTokenScan = Time.time;
+            foreach (var go in GameObject.FindObjectsOfType<GameObject>()) {
+                if (go == null || !go.name.StartsWith("MapToken")) continue;
+                if (_trackedTokens.Add(go.transform)) _tokenOnMap[go.transform] = IsOnMap(go.transform.position);
+            }
+        }
+        foreach (var token in _trackedTokens) {
+            if (token == null) continue;
+            bool inside = IsOnMap(token.position);
+            bool was = _tokenOnMap.TryGetValue(token, out var w) && w;
+            _tokenOnMap[token] = inside;
+            if (inside && !was) {
+                AddToken(token, token.name); // 拖上地图: 注册虚拟目标 (名称 = 令牌名)
+                MelonLogger.Msg($"[DC] token '{token.name}' placed on map");
+            }
+            else if (!inside && was) {
+                RemoveToken(token);          // 拖离地图: 位置源失效 → FC 撤任务
+                MelonLogger.Msg($"[DC] token '{token.name}' left map, task removed");
+            }
+        }
+    }
+
+    /// <summary>棋盘边界 (A-T × 1-10 网格, 留 0.2 余量): 令牌世界坐标 → 板面局部判定.</summary>
+    private bool IsOnMap(Vector3 worldPos) {
+        if (MapSurfaceRef == null) return false;
+        var lp = MapSurfaceRef.InverseTransformPoint(worldPos);
+        float x0 = GeoMap.MapBottomLeft.x - 0.2f, x1 = GeoMap.MapBottomLeft.x + 20f * GeoMap.MapCellSize + 0.2f;
+        float y0 = GeoMap.MapBottomLeft.y - 0.2f, y1 = GeoMap.MapBottomLeft.y + 10f * GeoMap.MapCellSize + 0.2f;
+        return lp.x >= x0 && lp.x <= x1 && lp.y >= y0 && lp.y <= y1;
+    }
+
+    /// <summary>地图上令牌右键 → 虚拟目标入队 (与实体右键同款 toggle 语义).</summary>
+    public void RightClickToken(GameObject token) {
+        if (token == null) return;
+        var existing = FcPort?.FindEntityTask(token);
+        if (existing != null) {
+            if (!existing.SalvoPair) existing.SalvoPair = true;
+            else FcPort?.RequestCancel(existing);
+            return;
+        }
+        Requests.Add(new FireTask {
+            Entity = token,
+            Name = token.name,
+            PositionSource = () => LivePos(token),
+            VelocitySource = () => {
+                if (!Tws) return Vector2.zero;
+                var t = Targets.Find(x => x.Entity == token);
+                return t?.Velocity ?? Vector2.zero;
+            },
+            Priority = 1,
+            Shell = SelectedShell,
+            Mode = ChargeModeSelection,
+        });
+    }
 
     /// <summary>开关 (3D 按钮列/火控台按钮由场景交互层调用).</summary>
     public void SetAutoTask(bool on) { AutoTask = on; }
