@@ -11,11 +11,6 @@ public class MapTable {
     private ImpactMarkerManager? impactManager; // 铁巢网格位置真源: 它把真实炮塔世界坐标投到地图网格
     private Dictionary<int, Transform> artilleries;
 
-    // 沙盘校准: 网格 A-T × 1-10 映射到棋子局部系
-    // 格长用代码原有比例 1/3.8164 (1 棋盘单位 = 3.8164 km); 左下角用 1 药平射真实落点解出:
-    // 目标 (-1.88,0.97) = 左下角 + 网格 (2.85,8.95) × 格长
-    private static readonly Vector2 MapBottomLeft = new(-2.6238f, -1.3741f); // 网格原点 (A1) 在棋子空间的位置 (含目测修正: 右 0.1 小格 / 上 1/20 小格)
-    private static readonly float MapCellSize = 1f / 3.8164f;                 // 每大格的棋子空间尺寸
     private Transform? fireMissionRoot;
     private FireMission? fireMission;
     private Transform? mapSurface;
@@ -72,8 +67,8 @@ public class MapTable {
         var tb = impactManager.turretController.turretBase;
         if (tb == null) return;
         var grid = tb.localPosition;
-        var local = new Vector3(MapBottomLeft.x + grid.x * MapCellSize,
-                                MapBottomLeft.y + grid.y * MapCellSize,
+        var local = new Vector3(GeoMap.MapBottomLeft.x + grid.x * GeoMap.MapCellSize,
+                                GeoMap.MapBottomLeft.y + grid.y * GeoMap.MapCellSize,
                                 turret.localPosition.z);
         turret.localPosition = local;
     }
@@ -305,7 +300,7 @@ public class MapTable {
         float rKm = ShellData.KillRadiusKm(bullet); // 游戏 ImpactRadius (半径, km), 不再手调表
         bool solid = bullet == BulletType.DRIL; // 混凝土: 整圆
         bool pierce = IsArmorPierce(bullet);    // 穿甲: 圈内 X 指示线
-        float rBoard = rKm * MapCellSize;
+        float rBoard = rKm * GeoMap.MapCellSize;
         float holderScale = mark.holder.transform.lossyScale.x;
         float surfaceScale = mapSurface != null ? mapSurface.lossyScale.x : 1f;
         if (holderScale <= 0.0001f) holderScale = 1f;
@@ -382,7 +377,7 @@ public class MapTable {
             if (freshAngel < 0) freshAngel += 360;
             mark.task.distance = freshDist;
             mark.task.angel = freshAngel;
-            mark.task.position = local * 3.8164f + new Vector3(10.016f, 5.235f, 0f);
+            mark.task.position = local * 3.8164f + GeoMap.KmOffset;
             // TRAK 1 帧预测 (25fps): 当前 + 上一帧差分外推, 与虚拟目标同款
             if (float.IsNaN(mark.lastDist)) {
                 mark.task.trackDistance = freshDist;
@@ -438,7 +433,7 @@ public class MapTable {
             root.transform.SetParent(mark.holder.transform, false);
             root.transform.localPosition = new Vector3(-((slot.Length - 1) * step + segW) / 2f, 0.14f + dy, 0f);
             for (int i = 0; i < slot.Length; i++) {
-                DrawCharSegments(root.transform, slot[i], mark.color, i * step, segW);
+                Glyph16Font.DrawCharSegments(root.transform, slot[i], mark.color, i * step, segW);
             }
             mark.labelRoot = root;
         }
@@ -452,7 +447,7 @@ public class MapTable {
             bRoot.transform.SetParent(mark.holder.transform, false);
             bRoot.transform.localPosition = new Vector3(-((bt.Length - 1) * step + segW) / 2f, 0.14f + dy + segW * 1.6f + (step - segW) + 0.02775f, 0f); // 行间距 = 字间距 + 再上抬 1/4 小格 (避开杀伤圈)
             for (int i = 0; i < bt.Length; i++) {
-                DrawCharSegments(bRoot.transform, bt[i], mark.color, i * step, segW);
+                Glyph16Font.DrawCharSegments(bRoot.transform, bt[i], mark.color, i * step, segW);
             }
             mark.bulletRoot = bRoot;
         }
@@ -464,172 +459,9 @@ public class MapTable {
             tRoot.transform.SetParent(mark.holder.transform, false);
             tRoot.transform.localPosition = new Vector3(-((timer.Length - 1) * step + segW) / 2f, -0.2f - dy, 0f);
             for (int i = 0; i < timer.Length; i++) {
-                DrawCharSegments(tRoot.transform, timer[i], mark.color, i * step, segW);
+                Glyph16Font.DrawCharSegments(tRoot.transform, timer[i], mark.color, i * step, segW);
             }
             mark.timerRoot = tRoot;
-        }
-    }
-
-    /// <summary>
-    /// TM1629A 十六段米字数码管: 段坐标 (单位格: 宽 1, 高 1.6, 中心 0.5,0.8) 与笔画位映射.
-    /// 微调字形直接改下方 Glyph16: ['X'] = 段名按位或, 例如 ['L'] = F|E|D1|D2.
-    /// 笔画位与布局 (bit0=a1 ... bit15=m):
-    ///      a1|a2
-    ///    f   h   b
-    ///      g1|g2
-    ///    e   i   c
-    ///      d1|d2
-    /// 对角: j 左上->中, k 右上->中, l 左下->中, m 右下->中
-    /// </summary>
-    private static readonly Dictionary<string, (Vector2, Vector2)> Seg16 = new() {
-        ["a1"] = (new Vector2(0.05f, 1.6f), new Vector2(0.5f, 1.6f)),
-        ["a2"] = (new Vector2(0.5f, 1.6f), new Vector2(0.95f, 1.6f)),
-        ["b"] = (new Vector2(0.95f, 1.6f), new Vector2(0.95f, 0.8f)),
-        ["c"] = (new Vector2(0.95f, 0.8f), new Vector2(0.95f, 0f)),
-        ["d1"] = (new Vector2(0.05f, 0f), new Vector2(0.5f, 0f)),
-        ["d2"] = (new Vector2(0.5f, 0f), new Vector2(0.95f, 0f)),
-        ["e"] = (new Vector2(0.05f, 0.8f), new Vector2(0.05f, 0f)),
-        ["f"] = (new Vector2(0.05f, 1.6f), new Vector2(0.05f, 0.8f)),
-        ["g1"] = (new Vector2(0.05f, 0.8f), new Vector2(0.5f, 0.8f)),
-        ["g2"] = (new Vector2(0.5f, 0.8f), new Vector2(0.95f, 0.8f)),
-        ["h"] = (new Vector2(0.5f, 0.8f), new Vector2(0.5f, 1.6f)),
-        ["i"] = (new Vector2(0.5f, 0.8f), new Vector2(0.5f, 0f)),
-        ["j"] = (new Vector2(0.05f, 1.6f), new Vector2(0.5f, 0.8f)),
-        ["k"] = (new Vector2(0.95f, 1.6f), new Vector2(0.5f, 0.8f)),
-        ["l"] = (new Vector2(0.05f, 0f), new Vector2(0.5f, 0.8f)),
-        ["m"] = (new Vector2(0.95f, 0f), new Vector2(0.5f, 0.8f)),
-    };
-
-    // 笔画位定义: ushort 掩码, bit N = 第 N 段, 与 SegBit16 顺序一致 (0-7 外框, 8-11 中间十字, 12-15 对角)
-    private const ushort A1 = 1 << 0, A2 = 1 << 1, B = 1 << 2, C = 1 << 3,
-                        D1 = 1 << 4, D2 = 1 << 5, E = 1 << 6, F = 1 << 7,
-                        G1 = 1 << 8, G2 = 1 << 9, H = 1 << 10, I = 1 << 11,
-                        J = 1 << 12, K = 1 << 13, L = 1 << 14, M = 1 << 15;
-
-    private static readonly string[] SegBit16 = { "a1", "a2", "b", "c", "d1", "d2", "e", "f", "g1", "g2", "h", "i", "j", "k", "l", "m" };
-
-    /// <summary>
-    /// 可打印 ASCII (0x20-0x7E) 字形表, ushort 位掩码按 SegBit16 点亮.
-    /// 无法表达的字符 (如 ~) 置 0 显示空白.
-    /// </summary>
-    private static readonly Dictionary<char, ushort> Glyph16 = new() {
-        // ---- 数字 ----
-        ['0'] = A1|A2|B|C|D1|D2|E|F,
-        ['1'] = B|C,
-        ['2'] = A1|A2|B|G1|G2|E|D1|D2,
-        ['3'] = A1|A2|B|G1|G2|C|D1|D2,
-        ['4'] = F|G1|G2|B|C,
-        ['5'] = A1|A2|F|G1|G2|C|D1|D2,
-        ['6'] = A1|A2|F|E|G1|G2|C|D1|D2,
-        ['7'] = A1|A2|B|C,
-        ['8'] = A1|A2|B|C|D1|D2|E|F|G1|G2,
-        ['9'] = A1|A2|F|G1|G2|B|C|D1|D2,
-        // ---- 大写字母 ----
-        ['A'] = A1|A2|B|C|E|F|G1|G2,
-        ['B'] = A1|A2|F|E|G1|D1|D2|K|M,   // 左竖 + 三横 + 右侧斜边 k/m
-        ['C'] = A1|A2|D1|D2|E|F,
-        ['D'] = F|E|J|L,   // 左竖 + 左侧尖角 j/l (上 \ 下 /)
-        ['E'] = A1|A2|F|G1|G2|E|D1|D2,
-        ['F'] = A1|A2|F|G1|G2|E,
-        ['G'] = A1|A2|F|E|G2|C|D1|D2,
-        ['H'] = F|E|G1|G2|B|C,
-        ['I'] = A1|A2|H|I|D1|D2,
-        ['J'] = A1|A2|H|I|D1,   // 上横 + 中竖 + 左下钩
-        ['K'] = F|E|G1|K|M,   // 中横只留左半
-        ['L'] = F|E|D1|D2,
-        ['M'] = F|E|J|K|B|C,
-        ['N'] = F|E|K|L|B|C,
-        ['O'] = A1|A2|B|C|D1|D2|E|F,
-        ['P'] = A1|A2|F|E|G1|G2|B,
-        ['Q'] = A1|A2|B|C|D1|D2|E|F|M,
-        ['R'] = A1|A2|F|E|G1|G2|B|M,   // 上横 + 左竖全 f/e + 中横 g1g2 + 右上竖 b + 斜腿 m
-        ['S'] = A1|A2|J|M|D1|D2,   // Z 镜像形, 与 5 区分 (齐射 S 标记用)
-        ['T'] = A1|A2|H|I,
-        ['U'] = F|E|B|C|D1|D2,
-        ['V'] = F|E|K|L,   // 左竖 f/e + 整条斜线 k/l (右上到左下)
-        ['W'] = E|F|B|C|J|K|L|M,
-        ['X'] = J|K|L|M,
-        ['Y'] = J|K|I,
-        ['Z'] = A1|A2|K|L|D1|D2,
-        // ---- 小写字母 (暂时用不上, 未调试, a 已知有误待定) ----
-        ['a'] = E|F|G1|G2|C|D1|D2,
-        ['b'] = F|E|G1|G2|C|D1|D2,
-        ['c'] = E|G1|G2|D1|D2,
-        ['d'] = B|C|G1|G2|E|D1|D2,
-        ['e'] = A1|F|E|G1|G2|D1|D2,
-        ['f'] = A1|F|G1|G2|E,
-        ['g'] = A1|A2|F|G1|G2|C|D1|D2,
-        ['h'] = F|E|G1|G2|C,
-        ['i'] = I,
-        ['j'] = C|I|D1|D2,
-        ['k'] = F|E|G1|G2|K|M,
-        ['l'] = F|E,
-        ['m'] = E|F|G1|G2|H|B|C,
-        ['n'] = E|G1|G2|C,
-        ['o'] = E|C|G1|G2|D1|D2,
-        ['p'] = A1|F|E|G1|G2|B,
-        ['q'] = A1|A2|B|C|G1|G2|D1|D2,
-        ['r'] = E|G1|G2,
-        ['s'] = A1|A2|F|G1|G2|C|D1|D2,
-        ['t'] = F|E|G1|G2|I,
-        ['u'] = E|C|D1|D2,
-        ['v'] = J|K,
-        ['w'] = E|C|J|K|L|M,
-        ['x'] = K|L,
-        ['y'] = K|L|I,
-        ['z'] = A1|A2|G1|G2|D1|D2,
-        // ---- 符号 ----
-        [' '] = 0,
-        ['!'] = H|D2,   // 中上竖 + 右半底横
-        ['"'] = F|B,
-        ['#'] = F|E|B|C|G1|G2,
-        ['$'] = A1|A2|F|G1|G2|C|D1|D2|H|I,
-        ['%'] = F|C|K|L,
-        ['&'] = A1|F|E|G1|G2|C|D1|D2,
-        ['\''] = H,   // 中上竖
-        ['('] = A1|F|E,   // 左上横 + 左竖两段
-        [')'] = B|C|D2,   // 右竖两段 + 右下横
-        ['*'] = J|K|L|M|H|I,
-        ['+'] = G1|G2|H|I,
-        [','] = L,
-        ['-'] = G1|G2,
-        ['.'] = G1|D1|E|I,   // 左下角画圈: g1 上 / d1 下 / e 左 / i 右
-        ['/'] = K|L,
-        [':'] = G1|D1,   // 左中横 + 左下横
-        [';'] = A1|L,   // 逗号 + 左上横
-        ['<'] = J|L,
-        ['='] = G1|G2|D1|D2,
-        ['>'] = K|M,
-        ['?'] = A1|A2|F|K|I,   // 上横 + 左竖上半 + 半斜线(k 右上到中) + 中下竖
-        ['@'] = A1|A2|B|C|E|F|G2|D2|I,   // 无底横的 0 + 右下角圈 (g2 d2 c i)
-        ['['] = A2|D2|H|I,   // 右半横 (钩朝右) + 中竖
-        ['\\'] = J|M,
-        [']'] = A1|D1|H|I,   // 左半横 (钩朝左) + 中竖
-        ['^'] = L|M,   // 下面两条斜杠 l/m 组成尖朝上的 ^
-        ['_'] = D1|D2,
-        ['`'] = J,
-        ['{'] = A2|G1|D2|H|I,
-        ['|'] = H|I,
-        ['}'] = A1|G2|D1|H|I,
-        ['~'] = A1|G1|F|H,  // 左上角圈: 当 ° 用 (a1 上 / g1 下 / f 左 / h 右)
-    };
-
-    /// <summary>画一个字符: scale = 字符宽 (板面单位), 字形高 1.6 x scale, 笔画粗随字号同比缩放 (实体标签基准 0.008).</summary>
-    private static void DrawCharSegments(Transform parent, char ch, Color color, float x0, float scale)
-    {
-        if (!Glyph16.TryGetValue(ch, out var mask)) mask = A1|A2|B|C|D1|D2|E|F|G1|G2; // 未知字符全亮 (8 形)
-        for (int bit = 0; bit < SegBit16.Length; bit++) {
-            if ((mask & (1 << bit)) == 0) continue;
-            var (a, b) = Seg16[SegBit16[bit]];
-            var go = new GameObject("FCS_LabelSeg");
-            go.transform.SetParent(parent, false);
-            var line = go.AddComponent<Il2CppShapes.Line>();
-            line.Thickness = 0.008f * (scale / LabelSegW);
-            line.Start = new Vector3(x0 + a.x * scale, a.y * scale, 0f);
-            line.End = new Vector3(x0 + b.x * scale, b.y * scale, 0f);
-            line.Color = color;
-            line.ColorStart = color;
-            line.ColorEnd = color;
         }
     }
 
@@ -702,7 +534,7 @@ public class MapTable {
         tagRoot.transform.SetParent(root.transform, false);
         float tagCenter = side * (armEnd + tagScale * 1.5f); // 臂端外再让一个字符宽度, 不压线
         tagRoot.transform.localPosition = new Vector3(tagCenter - tagScale * 0.5f, -0.8f * tagScale, 0f); // 字形中心骑线
-        DrawCharSegments(tagRoot.transform, isLeft ? 'L' : 'R', color, 0f, tagScale);
+        Glyph16Font.DrawCharSegments(tagRoot.transform, isLeft ? 'L' : 'R', color, 0f, tagScale);
         // 杀伤圈容器: 段在 SetAimRadius 按弹种重建 (半径定段数, 保持虚线周期一致)
         var circle = new GameObject("FCS_AimRadius");
         circle.transform.SetParent(root.transform, false);
@@ -740,14 +572,14 @@ public class MapTable {
             if (mark.root.activeSelf) mark.root.SetActive(false);
             return;
         }
-        mark.root.transform.localPosition = new Vector3(MapBottomLeft.x + grid.x * MapCellSize, MapBottomLeft.y + grid.y * MapCellSize, -0.03f);
+        mark.root.transform.localPosition = new Vector3(GeoMap.MapBottomLeft.x + grid.x * GeoMap.MapCellSize, GeoMap.MapBottomLeft.y + grid.y * GeoMap.MapCellSize, -0.03f);
         if (!mark.root.activeSelf) mark.root.SetActive(true);
     }
 
     // 杀伤圈画法参数: 虚线实/空长 0.01 板面单位 (与线宽解耦, 各弹种虚线段数固定);
-    // 圈线视觉宽 = 菱形框视觉宽 (菱形线宽 0.01 是实体局部值 = 0.01 km = 0.01 x MapCellSize 板面单位)
+    // 圈线视觉宽 = 菱形框视觉宽 (菱形线宽 0.01 是实体局部值 = 0.01 km = 0.01 x GeoMap.MapCellSize 板面单位)
     private const float KillDashLen = 0.01f;
-    private static readonly float KillThick = 0.01f * MapCellSize;
+    private static readonly float KillThick = 0.01f * GeoMap.MapCellSize;
 
     /// <summary>
     /// 手排虚线圆: 短实线弧 + 留空 (游戏 Dashed 按整条线排周期, 短段上显不出虚线),
@@ -809,7 +641,7 @@ public class MapTable {
         float rKm = ShellData.KillRadiusKm(bullet.Value); // 游戏 ImpactRadius (半径, km), 不再手调表
         bool solid = bullet.Value == BulletType.DRIL; // 混凝土: 整圆
         bool pierce = IsArmorPierce(bullet.Value);    // 穿甲: 圈内 X 指示线
-        float r = rKm * MapCellSize;
+        float r = rKm * GeoMap.MapCellSize;
         int n = KillSegCount(r, solid);
         if (n == mark.segCount && pierce == mark.pierce && Mathf.Abs(rKm - mark.radiusKm) < 0.0001f) return;
         mark.radiusKm = rKm;
@@ -880,7 +712,7 @@ public class MapTable {
             if (mark.ownsHolder) {
                 // T1-T4 虚拟目标: 标记物在板面局部系, 反解成网格坐标 (实体 localPosition 本来就是网格系, 直接可用)
                 Vector2 lp = mark.entity.localPosition;
-                targetGrid = new Vector2((lp.x - MapBottomLeft.x) / MapCellSize, (lp.y - MapBottomLeft.y) / MapCellSize);
+                targetGrid = new Vector2((lp.x - GeoMap.MapBottomLeft.x) / GeoMap.MapCellSize, (lp.y - GeoMap.MapBottomLeft.y) / GeoMap.MapCellSize);
             }
             else {
                 targetGrid = mark.entity.localPosition; // 实体实时位置
@@ -891,8 +723,8 @@ public class MapTable {
             targetGrid = nest + new Vector2(Mathf.Sin(rad), Mathf.Cos(rad)) * task.distance; // 1 网格 = 1 km
         }
         // z=-0.03 与瞄准十字同层: 平贴板面 (z=0) 会被生成的侦察照片盖住
-        var startLocal = new Vector3(MapBottomLeft.x + nest.x * MapCellSize, MapBottomLeft.y + nest.y * MapCellSize, -0.03f);
-        var endLocal = new Vector3(MapBottomLeft.x + targetGrid.x * MapCellSize, MapBottomLeft.y + targetGrid.y * MapCellSize, -0.03f);
+        var startLocal = new Vector3(GeoMap.MapBottomLeft.x + nest.x * GeoMap.MapCellSize, GeoMap.MapBottomLeft.y + nest.y * GeoMap.MapCellSize, -0.03f);
+        var endLocal = new Vector3(GeoMap.MapBottomLeft.x + targetGrid.x * GeoMap.MapCellSize, GeoMap.MapBottomLeft.y + targetGrid.y * GeoMap.MapCellSize, -0.03f);
         go.transform.localPosition = startLocal;
         line.Start = Vector3.zero;
         line.End = endLocal - startLocal;
@@ -919,8 +751,8 @@ public class MapTable {
         // 网格坐标 → 板面局部系 (与 GetMarkTarget 同空间), 方向角必须在该空间算
         // 网格画布空间与板面空间朝向不一致, 直接在网格空间算角会打飞
         var nestGrid = (Vector2)tb.localPosition;
-        var local = new Vector2(MapBottomLeft.x + gridPos.x * MapCellSize, MapBottomLeft.y + gridPos.y * MapCellSize);
-        var nestLocal = new Vector2(MapBottomLeft.x + nestGrid.x * MapCellSize, MapBottomLeft.y + nestGrid.y * MapCellSize);
+        var local = new Vector2(GeoMap.MapBottomLeft.x + gridPos.x * GeoMap.MapCellSize, GeoMap.MapBottomLeft.y + gridPos.y * GeoMap.MapCellSize);
+        var nestLocal = new Vector2(GeoMap.MapBottomLeft.x + nestGrid.x * GeoMap.MapCellSize, GeoMap.MapBottomLeft.y + nestGrid.y * GeoMap.MapCellSize);
         var target = local - nestLocal;
         var dist = target.magnitude * 3.8164f;
         var angle = Vector3.SignedAngle(new Vector3(target.x, target.y, 0f), Vector3.up, Vector3.forward);
@@ -928,7 +760,7 @@ public class MapTable {
         return new ArtilleryTask {
             angel = angle,
             distance = dist,
-            position = new Vector3(local.x, local.y, 0f) * 3.8164f + new Vector3(10.016f, 5.235f, 0f),
+            position = new Vector3(local.x, local.y, 0f) * 3.8164f + GeoMap.KmOffset,
         };
     }
 
@@ -1141,7 +973,7 @@ public class MapTable {
         var task = new ArtilleryTask {
             angel = angle,
             distance = dist,
-            position = artilleries[index].localPosition * 3.8164f + new Vector3(10.016f, 5.235f, 0f)
+            position = artilleries[index].localPosition * 3.8164f + GeoMap.KmOffset
         };
         return task;
     }

@@ -27,6 +27,12 @@ public class FcsModule : IFcsModule
     private FcsWindow? window;
     private TacticalRadar? radar;
 
+    // ===== 2.0 新架构模块 (迁移期: 与旧 FSC 并存, 新件闲置不改变游戏行为) =====
+    private GunControl? gunL;
+    private GunControl? gunR;
+    private CoroutineLock? gcPurchaseLock;
+    private CoroutineLock? gcFireLock;
+
     private bool autoSweep;
     private readonly HashSet<EntityLocation> swept = new(new EntityLocationComparer());
 
@@ -35,9 +41,29 @@ public class FcsModule : IFcsModule
         window = new FcsWindow(fcs);
         radar = new TacticalRadar(fcs);
         bool bound = fcs.TryBind();
+        if (bound) WireGunControls();
         // 返回绑定结果仅用于 Host 日志; 窗口实例已建好, 未绑定时会显示提示,
         // 进入场景后按 F9 重载即可绑定.
         return bound;
+    }
+
+    /// <summary>2.0 GC 模块接线: 全局端口总线 (炮塔/击发钮) + 两炮执行器空转 (无任务时只读传感器, 不碰硬件).</summary>
+    private void WireGunControls()
+    {
+        FcsBus.TurretRead = () => fcs.Turret.CurrentAngle();
+        FcsBus.TurretVelRead = () => fcs.Turret.RotationVelocity();
+        FcsBus.TurretSet = a => fcs.Turret.SetDesiredRotation(a);
+        FcsBus.Fire = () => fcs.TriggerConsole.Fire();
+        gcPurchaseLock = new CoroutineLock();
+        gcFireLock = new CoroutineLock();
+        var deck = new PurchaseDeck();
+        deck.TryBind();
+        gunL = new GunControl(LeftRight.Left, fcs.LeftGun, deck, gcPurchaseLock, gcFireLock);
+        gunR = new GunControl(LeftRight.Right, fcs.RightGun, deck, gcPurchaseLock, gcFireLock);
+        gunL.SyncPeer = gunR;
+        gunR.SyncPeer = gunL;
+        gunL.Start();
+        gunR.Start();
     }
 
     public void Update()
@@ -195,6 +221,13 @@ public class FcsModule : IFcsModule
 
     public void Shutdown()
     {
+        gunL?.Stop();
+        gunR?.Stop();
+        gunL = gunR = null;
+        FcsBus.TurretRead = null;
+        FcsBus.TurretVelRead = null;
+        FcsBus.TurretSet = null;
+        FcsBus.Fire = null;
         fcs.Dispose();
         window = null;
         radar = null;

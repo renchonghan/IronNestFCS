@@ -228,7 +228,7 @@ public class FcsSceneInteractor {
             targetId = id,
             angel = angle,
             distance = dist,
-            position = localPos * 3.8164f + new Vector3(10.016f, 5.235f, 0f),
+            position = localPos * 3.8164f + GeoMap.KmOffset,
             bulletType = selectedBulletType
         };
     }

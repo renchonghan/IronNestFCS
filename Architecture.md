@@ -321,3 +321,20 @@ Manual(全手动)
 4. DC (交互/渲染)
 5. FC 最后 (依赖所有端口)
 6. 删旧调度层
+
+
+### 2.0 目录规划 (按模块写文件, 每类 ≤300 行)
+
+```
+Logic/
+├─ FcsModule.cs             宿主装配 (保留, 只改模块初始化)
+├─ Shared/                  共享静态件
+│   ├─ GeoMap.cs / Glyph16Font.cs   (1a/1b 已抽)
+│   ├─ TrackAxis.cs / CoroutineLock.cs / ArtilleryTask.cs / ShellData.cs  (搬入)
+├─ GC/  GunControl (GunControl.cs 状态机 / GunSystem.cs / PurchaseDeck.cs)
+├─ RD/  Radar.cs (TacticalRadar 改造)
+├─ DC/  DisplayControl.cs / SandboxRenderer.cs / ClickRaycaster.cs
+└─ FC/  FireControl.cs / FcsHud.cs / BallisticCalculator.cs / TriggerConsole.cs
+```
+
+- 旧文件 (FSC.cs/MapTable.cs/FcsWindow.cs/TacticalRadar.cs) 四模块建完再整体清退, 每步可编译可 F9

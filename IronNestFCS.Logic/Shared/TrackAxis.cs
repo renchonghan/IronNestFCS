@@ -40,6 +40,15 @@ public class TrackAxis {
         this.iWindowOff = iWindowOff;
     }
 
+    /// <summary>新任务开始: 清误差窗/历史/判定位 (GC 任务链换目标时调用).</summary>
+    public void ResetForTask() {
+        _errs.Clear();
+        _err1Ago = _err2Ago = float.NaN;
+        _lastPos = float.NaN;
+        Stable = Stuck = 0f;
+        Locked = GaveUp = false;
+    }
+
     /// <summary>推进一步: err = 目标-实际, vel = 实际速度, pos = 实际位置. 返回修正量 (叠加到预测值).</summary>
     public float Step(float err, float vel, float pos) {
         // 套上并跟踪稳定: 误差+速度连续收住 5 帧 (0.2s) 才判定 (防瞬时过零)
