@@ -277,6 +277,9 @@ public class GunControl {
         _lastHasFired = false;        // 残留的击发沿不许带到下个任务
         _impactFlying = false;
         _sawCountdown = false;
+        // 外推状态清零: 新目标仰角/方位突变, 旧斜率历史会把外推带飞 (先停旧目标一会/先瞄出去才收敛)
+        _slopeE = _slopeA = float.NaN;
+        _lastTargetE = _lastTargetA = float.NaN;
         _eAxis.ResetForTask();
         _hAxis.ResetForTask();
     }
@@ -342,9 +345,13 @@ public class GunControl {
     /// 击发后膛空也会掉, 时序上比 pendingReload 晚, 不能当击发信号.</summary>
     internal IEnumerator RunTrak() {
         Action = GunAction.Trak;
-        // 装填机构停稳 + 炮管运动停止再追 (装填完炮管有回落动作, 追早了对摇杆打架 → 鬼畜);
-        // 不看码 (BreachLocked 一闪而过), 用机构信号 + 小缓冲
-        yield return _gun.WaitForReloadReady();
+        // 等装填完成 (CanFire = 弹+药+炮闩锁 = 手柄解锁) 再追 — 换目标"停一下"的元凶是等 WaitForReloadReady:
+        // 上一发自动循环期间仰角速度恒非 0, 三条件要等 15s; CanFire 置位即机构就绪, 追完小缓冲防回落鬼畜
+        float waited = 0f;
+        while (!_gun.CanFire() && waited < 30f) {
+            yield return new WaitForSeconds(0.5f);
+            waited += 0.5f;
+        }
         yield return new WaitForSeconds(0.3f);
         while (!_disposed) {
             if (ManualControl || DesiredCharge < 0) yield break;

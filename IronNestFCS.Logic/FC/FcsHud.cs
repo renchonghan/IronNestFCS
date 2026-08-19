@@ -55,8 +55,14 @@ public class FcsHud {
         y += lh;
         var queue = Fc?.Queue ?? System.Array.Empty<FireTask>();
         var finished = Fc?.Finished ?? System.Array.Empty<FireControl.FinishedEntry>();
+        // 队列展开: 齐射对占两行 — 第一行正常, 第二行前导 >>>[SALVO] (1.0.8 同款, 数据层仍是单任务挂双槽)
+        var rows = new System.Collections.Generic.List<string>();
+        foreach (var t in queue) {
+            rows.Add(QueueRow(t));
+            if (t.SalvoPair) rows.Add(SalvoRow(t));
+        }
         for (int i = 0; i < 8; i++) {
-            string left = i < queue.Count ? QueueRow(queue[i]) : "";
+            string left = i < rows.Count ? rows[i] : "";
             string right = i < finished.Count ? FinishRow(finished[i]) : "";
             GUI.Label(new Rect(x, y, _panelRect.width, h), $" {left,-30}|{right}");
             y += lh;
@@ -69,6 +75,12 @@ public class FcsHud {
         string planned = t.PlannedStrikeTime > 0f ? MissionClock.Format(t.PlannedStrikeTime) : "[--:--:--]";
         char mode = t.Mode switch { ChargeMode.Tight => 'T', ChargeMode.Extra => 'X', _ => 'N' };
         return $"{planned} {t.Angle:000.0} {t.Distance:00.00}  {t.Shell}  {mode}";
+    }
+
+    /// <summary>齐射对第二行: 前导 >>>[SALVO] (10 字符, 与 [--:--:--] 同宽), 数据同首行.</summary>
+    private static string SalvoRow(FireTask t) {
+        char mode = t.Mode switch { ChargeMode.Tight => 'T', ChargeMode.Extra => 'X', _ => 'N' };
+        return $">>>[SALVO] {t.Angle:000.0} {t.Distance:00.00}  {t.Shell}  {mode}";
     }
 
     /// <summary>完成行: 抵达时刻 [HH:MM:SS] (无任务时钟 = 横线) 方位 距离 T:-剩余秒 (炮表倒计时, 与任务时钟无关).</summary>
@@ -114,8 +126,8 @@ public class FcsHud {
         var (code, name) = mode == FireMode.Manual || gun.Action >= GunAction.Trak
             ? PhaseCode(gun.Action, mode)
             : (gun.ReloadPhase() ?? PhaseCode(gun.Action, mode));
-        // 膛内/药数活读 (玩家手动装填时 HUD 实时跟, 快照会陈旧)
-        string chamber = gun.ChamberLive.Length > 0 ? gun.ChamberLive : (gun.Action == GunAction.Trak ? "----" : "NULL");
+        // 膛内/药数活读 (玩家手动装填时 HUD 实时跟, 快照会陈旧); 膛空一律 [----] (不用 NULL)
+        string chamber = gun.ChamberLive.Length > 0 ? gun.ChamberLive : "----";
         string eStr = float.IsNaN(gun.Elevation) ? "--.--" : $"{gun.Elevation:00.00}";
         string aStr = float.IsNaN(gun.Azimuth) ? "---.-" : $"{gun.Azimuth:000.0}";
         string cStr = gun.ChargesLive > 0 ? gun.ChargesLive.ToString() : "-";
