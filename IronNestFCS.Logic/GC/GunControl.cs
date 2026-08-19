@@ -43,37 +43,57 @@ public class GunControl {
     public int DesiredCharge = -1;      // -1 = 无任务
     public float DesiredElevation = float.NaN;  // 目标俯仰 (FC 持续输出, 含提前量)
     public float DesiredAzimuth = float.NaN;    // 目标方位 (FC 持续输出, 含提前量)
+    public float DesiredDistance = float.NaN;   // 目标距离 km (FC 持续输出; 锁定死区动态口径用)
 
     // ===== 状态端口 =====
     public string Chamber { get; private set; } = "";   // 膛内弹种 (实装快照)
     public int Charges { get; private set; }            // 实装药数 (实装快照)
+    /// <summary>膛内弹种活读 (显示/稳定判定用 — 玩家手动装填时快照不刷新, 活读才准).</summary>
+    public string ChamberLive { get { try { return _gun.BulletInChamber() ?? ""; } catch { return ""; } } }
+    /// <summary>实装药数活读 (显示用, 同 ChamberLive).</summary>
+    public int ChargesLive { get { try { return _gun.LoadedPowderCharges(); } catch { return 0; } } }
     public float Elevation { get; private set; } = float.NaN;      // 实际俯仰 (每帧传感器)
     public float Azimuth { get; private set; } = float.NaN;        // 实际方位回读 (每帧)
     public GunAction Action { get; private set; } = GunAction.Idle;
     public float FlyTime { get; private set; } = float.NaN;        // 飞行时间 (游戏自解: 瞄准期 PredictedImpactTime / 击发后锁存)
     public bool AllReady { get; private set; }                     // 弹药确认且追踪稳定; 不稳定回退
-    public bool Fired { get; private set; }                        // 本发已击发 (FC 收尾用)
+    public bool Fired { get; private set; }                        // 本发已击发 (GC 内部防重; 不对外 — FC 用 FlyRemaining 作击发确认)
     public bool KernelMode { get; private set; }                   // 内核态: 硬件动作执行中 (指令只记录不生效)
-    /// <summary>游戏 CANFIRE 信号 (膛内+装药+保险): 绿十字显示门槛 (1.x 同口径, 弹没装好不出落点).</summary>
+    /// <summary>游戏 CANFIRE 信号 (实测不含保险: 装填完成 — 弹+药+炮闩锁 — 未开保险即 True;
+    /// 就是"俯仰手柄解锁"的综合信号): 绿十字/落弹点显示门槛 (1.x 同口径, 弹没装好不出落点).</summary>
     public bool CanFire { get { try { return _gun.CanFire(); } catch { return false; } } }
     /// <summary>击发后游戏炮表剩余秒数 (与游戏自身飞行指示器同一数据源, 消除检测时间差); 未倒计时 NaN.</summary>
     public float FlyRemaining { get; private set; } = float.NaN;
 
     // ===== 内部 =====
-    private readonly TrackAxis _eAxis = new(0.01f, 0.1f, 0.5f);  // E: 收敛 0.01°, 变积分 0.1~0.5
-    private readonly TrackAxis _hAxis = new(0.1f, 0.3f, 1.0f);    // H: 收敛 0.1°, 变积分 0.3~1
+    private readonly TrackAxis _eAxis = new(0.05f, 0.002f, 0.05f, 2.0f, 0f, 0f, 0f, 16); // E: 纯前馈 — 游戏天顶星环无超调, 外圈修正全拆; 锁定死区 0.05° (动目标残差波动 ±0.05, 0.01 太苛刻)
+    private readonly TrackAxis _hAxis = new(0.05f, 0.002f, 0.3f, 4.0f, 0f, 0f, 0f, 16);  // H: 同上
+    // 伺服滞后外推 (游戏环一阶一型, 动目标追踪有固定相位滞后): 设定值 = 目标 + EWMA 斜率 × 外推帧数
+    private float _lastTargetE = float.NaN, _lastTargetA = float.NaN;
+    private float _slopeE = float.NaN, _slopeA = float.NaN; // EWMA 斜率 (单帧差分 × ExtrapFrames 放大解算噪声, 设定值跳)
+    private const float ExtrapFramesE = 3f;  // E 环快: 5 帧过头 (误差负漂), 3 帧
+    private const float ExtrapFramesA = 4f;  // H 环慢 (炮塔 4°/s); 5 帧实测小滞后 → 4
+    private const float SlopeAlphaE = 0.3f;  // E 斜率平滑
+    private const float SlopeAlphaA = 0.5f;  // H 斜率平滑加大 (过最近点角速度急变段跟快点)
     private object? _loopHandle;
     private object? _taskHandle;
-    private float _eStable;
-    private float _hStable;
     private float _latchedFlyTime = float.NaN; // 击发后锁存总飞时
-    private string _lastStateKey = "";         // 装填状态码变化检测 (诊断用, 定位完删)
-    private float _lastLoadDiag;               // CanFire 不置位诊断节流 (定位完删)
+    private bool _lastHasFired;                // pendingReload 上升沿检测 (击发自检)
+    private bool? _lastCanFire;                // CanFire 沿检测 (装填完成 → 击发沿复位)
+    private bool _impactFlying;                // 落点指示器飞行中 (GC 持续传导倒计时剩余)
+    private bool _sawCountdown;                // 已见过倒计时真值 (落地判定: 见过后又 NaN = 落地)
+    private float _impactFiredAt;              // 击发确认时刻 (倒计时未启动兜底)
     private bool _disposed;
 
-    // 实时弹道指示器 push 目标 (FcsModule 注入 DC 回调): (瞄准点, 杀伤圈, 弹种)
-    public delegate void BallisticPush(LeftRight side, float aimX, float aimY, float killRadiusKm, int bulletType);
+    // 实时弹道指示器 push 目标 (FcsModule 注入 DC 回调; GC 全权): (瞄准点, 杀伤圈, 弹种, AllReady, 飞时)
+    public delegate void BallisticPush(LeftRight side, float aimX, float aimY, float killRadiusKm, int bulletType, bool ready, float flyTime);
     public BallisticPush? OnBallisticPush;
+
+    // ===== GC → DC: 落点指示器 (FcsModule 注入 DC 回调) =====
+    /// <summary>击发确认 (锁存总飞时已取到): DC 画落点线 — 落点 = GC 冻结的开火前最后瞄准点 (板面坐标, 开火后游戏把标记拉回铁巢, 必须 GC 侧冻结).</summary>
+    public System.Action<LeftRight, float, float, BulletType, float>? OnImpactFired;
+    /// <summary>飞行期间持续传导游戏倒计时剩余 (与游戏指示器逐帧同步); 0 = 落地隐藏.</summary>
+    public System.Action<LeftRight, float>? OnImpactRemain;
 
     /// <summary>齐射对端 (SyncCommand 时相位级同步互相等; 对炮 FALL → 本炮也 FALL 防陪死).</summary>
     public GunControl? SyncPeer;
@@ -112,26 +132,78 @@ public class GunControl {
         while (!_disposed) {
             yield return new WaitForSeconds(0.04f);
             ReadSensors();                     // 每帧: 俯仰/方位/飞时 (传感器值不受动作影响)
-            // 装填状态码诊断 (定位完删): 游戏状态机 stateKey 变化才打 — 玩家手动装填也能抓, 不用跑 mod 动作
-            var stateKey = _gun.ReloadStateKey() ?? "<null>";
-            if (stateKey != _lastStateKey) {
-                _lastStateKey = stateKey;
-                MelonLogger.Msg($"[GC] {_side}: reloadState '{stateKey}'");
+            // 锁定死区动态口径 (弹道学): 落点偏移 ≤ 混凝土弹 (DRIL) 杀伤半径 / 5 → δ(°) = (R/5)/d × 57.3
+            // 近距离放宽 远距离收紧; clamp 防病态 (R=0.07 km 见 GameInternals.md)
+            if (!float.IsNaN(DesiredDistance) && DesiredDistance > 0f) {
+                float db = ShellData.KillRadiusKm(BulletType.DRIL) / 5f / DesiredDistance * Mathf.Rad2Deg;
+                db = Mathf.Clamp(db, 0.02f, 0.3f);
+                _eAxis.LockDeadband = db;
+                _hAxis.LockDeadband = db;
             }
-            if (ManualControl) {               // 手动: 立即停手, 残局交玩家, 线程照跑
+            // 实时弹道指示器 (GC 全权 push, 与 FC 解算/任务/手动无关): 内部按 CanFire 门控 (装填完成即显示)
+            PushBallistic();
+            // 装填完成 (CanFire 上升沿): 击发沿基准复位 — 手动连打多发时每发都是新的击发事件
+            var cf = _gun.CanFire();
+            if (cf != _lastCanFire) {
+                if (cf) {
+                    Fired = false;
+                    _lastHasFired = false;
+                    _latchedFlyTime = float.NaN;
+                }
+                _lastCanFire = cf;
+            }
+            // 击发自检 (手动/自动通用, 不依赖 FC): pendingReload 上升沿 + 膛空 (CanFire 已掉) = 开火瞬间 →
+            // 锁存炮表真值 + 通知 DC 画落点线; 手动开火 (无 FC 收尾) 同样出飞行轨迹
+            bool firedNow = _gun.HasFired();
+            if (firedNow && !_lastHasFired && !Fired && !cf) {
+                Fired = true; // 内部防重 (不对外 — FC 用 FlyRemaining 作击发确认)
+                var sw = _gun.StopwatchLatch();
+                if (sw.HasValue && sw.Value.travelTime > 0.01f) _latchedFlyTime = sw.Value.travelTime;
+                else _latchedFlyTime = FlyTime; // 倒计时未启动 (fireDelay): 瞄准期预测值兜底
+                FlyTime = _latchedFlyTime;      // 击发后: 锁存真值 (瞄准期活读停更, 下一帧 ReadSensors 走 else)
+                // 弹种: 最后非空膛内弹 (击发瞬间膛已空, 活读拿不到 — 开火按最后一次落点指示走); 兜底 DesiredShell
+                BulletType firedShell = System.Enum.TryParse<BulletType>(_lastChamberLive, out var fb) ? fb : DesiredShell;
+                _impactFlying = true;
+                _sawCountdown = false;
+                _impactFiredAt = Time.time;
+                OnImpactFired?.Invoke(_side, _lastAimLive.x, _lastAimLive.y, firedShell, _latchedFlyTime);
+            }
+            _lastHasFired = firedNow;
+            // 飞行期间: 持续传导游戏倒计时剩余 (与游戏指示器同步); 落地 (已见过倒计时后变 NaN) 传 0 隐藏
+            if (_impactFlying) {
+                float r = _gun.CountdownRemainingSeconds();
+                if (!float.IsNaN(r) && r > 0f) {
+                    _sawCountdown = true;
+                    OnImpactRemain?.Invoke(_side, r);
+                }
+                else if (_sawCountdown && float.IsNaN(r)) {
+                    _impactFlying = false;
+                    OnImpactRemain?.Invoke(_side, 0f);
+                }
+                else if (!_sawCountdown && Time.time - _impactFiredAt > 3f) {
+                    _impactFlying = false; // 表没绑/倒计时没启动: 兜底结束 (DC 侧本地计时兜底进度)
+                }
+            }
+            if (ManualControl) {               // 手动: 立即停手, 残局交玩家, 线程照跑 (落点指示不受手动影响 — 已在上方 push)
                 TryStop(_taskHandle);
                 _taskHandle = null;
                 KernelMode = false;
                 AllReady = false;
                 Action = GunAction.Idle;
                 SalvoActive = false;
-                PushBallistic(-1);             // 弹种 -1 = 未就绪不渲染
                 continue;
             }
-            // 方位追踪不受装弹影响: 被选中即全程追 (从派发起, 不等 LOAD/TRAK)
-            if (AzimuthSelect && !float.IsNaN(DesiredAzimuth) && !float.IsNaN(Azimuth)) {
-                float hCorr = _hAxis.Step(Mathf.DeltaAngle(Azimuth, DesiredAzimuth), FcsBus.TurretVelRead?.Invoke() ?? 0f, Azimuth);
-                if (!_hAxis.GaveUp && FcsBus.TurretSet != null) FcsBus.TurretSet(DesiredAzimuth + hCorr);
+            // 方位追踪不受装弹影响: 被选中即全程追 (从派发起, 不等 LOAD/TRAK).
+            // 齐射: 右炮 DesiredX 输入忽略, 按左炮数据走 (前向接口规范; 同任务解算相同, 语义对齐)
+            float desiredA = DesiredAzimuth;
+            if (SyncCommand && SyncPeer != null && _side == LeftRight.Right) desiredA = SyncPeer.DesiredAzimuth;
+            if (AzimuthSelect && !float.IsNaN(desiredA) && !float.IsNaN(Azimuth)) {
+                // 伺服滞后外推 (同 E): 设定值 = 目标 + EWMA 斜率 × ExtrapFrames
+                float rawSlopeA = float.IsNaN(_lastTargetA) ? 0f : desiredA - _lastTargetA;
+                _lastTargetA = desiredA;
+                _slopeA = float.IsNaN(_slopeA) ? rawSlopeA : _slopeA + SlopeAlphaA * (rawSlopeA - _slopeA);
+                float hCorr = _hAxis.Step(Mathf.DeltaAngle(Azimuth, desiredA), Azimuth);
+                if (!_hAxis.GaveUp && FcsBus.TurretSet != null) FcsBus.TurretSet(desiredA + _slopeA * ExtrapFramesA + hCorr);
             }
             if (DesiredCharge < 0) SalvoActive = false; // 任务撤了/完成了: 导演标志复位, 下次派发才能重启
             if (_taskHandle == null) {
@@ -142,6 +214,7 @@ public class GunControl {
                 }
                 if (DesiredShell != (BulletType)(-1) && DesiredCharge >= 0 && !SalvoActive) {
                     RefreshSnapshot();         // 任务上炮: 边界读实装快照
+                    ResetForTask();            // 追之前清 PID 缓存 (链内开头也有, 这里提前到起链帧 — H 轴派发帧已开追)
                     if (SyncCommand && SyncPeer != null) {
                         // 齐射: 左炮启动导演 (一条协程带两炮), 右炮登记同一句柄不自己起链
                         if (_side == LeftRight.Left) {
@@ -201,6 +274,9 @@ public class GunControl {
         AllReady = false;
         Fired = false;
         _latchedFlyTime = float.NaN;
+        _lastHasFired = false;        // 残留的击发沿不许带到下个任务
+        _impactFlying = false;
+        _sawCountdown = false;
         _eAxis.ResetForTask();
         _hAxis.ResetForTask();
     }
@@ -227,7 +303,7 @@ public class GunControl {
             // PWDR 拉杆只改"选药" (实装不变), 必须接 LOAD 推药入膛再回决策, 否则 loaded 永远 0 死循环
             return new SalvoStep { Action = GunAction.Pwdr, Deadline = 45f, Routine = PwdrLoadStep };
         }
-        // 弹对+药对 = 装填完成 (CanFire 含保险, 装填段不卡它 — 保险由 FC 在 TRAK 段解, 1.x 口径)
+        // 弹对+药对 = 装填完成 (比 CanFire 更精细的实装校验; CanFire 实测不含保险本可直接用, 但弹药逐项对号更稳)
         return null; // 弹药就绪
     }
 
@@ -256,28 +332,26 @@ public class GunControl {
             case "RamCharges":
             case "CloseShellGuide":
             case "FinalSequence": return ("2-4", "LOAD"); // 推药+收尾 (1.x WaitLoading 口径)
-            case "BreachLocked": return ("2-5", "COFM");  // 炮闩锁定 (1.x 装填确认, 一闪而过)
+            case "BreachLocked": return ManualControl ? null : ("2-5", "COFM"); // 炮闩锁定 (1.x 装填确认, 一闪而过); 手动: 跳过 2-5 确认 (玩家自己装填, mod 不确认)
             default: return null;
         }
     }
 
     /// <summary>3-1 TRAK: 持续追踪直到击发 (FC 击发或玩家); 任务被撤 (DesiredCharge<0) 退出不开火.
-    /// 击发判定看 pendingReload (HasFired): 击发后天然切 REST — CanFire 含保险, TRAK 期保险未解恒 false, 不能当击发信号.</summary>
+    /// 击发判定看 pendingReload (HasFired): 击发瞬间置位最准 — CanFire 是装填完成信号 (不含保险),
+    /// 击发后膛空也会掉, 时序上比 pendingReload 晚, 不能当击发信号.</summary>
     internal IEnumerator RunTrak() {
         Action = GunAction.Trak;
-        yield return new WaitForSeconds(0.5f); // 装填机构停稳再追 (开头仰角杆不鬼畜)
+        // 装填机构停稳 + 炮管运动停止再追 (装填完炮管有回落动作, 追早了对摇杆打架 → 鬼畜);
+        // 不看码 (BreachLocked 一闪而过), 用机构信号 + 小缓冲
+        yield return _gun.WaitForReloadReady();
+        yield return new WaitForSeconds(0.3f);
         while (!_disposed) {
             if (ManualControl || DesiredCharge < 0) yield break;
             yield return new WaitForSeconds(0.04f);
             if (!TrackOnce()) continue; // 本帧追踪推进 (AllReady 内部维护)
-            if (_gun.HasFired()) break; // 击发 (pendingReload) → 天然切 REST; CanFire 含保险, TRAK 期保险未解恒 false, 不能当击发信号
+            if (_gun.HasFired()) break; // 击发 (pendingReload) → 天然切 REST (锁存/落点通知由常驻 Loop 击发自检做)
         }
-        if (_gun.HasFired() && !Fired) {
-            Fired = true;
-            var sw = _gun.StopwatchLatch();
-            if (sw.HasValue && sw.Value.travelTime > 0.01f) _latchedFlyTime = sw.Value.travelTime;
-        }
-        FlyTime = _latchedFlyTime; // 击发后: 锁存真值供 FC 落点计时
     }
 
     /// <summary>3-3 REST 复位 → IDLE; AllReady 一并清 (防残留误导下个任务装填期).</summary>
@@ -288,17 +362,42 @@ public class GunControl {
     }
 
     /// <summary>TRAK 单帧推进: E 恒追 (TrackAxis 天顶星伺服 = 设 1 帧预测目标 + 修正);
-    /// H 仅在被 AzimuthSelect 选中时追. 双轴稳定 + 弹药确认 → AllReady; 不稳定即回退.</summary>
+    /// H 仅在被 AzimuthSelect 选中时追. 双轴稳定 + 弹药确认 → AllReady; 不稳定即回退.
+    /// 齐射: 右炮跟随左炮设置 (按左炮数据走, 游戏内齐射联动) — 右炮 DesiredX 输入忽略, E 不单独控制 PID,
+    /// 直接设左炮的设定值; 锁定判定 = 右炮实际仰角跟上目标 (死区内).</summary>
     private bool TrackOnce() {
+        float targetE = DesiredElevation;
+        float targetA = DesiredAzimuth;
+        if (SyncCommand && SyncPeer != null && _side == LeftRight.Right) { targetE = SyncPeer.DesiredElevation; targetA = SyncPeer.DesiredAzimuth; }
         bool eLock = false;
-        if (!float.IsNaN(DesiredElevation)) {
-            float corr = _eAxis.Step(DesiredElevation - Elevation, _gun.ElevationVelocity(), Elevation);
-            if (!_eAxis.GaveUp) _gun.SetElevationValue(DesiredElevation + corr);
-            eLock = _eAxis.Locked;
+        if (!float.IsNaN(targetE)) {
+            // 伺服滞后外推: 设定值 = 目标 + 帧间变化率 × ExtrapFrames (动目标相位滞后补偿);
+            // 斜率 EWMA 平滑 (单帧差分 × ExtrapFrames 放大解算噪声, 设定值跳 → 掉锁)
+            float rawSlopeE = float.IsNaN(_lastTargetE) ? 0f : targetE - _lastTargetE;
+            _lastTargetE = targetE;
+            _slopeE = float.IsNaN(_slopeE) ? rawSlopeE : _slopeE + SlopeAlphaE * (rawSlopeE - _slopeE);
+            float setTarget = targetE + _slopeE * ExtrapFramesE;
+            if (SyncCommand && SyncPeer != null && _side == LeftRight.Right) {
+                // 齐射右炮: 跟随左炮设定值, 不跑自己的 PID
+                float set = !float.IsNaN(SyncPeer.LastElevationSet) ? SyncPeer.LastElevationSet : setTarget;
+                _gun.SetElevationValue(set);
+                LastElevationSet = set;
+                eLock = Mathf.Abs(Elevation - targetE) <= _eAxis.Deadband;
+            }
+            else {
+                float corr = _eAxis.Step(targetE - Elevation, Elevation);
+                if (!_eAxis.GaveUp) _gun.SetElevationValue(setTarget + corr);
+                LastElevationSet = setTarget + corr;
+                eLock = _eAxis.Locked;
+            }
         }
-        bool hLock = !AzimuthSelect || _hAxis.Locked; // 未被选中不算; 选中时 H 稳定态由常驻循环的 _hAxis 维护 (方位全程追)
-        bool ammoReady = Chamber == DesiredShell.ToString()
-            && (!SyncCommand ? Charges >= DesiredCharge : Charges == DesiredCharge);
+        // 选中: H 稳定态由常驻循环的 _hAxis 维护; 未选中: 炮塔归另一炮 — 等炮塔转到本炮目标方位 (死区内) 才算稳,
+        // 不然两炮不同任务时未选中炮 H 没对准也报 AllReady, FC 会打飞
+        bool hLock = AzimuthSelect ? _hAxis.Locked
+            : float.IsNaN(targetA) || Mathf.Abs(Mathf.DeltaAngle(Azimuth, targetA)) <= _hAxis.Deadband;
+        // 弹药判定活读 (TRAK 期机构稳定, 活读可信; 玩家介入时快照可能陈旧)
+        bool ammoReady = _gun.BulletInChamber() == DesiredShell.ToString()
+            && (!SyncCommand ? _gun.LoadedPowderCharges() >= DesiredCharge : _gun.LoadedPowderCharges() == DesiredCharge);
         AllReady = ammoReady && eLock && hLock; // 任一不稳 → 回退
         return Fired || _gun.HasFired();
     }
@@ -358,6 +457,13 @@ public class GunControl {
 
     /// <summary>SHRD 选弹: 转弹仓到目标弹位 (未推弹前可改).</summary>
     private IEnumerator ShrdRoutine() {
+        // 空膛转弹仓前: 等残留实装计数清零 (上一发击发后的自动循环; 1.x 同款) —
+        // 炮闩打开后机构还要 ~3s 复位, 计数清零才算复位完, 光看炮闩打开就转弹仓会过早点击
+        float waitLoaded = 0f;
+        while (_gun.LoadedPowderCharges() > 0 && waitLoaded < 10f) {
+            yield return new WaitForSeconds(0.5f);
+            waitLoaded += 0.5f;
+        }
         yield return _gun.RotateCylinderTo(DesiredShell);
         yield return new WaitForSeconds(0.5f); // 转完等弹仓列表刷新再确认
         RefreshSnapshot();
@@ -405,7 +511,7 @@ public class GunControl {
     }
 
     /// <summary>LOAD 装填: 按装填钮 (药拉够后激活, 游戏据此推药入膛) + 实装确认 (2-5 COFM 弹对药对+炮闩锁).
-    /// CanFire 不卡 (含保险, 保险由 FC 在 TRAK 段解).</summary>
+    /// 不卡 CanFire: 实测不含保险 (装完未开保险即 True) 本可直接等, 但逐项实装校验对号更稳.</summary>
     private IEnumerator LoadRoutine() {
         yield return _gun.RamPowder(); // 机构停稳 + 等装填钮激活点击
         float waited = 0f;
@@ -415,11 +521,6 @@ public class GunControl {
             bool shellOk = _gun.BulletInChamber() == DesiredShell.ToString();
             bool powderOk = SyncCommand ? _gun.LoadedPowderCharges() == DesiredCharge : _gun.LoadedPowderCharges() >= DesiredCharge;
             if (shellOk && powderOk && _gun.ReloadStateAtOrAfter("BreachLocked")) break;
-            // COFM 卡住诊断 (定位完删)
-            if (Time.time - _lastLoadDiag > 2f) {
-                _lastLoadDiag = Time.time;
-                MelonLogger.Msg($"[GC] {_side}: COFM wait — shell='{_gun.BulletInChamber()}' loaded={_gun.LoadedPowderCharges()} need={DesiredCharge} state='{_gun.ReloadStateKey()}'");
-            }
             yield return new WaitForSeconds(0.5f);
             waited += 0.5f;
         }
@@ -466,9 +567,37 @@ public class GunControl {
         yield return _gun.WaitBackToIdle();
     }
 
-    /// <summary>每帧 push 实时弹道指示器数据给 DC (开火前的绿色瞄准十字/LR; 弹种 -1 = 未就绪不渲染).</summary>
-    private void PushBallistic(int bulletType) {
-        OnBallisticPush?.Invoke(_side, 0f, 0f, 0f, bulletType); // 瞄准点/杀伤圈坐标由 DC 渲染线程按 FC 数据画, GC 只出就绪态
+    private Transform? _impact; // 游戏实时落点标记 (绿十字跟它走, 1.x 同款; GC 全权)
+    /// <summary>本炮最近一次仰角设定值 (齐射右炮跟随左炮设置用 — 右炮直接设左炮的 PID 输出).</summary>
+    public float LastElevationSet = float.NaN;
+    private string _lastChamberLive = ""; // 最后非空膛内弹活读 (击发瞬间膛已空, 弹种用它 — 开火按最后一次落点指示走)
+    private Vector2 _lastAimLive;         // CanFire 期间每帧更新的瞄准点 (板面坐标; 击发瞬间冻结 — 开火后游戏把落点标记拉回铁巢, 不能跟进)
+    private bool _hasAimLive;
+
+    /// <summary>每帧 push 实时弹道指示器数据给 DC (GC 全权: 瞄准点/杀伤圈/弹种/AllReady/飞时).
+    /// 瞄准点每帧都传真实值 (弹种 -1 只管绿十字显隐, DC 侧瞄准点缓存必须跟着炮走 —
+    /// 击发瞬间 CanFire 已掉, 落点线终点 = 开火前最后有效瞄准点).
+    /// 弹种 = CanFire 门控 (实测不含保险: 装填完成 — 弹+药+炮闩锁 — 未开保险即 True),
+    /// 不跟任务/相位走 — F9 后/无任务时膛内有弹也显示 (弹种读膛内实弹活读).</summary>
+    private void PushBallistic() {
+        if (_impact == null)
+            _impact = GameObject.Find(_side == LeftRight.Left ? "GunLeft_ImpactMarker" : "GunRight_ImpactMarker")?.transform;
+        if (_impact == null) return;
+        // 膛内弹种活读 (不读 Chamber 快照 — 手动态快照不刷新; 显示信号无"动作中不可信"问题)
+        string chamber = _gun.BulletInChamber() ?? "";
+        if (chamber.Length > 0) _lastChamberLive = chamber; // 缓存最后非空膛内弹
+        BulletType shell = !CanFire ? (BulletType)(-1)
+            : System.Enum.TryParse<BulletType>(chamber, out var b) ? b : (BulletType)(-1);
+        var g = _impact.localPosition; // 游戏网格坐标 → 板面 (1.x: MapBottomLeft + grid × MapCellSize)
+        float bx = GeoMap.MapBottomLeft.x + g.x * GeoMap.MapCellSize;
+        float by = GeoMap.MapBottomLeft.y + g.y * GeoMap.MapCellSize;
+        if (CanFire) { // 只在装填完成期间跟进 — 击发后游戏把标记拉回铁巢, 冻结住开火前最后落点
+            _lastAimLive = new Vector2(bx, by);
+            _hasAimLive = true;
+        }
+        OnBallisticPush?.Invoke(_side,
+            bx, by,
+            shell >= 0 ? ShellData.KillRadiusKm(shell) : 0f, (int)shell, AllReady, FlyTime);
     }
 
     // ===== 齐射导演接口 (SalvoDirector 驱动两门炮, 1.x 单协程带双炮同款) =====

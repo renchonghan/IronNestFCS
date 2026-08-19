@@ -828,8 +828,8 @@ public class FSC
                     task.progress = Progress.Aiming;
                     MarkProgress(leftRight, Progress.Aiming);
                     {
-                        var eAxis = new TrackAxis(0.01f, 0.1f, 0.5f); // E 收敛标准 0.01°, 变积分 0.1~0.5
-                        var aAxis = new TrackAxis(0.1f, 0.3f, 1.0f);  // H 收敛标准 0.1°, 变积分 0.3~1
+                        var eAxis = new TrackAxis(0.01f, 0.002f, 0.05f, 2.0f, 0f, 0.2f, 10f, 16); // E 收敛标准 0.01°, 变积分 0.1~0.5
+                        var aAxis = new TrackAxis(0.01f, 0.002f, 0.3f, 4.0f, 0f, 0.2f, 10f, 16);  // H 收敛标准 0.1°, 变积分 0.3~1
                         bool armed = false;
                         bool confirmStarted = false;
                         while (true) {
@@ -1051,9 +1051,9 @@ public class FSC
         // 3-1~3-3 SALVO TRAK 合并: 双炮持续追踪同一目标 (trackX 取主任务), 双炮都套上并稳定 → 五步确认 + 双炮 Arm → AutoFire 立即击发 / 手动等击发
         MarkSalvo(leader, follower, Progress.Aiming);
         {
-            var eAxisL = new TrackAxis(0.01f, 0.1f, 0.5f); // E 收敛标准 0.01°, 变积分 0.1~0.5
-            var eAxisR = new TrackAxis(0.01f, 0.1f, 0.5f);
-            var aAxis = new TrackAxis(0.1f, 0.3f, 1.0f);   // H 收敛标准 0.1°, 变积分 0.3~1
+            var eAxisL = new TrackAxis(0.01f, 0.002f, 0.05f, 2.0f, 0f, 0.2f, 10f, 16); // E 收敛标准 0.01°, 变积分 0.1~0.5
+            var eAxisR = new TrackAxis(0.01f, 0.002f, 0.05f, 2.0f, 0f, 0.2f, 10f, 16);
+            var aAxis = new TrackAxis(0.01f, 0.002f, 0.3f, 4.0f, 0f, 0.2f, 10f, 16);   // H 收敛标准 0.1°, 变积分 0.3~1
             bool armed = false;
             bool confirmStarted = false;
             while (true) {

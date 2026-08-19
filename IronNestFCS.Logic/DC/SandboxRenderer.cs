@@ -20,7 +20,7 @@ public class SandboxRenderer {
 
     // ===== 3D 指示器状态 =====
     private readonly Dictionary<GameObject, QueueIndicator> _queueMarks = new();
-    private readonly List<ImpactIndicator> _impacts = new();
+    private readonly Dictionary<LeftRight, ImpactIndicator> _impacts = new(); // 恒定实体: 每炮一套 (虚线/实线/点), 不用就隐藏
     private readonly Dictionary<GameObject, GameObject> _icons = new();
     private readonly Dictionary<LeftRight, BallisticMark> _ballistic = new();
 
@@ -29,9 +29,9 @@ public class SandboxRenderer {
 
     // 层级偏移量 (相对板面 z=0, 越负越浮): 所有标记一律挂板面 —
     // 游戏大地图在实体层上堆叠照片 (改透明度), 挂实体的东西会被盖淡/消失, 只能挂板面.
-    private const float GreenOffset = 0f;  // 绿十字+瞄准圈
-    private const float ImpactOffset = 0.001f;  // 落点指示器 (红线/红点/圈/字)
-    private const float RedOffset = 0.002f;     // 红杀伤圈+编号+弹种标签+预瞄线+实体图标
+    private const float GreenOffset = -0.0105f;  // 绿十字+瞄准圈
+    private const float ImpactOffset = -0.01f;  // 落点指示器 (红线/红点/圈/字)
+    private const float RedOffset = -0.005f;     // 红杀伤圈+编号+弹种标签+预瞄线+实体图标
     private const float SurfScale = 0.212f / 0.81f; // 实体单位 → 板面单位 (实体世界缩放 / 板面世界缩放)
 
     public void Start() {
@@ -70,7 +70,7 @@ public class SandboxRenderer {
     public void ClearAll() {
         foreach (var m in _queueMarks.Values) { DestroyRoot(m.Root); DestroyRoot(m.LineRoot); }
         _queueMarks.Clear();
-        foreach (var i in _impacts) DestroyRoot(i.Root);
+        foreach (var i in _impacts.Values) DestroyRoot(i.Root);
         _impacts.Clear();
         foreach (var go in _icons.Values) DestroyRoot(go);
         _icons.Clear();
@@ -153,7 +153,7 @@ public class SandboxRenderer {
             }
         }
         // 飞行时间 (炮给的, 瞄准期实时自解): 十字下端居中, 两位数字, 与弹种标签同字号; NaN 不显示
-        string ft = float.IsNaN(flyTime) ? "" : Mathf.RoundToInt(flyTime).ToString("00");
+        string ft = float.IsNaN(flyTime) ? "" : Mathf.FloorToInt(flyTime).ToString("00"); // 舍小数点 (0.x 算 0, 不四舍五入)
         if (ft != mark.FlyText) {
             mark.FlyText = ft;
             ClearChildren(mark.FlyRoot.transform);
@@ -288,20 +288,26 @@ public class SandboxRenderer {
             }
         }
         // 预瞄线 (旧版 BuildTargetLine 同款: 游戏 Dashed=true, 厚 0.006, 纯绿; 只画在炮任务上)
-        // LineRoot 直接挂板面 (落点层), 线 z=0 即可
-        ClearChildren(mark.LineRoot.transform);
+        // LineRoot 直接挂板面 (落点层), 线 z=0 即可; 恒定实体: 建一次, 不用就隐藏 —
+        // LineRoot 每帧跟实体走, 线局部端点随 LineRoot 平移不变, 每次重建是浪费 (Destroy 延迟还瞬态堆积)
         if (drawLine && NestRef != null) {
+            if (mark.TargetLine == null) {
+                var go = new GameObject("FCS2_TargetLine");
+                go.transform.SetParent(mark.LineRoot.transform, false);
+                mark.TargetLine = go.AddComponent<Il2CppShapes.Line>();
+                mark.TargetLine.Thickness = 0.006f;
+                mark.TargetLine.Dashed = true;
+                mark.TargetLine.Color = Color.green;
+                mark.TargetLine.ColorStart = Color.green;
+                mark.TargetLine.ColorEnd = Color.green;
+            }
             var nest = (Vector2)MapSurfaceRef.InverseTransformPoint(NestRef.position) - entityBoard;
-            var go = new GameObject("FCS2_TargetLine");
-            go.transform.SetParent(mark.LineRoot.transform, false);
-            var line = go.AddComponent<Il2CppShapes.Line>();
-            line.Thickness = 0.006f;
-            line.Dashed = true;
-            line.Color = Color.green;
-            line.ColorStart = Color.green;
-            line.ColorEnd = Color.green;
-            line.Start = new Vector3(nest.x, nest.y, 0f);
-            line.End = Vector3.zero;
+            mark.TargetLine.Start = new Vector3(nest.x, nest.y, 0f);
+            mark.TargetLine.End = Vector3.zero;
+            mark.TargetLine.gameObject.SetActive(true);
+        }
+        else if (mark.TargetLine != null && mark.TargetLine.gameObject.activeSelf) {
+            mark.TargetLine.gameObject.SetActive(false); // 不在炮任务: 隐藏 (恒定实体)
         }
     }
 
@@ -315,48 +321,61 @@ public class SandboxRenderer {
         }
     }
 
-    /// <summary>炮弹落点指示器 (FC 击发时调用一次): 红色落点 + 杀伤圈, 下面计时, 弹种在编号位 (队列时 L-X 的位置);
+    /// <summary>炮弹落点指示器 (GC 击发确认时调用一次): 红色落点 + 杀伤圈, 下面计时, 弹种在编号位 (队列时 L-X 的位置);
     /// 红线 (全红): 虚线固定 (全长弹道) + 实线逐渐缩短 (未飞段) + 实心红点 (弹头).
-    /// 飞行时长结束后自动销毁. 齐射两发 = 各建一个 (落点相同也分开建).
-    /// remainingSource = 游戏炮表剩余秒数 (与游戏自身飞行指示器同一数据源, 消除检测时间差); null 退回 Time.time 计时.</summary>
-    public void CreateImpact(Vector3 impactWorld, BulletType shell, float flightTime, System.Func<float>? remainingSource = null) {
+    /// 落点 = 开火瞬间的瞄准点缓存 (GC 口径: 落弹点就是 GC 传给 DC 的落弹点, 不另传坐标).
+    /// 恒定实体: 每炮一套 (6 个根), 击发时重画激活, 飞行结束隐藏 — 不新建不销毁.
+    /// 剩余时间由 GC 持续传导 (游戏倒计时真值, 与游戏指示器同步); DC 侧本地计时兜底.</summary>
+    public void ImpactFired(LeftRight side, float aimX, float aimY, BulletType shell, float flightTime) {
         if (MapSurfaceRef == null || NestRef == null) return;
-        var root = new GameObject("FCS2_ImpactIndicator");
-        root.transform.SetParent(MapSurfaceRef, false);
-        var im = new ImpactIndicator {
-            Root = root,
-            ImpactBoard = (Vector2)MapSurfaceRef.InverseTransformPoint(impactWorld),
-            NestBoard = (Vector2)MapSurfaceRef.InverseTransformPoint(NestRef.position),
-            Shell = shell,
-            FlightTime = Mathf.Max(flightTime, 0.01f),
-            CreatedAt = Time.time,
-            RemainingSource = remainingSource,
-        };
-        // 落点坐标诊断 (定位完删): 板面域 x∈[-2.62,2.62] y∈[-1.37,1.25]
-        MelonLogger.Msg($"[DC] impact world=({impactWorld.x:F2},{impactWorld.y:F2},{impactWorld.z:F2}) nestWorld=({NestRef.position.x:F2},{NestRef.position.y:F2},{NestRef.position.z:F2}) surfPos=({MapSurfaceRef.position.x:F2},{MapSurfaceRef.position.y:F2},{MapSurfaceRef.position.z:F2}) scale={MapSurfaceRef.lossyScale.x:F3} → board=({im.ImpactBoard.x:F2},{im.ImpactBoard.y:F2}) nestBoard=({im.NestBoard.x:F2},{im.NestBoard.y:F2})");
-        im.FixedRoot = new GameObject("FCS2_ImpactFixed");
-        im.SolidRoot = new GameObject("FCS2_ImpactSolid");
-        im.DotRoot = new GameObject("FCS2_ImpactDot");
-        im.CircleRoot = new GameObject("FCS2_ImpactCircle");
-        im.TimerRoot = new GameObject("FCS2_ImpactTimer");
-        im.BulletRoot = new GameObject("FCS2_ImpactBullet");
-        foreach (var c in new[] { im.FixedRoot, im.SolidRoot, im.DotRoot, im.CircleRoot, im.TimerRoot, im.BulletRoot })
-            c.transform.SetParent(root.transform, false);
-        // 红线/红点挂 ImpactOffset 同层 (圈/字在各自动作里单独设 z, 这里只抬线层)
-        foreach (var c in new[] { im.FixedRoot, im.SolidRoot, im.DotRoot })
-            c.transform.localPosition = new Vector3(0f, 0f, ImpactOffset);
-        // 虚线固定 (全长弹道; 线宽与绿虚线一致 0.006)
+        var board = new Vector2(aimX, aimY); // 落点 = GC 冻结的开火前最后瞄准点 (开火后游戏把标记拉回铁巢, DC 侧缓存不可靠)
+        // 边界检查: 落点出地图 (向外扩一小格) 不显示指示器 — 落点打到板外时红线别飞出火控台
+        float x0 = GeoMap.MapBottomLeft.x - GeoMap.MapCellSize;
+        float x1 = GeoMap.MapBottomLeft.x + 20f * GeoMap.MapCellSize + GeoMap.MapCellSize;
+        float y0 = GeoMap.MapBottomLeft.y - GeoMap.MapCellSize;
+        float y1 = GeoMap.MapBottomLeft.y + 10f * GeoMap.MapCellSize + GeoMap.MapCellSize;
+        if (board.x < x0 || board.x > x1 || board.y < y0 || board.y > y1) return;
+        if (!_impacts.TryGetValue(side, out var im) || im.Root == null) {
+            im = new ImpactIndicator { Root = new GameObject("FCS2_ImpactIndicator") };
+            im.Root.transform.SetParent(MapSurfaceRef, false);
+            im.FixedRoot = new GameObject("FCS2_ImpactFixed");
+            im.SolidRoot = new GameObject("FCS2_ImpactSolid");
+            im.DotRoot = new GameObject("FCS2_ImpactDot");
+            im.CircleRoot = new GameObject("FCS2_ImpactCircle");
+            im.TimerRoot = new GameObject("FCS2_ImpactTimer");
+            im.BulletRoot = new GameObject("FCS2_ImpactBullet");
+            foreach (var c in new[] { im.FixedRoot, im.SolidRoot, im.DotRoot, im.CircleRoot, im.TimerRoot, im.BulletRoot })
+                c.transform.SetParent(im.Root.transform, false);
+            // 红线/红点挂 ImpactOffset 同层 (圈/字在各自动作里单独设 z, 这里只抬线层)
+            foreach (var c in new[] { im.FixedRoot, im.SolidRoot, im.DotRoot })
+                c.transform.localPosition = new Vector3(0f, 0f, ImpactOffset);
+            // 实心红点 (圆画在局部原点, 后续移动父级位置即可, 只建一次)
+            FillDot(im.DotRoot.transform, Vector2.zero, 0.012f, Color.red);
+            _impacts[side] = im;
+        }
+        // 每发重画/重置 (弹道终点/弹种可能变)
+        im.ImpactBoard = board;
+        im.NestBoard = (Vector2)MapSurfaceRef.InverseTransformPoint(NestRef.position);
+        im.Shell = shell;
+        im.FlightTime = Mathf.Max(flightTime, 0.01f);
+        im.CreatedAt = Time.time;
+        im.FlightRemain = float.NaN; // 等 GC 传导倒计时真值
+        im.LastShownSecond = -1;
+        ClearChildren(im.FixedRoot.transform);
         DashedLine(im.FixedRoot.transform, im.NestBoard, im.ImpactBoard, 0.006f, Color.red, 0.05f, 0.03f);
-        // 红落点圈 (弹种杀伤半径)
-        float rKm = ShellData.KillRadiusKm(shell);
-        RebuildCircle(im.CircleRoot.transform, rKm, 0f, Color.red, solid: shell == BulletType.DRIL, pierce: IsArmorPierce(shell),
+        // 实线缓存作废: 下一帧 UpdateImpacts 按新弹道重建 (起点=炮口, 终点=新落点)
+        if (im.SolidLine != null) { try { UnityEngine.Object.Destroy(im.SolidLine.gameObject); } catch { } im.SolidLine = null; }
+        // 红落点圈 (弹种杀伤半径, 随弹种)
+        float rKm = ShellData.KillRadiusKm(im.Shell);
+        RebuildCircle(im.CircleRoot.transform, rKm, 0f, Color.red, solid: im.Shell == BulletType.DRIL, pierce: IsArmorPierce(im.Shell),
             ref im.RadiusKm, ref im.SegCount, ref im.Pierce);
         im.CircleRoot.transform.localPosition = new Vector3(im.ImpactBoard.x, im.ImpactBoard.y, ImpactOffset);
         // 弹种标签 (飞行时挪到队列编号位: 与队列时 L-X 同 y = 0.14 + dy; 板面空间 = 实体空间常量 × SurfScale)
         float segW = 0.045f * 5f / 6f * SurfScale;
         float step = segW * 1.4f;
         float dy = (0.045f / 8f + 0.0222f) * SurfScale;
-        string bt = shell.ToString();
+        string bt = im.Shell.ToString();
+        ClearChildren(im.BulletRoot.transform);
         im.BulletRoot.transform.localPosition = new Vector3(
             im.ImpactBoard.x - ((bt.Length - 1) * step + segW) / 2f,
             im.ImpactBoard.y + (0.14f * SurfScale + dy),
@@ -367,31 +386,41 @@ public class SandboxRenderer {
         im.SegW = segW;
         im.Step = step;
         im.TimerY = im.ImpactBoard.y + (-0.2f * SurfScale - dy);
-        _impacts.Add(im);
+        im.Root.SetActive(true);
     }
 
-    /// <summary>每帧: 落点指示器推进 — 实线未飞段渐短 + 实心红点弹头沿线移动 + 计时数字每秒刷新; 结束自毁.</summary>
+    /// <summary>GC 飞行期持续传导: 游戏倒计时剩余 (与游戏指示器逐帧同步); 0 = 落地隐藏.</summary>
+    public void PushImpactRemain(LeftRight side, float remain) {
+        if (!_impacts.TryGetValue(side, out var im) || im.Root == null) return;
+        im.FlightRemain = remain;
+        if (remain <= 0f && im.Root.activeSelf) im.Root.SetActive(false); // 落地: 隐藏 (恒定实体, 不销毁)
+    }
+
+    /// <summary>每帧: 落点指示器推进 — 实线未飞段渐短 + 实心红点弹头沿线移动 + 计时数字每秒刷新; 结束隐藏.</summary>
     private void UpdateImpacts() {
-        for (int i = _impacts.Count - 1; i >= 0; i--) {
-            var im = _impacts[i];
-            // 优先吃游戏炮表剩余 (与游戏指示器同步); 无来源退回本地计时
-            float remain = im.RemainingSource?.Invoke() ?? (im.FlightTime - (Time.time - im.CreatedAt));
-            if (float.IsNaN(remain)) remain = 0f;
+        foreach (var im in _impacts.Values) {
+            if (im.Root == null || !im.Root.activeSelf) continue; // 未激活 (没在飞) 不动
+            // 剩余时间优先吃 GC 传导的游戏倒计时 (与游戏指示器同步); NaN (GC 静默/表没绑) 退回本地计时
+            float remain = im.FlightRemain;
+            if (float.IsNaN(remain)) remain = im.FlightTime - (Time.time - im.CreatedAt);
             if (remain <= 0f) {
-                DestroyRoot(im.Root);
-                _impacts.RemoveAt(i);
+                im.Root.SetActive(false); // 落地: 隐藏 (恒定实体, 不销毁)
                 continue;
             }
             float progress = 1f - remain / im.FlightTime; // 0=刚出膛 1=落地
             Vector2 shell = Vector2.Lerp(im.NestBoard, im.ImpactBoard, progress);
-            // 实线: 弹头 → 落点 (未飞段)
-            ClearChildren(im.SolidRoot.transform);
-            Line(im.SolidRoot.transform, shell, im.ImpactBoard, 0.006f, Color.red);
-            // 实心红点 (小实心圆)
-            ClearChildren(im.DotRoot.transform);
-            FillDot(im.DotRoot.transform, shell, 0.012f, Color.red);
-            // 计时数字 (整秒, 下面)
-            int sec = Mathf.CeilToInt(remain);
+            // 实线: 弹头 → 落点 (未飞段) — 只动端点不重建
+            if (im.SolidLine == null) {
+                im.SolidLine = Line(im.SolidRoot.transform, shell, im.ImpactBoard, 0.006f, Color.red);
+            }
+            else {
+                im.SolidLine.Start = new Vector3(shell.x, shell.y, 0f);
+                im.SolidLine.End = new Vector3(im.ImpactBoard.x, im.ImpactBoard.y, 0f);
+            }
+            // 实心红点: 圆画在局部原点, 移动父级位置
+            im.DotRoot.transform.localPosition = new Vector3(shell.x, shell.y, ImpactOffset);
+            // 计时数字 (整秒, 下面; 舍小数点 — 0.x 算 0, 不四舍五入)
+            int sec = Mathf.FloorToInt(remain);
             if (sec != im.LastShownSecond) {
                 im.LastShownSecond = sec;
                 ClearChildren(im.TimerRoot.transform);
@@ -484,7 +513,7 @@ public class SandboxRenderer {
 
     // ===== 图元 =====
 
-    private static void Line(Transform parent, Vector2 a, Vector2 b, float thickness, Color color) {
+    private static Il2CppShapes.Line Line(Transform parent, Vector2 a, Vector2 b, float thickness, Color color) {
         var go = new GameObject("FCS2_Seg");
         go.transform.SetParent(parent, false);
         var line = go.AddComponent<Il2CppShapes.Line>();
@@ -494,6 +523,7 @@ public class SandboxRenderer {
         line.Color = color;
         line.ColorStart = color;
         line.ColorEnd = color;
+        return line;
     }
 
     /// <summary>虚线 (两段循环): dashLen 实线 / gapLen 空.</summary>
@@ -576,6 +606,7 @@ public class SandboxRenderer {
         public GameObject LineRoot = null!;
         public GameObject OuterRoot = null!;
         public GameObject SalvoRoot = null!;
+        public Il2CppShapes.Line? TargetLine; // 预瞄线 (恒定实体: 建一次, 不用就隐藏)
         public Slot Slot;
         public int QueuePos;
         public bool Salvo;
@@ -586,7 +617,6 @@ public class SandboxRenderer {
         public float RadiusKm = -1f;
         public int SegCount;
         public bool Pierce;
-        public Vector2? NestPos;
     }
 
     private class ImpactIndicator {
@@ -602,7 +632,7 @@ public class SandboxRenderer {
         public BulletType Shell;
         public float FlightTime;
         public float CreatedAt;
-        public System.Func<float>? RemainingSource;
+        public float FlightRemain = float.NaN; // GC 传导的游戏倒计时剩余 (NaN = 未收到, 本地计时兜底)
         public float SegW;      // 计时/弹种标签字号 (板面空间)
         public float Step;      // 字符间距
         public float TimerY;    // 计时标签 y (板面空间)
@@ -610,6 +640,7 @@ public class SandboxRenderer {
         public int SegCount;
         public bool Pierce;
         public int LastShownSecond = -1;
+        public Il2CppShapes.Line? SolidLine; // 未飞段实线 (缓存, 每帧只动端点)
     }
 
     private class BallisticMark {

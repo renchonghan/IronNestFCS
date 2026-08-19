@@ -181,10 +181,11 @@ public class GunSystem {
     }
     
     /// <summary>
-    /// 正式版的装填状态索引是数据驱动的, 空闲时可能处于不同的 CurrentStateIndex
+    /// 装填机构就绪等待: 正式版的装填状态索引是数据驱动的, 空闲时可能处于不同的 CurrentStateIndex
     /// 因此不把某个固定索引当作"可装填". 只依据控制器实际的 working, 炮闩锁定和炮管运动状态判断
+    /// (TRAK 开始前也用它等机构停稳 — 装填完炮管还有回落动作, 不等就追会鬼畜).
     /// </summary>
-    private IEnumerator WaitForReloadReady() {
+    public IEnumerator WaitForReloadReady() {
         while (gunController != null) {
             var mechanismReady = reloadController == null || !reloadController.working;
             var breechReady = !gunController.ExternalReloadLoweringLocked;
@@ -376,7 +377,7 @@ public class GunSystem {
         return reloadController?.CurrentState?.stateKey == "ShellRamming";
     }
 
-    /// <summary>游戏装填状态机当前状态码 (诊断用: 轮询找装弹/装药相位码).</summary>
+    /// <summary>游戏装填状态机当前状态码 (HUD 相位显示 / COFM 实装确认用).</summary>
     public string? ReloadStateKey() {
         try { return reloadController?.CurrentState?.stateKey; } catch { return null; }
     }

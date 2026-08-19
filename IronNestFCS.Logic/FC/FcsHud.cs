@@ -79,22 +79,22 @@ public class FcsHud {
             float now = MissionClock.Seconds;
             remain = float.IsNaN(now) ? 0f : f.Fly - (now - f.FireMission);
         }
-        string cd = remain > 0.01f ? $"{remain:00.0}S" : "--.-S";
+        string cd = remain > 0.01f ? $"{remain:00.00}" : "--.--"; // 前缀 T:- 固定, 占位只补 --.--
         return $"{arrival} {f.Task.Angle:000.0} {f.Task.Distance:00.00} T:-{cd}";
     }
 
-    /// <summary>标题行: [IronNest FCS] + [模式档] + [CBC:---S] + 任务时钟, 64 字符定宽.</summary>
+    /// <summary>标题行: [IronNest FCS] + [模式档] + [CBC:---] + 任务时钟, 64 字符定宽 (空格数量对样稿).</summary>
     private string TitleLine() {
         string mode = Fc?.Mode switch {
             FireMode.FullAuto => "Full-Auto",
             FireMode.SemiAuto => "Semi-Auto",
             FireMode.PreAiming => "PreAiming",
-            _ => "Manual",
+            _ => "ManualSet", // Manual 6 字符短一截, ManualSet 对齐 9 字符
         };
         float cbt = Fc != null ? Fc.CbtSeconds : float.NaN;
-        string cbtStr = float.IsNaN(cbt) ? "CBC:---S" : $"CBC:{Mathf.CeilToInt(cbt):000}S";
+        string cbtStr = float.IsNaN(cbt) ? "CBC:---" : $"CBC:{Mathf.CeilToInt(cbt):000}";
         string clock = MissionClock.Format(MissionClock.Seconds);
-        string line = $" [IronNest FCS]   [{mode}]      [{cbtStr}]        {clock} ";
+        string line = $" [IronNest FCS]  [{mode}]        [{cbtStr}]        {clock} ";
         if (line.Length < LineWidth) line = line.PadRight(LineWidth);
         return line[..LineWidth];
     }
@@ -102,22 +102,24 @@ public class FcsHud {
     /// <summary>炮块两行: PHASE x-x NAME | [膛内弹] E A C | FT; 第二行前导 = 编号 (在炮 L-N / R-X).</summary>
     private void DrawGunBlock(GunControl? gun, string label, float x, ref float y, float lh, float h) {
         if (gun == null) {
-            GUI.Label(new Rect(x, y, _panelRect.width, h), $" [{label}] PHASE 0-0 IDLE | [NULL] E:--.-- A:---.- C:- | FT:--.-S".PadRight(LineWidth));
+            GUI.Label(new Rect(x, y, _panelRect.width, h), $" [{label}] PHASE 0-0 IDLE | [NULL] E:--.-- A:---.- C:- | FT:--.--".PadRight(LineWidth));
             y += lh;
-            GUI.Label(new Rect(x, y, _panelRect.width, h), $" [--:--:--] ---.- --.-- | [----] E:--.-- A:---.- C:- | T:---.-S".PadRight(LineWidth));
+            GUI.Label(new Rect(x, y, _panelRect.width, h), $" [--:--:--] ---.- --.-- | [----] E:--.-- A:---.- C:- | T:---.--".PadRight(LineWidth));
             y += lh;
             return;
         }
-        // 相位优先读游戏装填状态码 (真实状态); 但码只在装填动作期间生效 — 装填完成后码停在 BreachLocked,
-        // TRAK 起改用声称 Action (否则 HUD 永远卡 2-5 COFM)
-        var (code, name) = gun.Action < GunAction.Trak
-            ? (gun.ReloadPhase() ?? PhaseCode(gun.Action, Fc?.Mode ?? FireMode.Manual))
-            : PhaseCode(gun.Action, Fc?.Mode ?? FireMode.Manual);
-        string chamber = gun.Chamber.Length > 0 ? gun.Chamber : (gun.Action == GunAction.Trak ? "----" : "NULL");
+        // 相位: 自动模式装填段读游戏真实状态码 (码停在 BreachLocked 时 TRAK 起改声称 Action, 防卡 2-5 COFM);
+        // 手动 = 纯 Action 映射 (0-0 IDLE, 不读码 — 玩家自己装填, mod 不确认)
+        var mode = Fc?.Mode ?? FireMode.Manual;
+        var (code, name) = mode == FireMode.Manual || gun.Action >= GunAction.Trak
+            ? PhaseCode(gun.Action, mode)
+            : (gun.ReloadPhase() ?? PhaseCode(gun.Action, mode));
+        // 膛内/药数活读 (玩家手动装填时 HUD 实时跟, 快照会陈旧)
+        string chamber = gun.ChamberLive.Length > 0 ? gun.ChamberLive : (gun.Action == GunAction.Trak ? "----" : "NULL");
         string eStr = float.IsNaN(gun.Elevation) ? "--.--" : $"{gun.Elevation:00.00}";
         string aStr = float.IsNaN(gun.Azimuth) ? "---.-" : $"{gun.Azimuth:000.0}";
-        string cStr = gun.Charges > 0 ? gun.Charges.ToString() : "-";
-        string ft = !float.IsNaN(gun.FlyTime) && gun.FlyTime > 0.01f ? $"{gun.FlyTime:00.0}S" : "--.-S";
+        string cStr = gun.ChargesLive > 0 ? gun.ChargesLive.ToString() : "-";
+        string ft = !float.IsNaN(gun.FlyTime) && gun.FlyTime > 0.01f ? $"{gun.FlyTime:00.00}" : "--.--";
         var task = Fc != null ? (gun == GunL ? Fc.LeftTask : Fc.RightTask) : null;
         bool isL = gun == GunL;
         // 前导位 = 预定打击时间 (默认 -1 → [--:--:--]); 齐射时右炮行前导 >>>[SALVO] (1.x 同款, 左炮为主炮)
@@ -128,16 +130,17 @@ public class FcsHud {
         GUI.Label(new Rect(x, y, _panelRect.width, h),
             $" [{label}] PHASE {code} {name} | [{Center(chamber, 4)}] E:{eStr} A:{aStr} C:{cStr} | FT:{ft}".PadRight(LineWidth));
         y += lh;
-        // 第二行 = 火控解析 (与炮无关, FC 解算持续刷新): 解算仰角/方位/装药; 无任务全横线
-        // T:- = 游戏炮表倒计时 (落地/未倒计时 → 横线); 不依赖任务时钟
-        float cd = gun.FlyRemaining;
-        string t2 = !float.IsNaN(cd) && cd > 0.01f ? $"{cd:00.0}S" : "--.-S";
+        // 第二行 = 火控解析 (与炮无关, FC 解算持续刷新): 解算仰角/方位/装药; 弹种 = 火控指定的弹 (任务给的, 不读膛内); 无任务 [----]
+        // T:- = 火控解析飞时 (射表直算, 静态 — 实际倒计时归 Finish Queue 记); 不依赖游戏炮表
         float solE = Fc != null ? (isL ? Fc.SolElevL : Fc.SolElevR) : float.NaN;
         int solC = Fc != null ? (isL ? Fc.SolChargeL : Fc.SolChargeR) : -1;
         string solEStr = task != null && !float.IsNaN(solE) ? $"{solE:00.00}" : "--.--";
         string solCStr = solC > 0 ? solC.ToString() : "-";
+        string solShell = task != null ? task.Shell.ToString() : "----";
+        float solFly = task != null && solC > 0 ? ShellData.FlightTime(task.Distance, solC) : float.NaN;
+        string t2 = !float.IsNaN(solFly) ? $"{solFly:00.00}" : "--.--"; // 前缀 T:- 固定, 占位只补 --.--
         GUI.Label(new Rect(x, y, _panelRect.width, h),
-            $" {id} {ang} {dst} | [{Center(chamber, 4)}] E:{solEStr} A:{ang} C:{solCStr} | T:-{t2}".PadRight(LineWidth));
+            $" {id} {ang} {dst} | [{Center(solShell, 4)}] E:{solEStr} A:{ang} C:{solCStr} | T:-{t2}".PadRight(LineWidth));
         y += lh;
     }
 

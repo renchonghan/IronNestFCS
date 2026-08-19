@@ -110,6 +110,7 @@ public class DisplayControl {
                 Velocity = Tws ? TrackVelocity(tok.Key.gameObject, pos) : Vector2.zero,
                 Side = Side3.Enemy,
                 Kind = EntityKind.Other,
+                Virtual = true,
             });
         }
         PruneHistories(seen);
@@ -134,9 +135,10 @@ public class DisplayControl {
         foreach (var k in dead) _posHist.Remove(k);
     }
 
-    /// <summary>实体图标差集 (DC 自己的活): 在列表→画, 不在→删 (渲染线程执行 3D 挂件管理).</summary>
+    /// <summary>实体图标差集 (DC 自己的活): 在列表→画, 不在→删 (渲染线程执行 3D 挂件管理); 令牌虚拟目标不画.</summary>
     private void UpdateIcons() {
         foreach (var t in Targets) {
+            if (t.Virtual) continue; // 令牌虚拟目标: 无实体图标 (内圈菱形框只属于真实目标)
             if (_icons.Add(t.Entity)) OnIconSpawn?.Invoke(t);
         }
         var remove = new List<GameObject>();
@@ -316,4 +318,5 @@ public class DcTarget {
     public Side3 Side;
     public EntityKind Kind;
     public int Armour;
+    public bool Virtual;          // 令牌虚拟目标: 不画实体图标 (没有内圈菱形框)
 }

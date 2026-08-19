@@ -74,9 +74,14 @@ public class FcsModule : IFcsModule
         display.Start();
         renderer2.Start();
 
-        // GC → DC_D: 实时弹道 push
-        gunL.OnBallisticPush = (side, x, y, r, b) => renderer2.PushBallistic(side, new Vector2(x, y), r, b);
-        gunR.OnBallisticPush = (side, x, y, r, b) => renderer2.PushBallistic(side, new Vector2(x, y), r, b);
+        // GC → DC_D: 实时弹道 push (GC 全权: 瞄准点/杀伤圈/弹种/AllReady/飞时)
+        gunL.OnBallisticPush = (side, x, y, r, b, ready, fly) => renderer2.PushBallistic(side, new Vector2(x, y), r, b, ready, fly);
+        gunR.OnBallisticPush = (side, x, y, r, b, ready, fly) => renderer2.PushBallistic(side, new Vector2(x, y), r, b, ready, fly);
+        // GC → DC_D: 落点指示器 (GC 击发确认 → DC 画线; GC 飞行期持续传导倒计时剩余)
+        gunL.OnImpactFired = (side, x, y, shell, fly) => renderer2.ImpactFired(side, x, y, shell, fly);
+        gunR.OnImpactFired = (side, x, y, shell, fly) => renderer2.ImpactFired(side, x, y, shell, fly);
+        gunL.OnImpactRemain = (side, r) => renderer2.PushImpactRemain(side, r);
+        gunR.OnImpactRemain = (side, r) => renderer2.PushImpactRemain(side, r);
 
         // FC
         fireControl = new FireControl {
@@ -88,9 +93,7 @@ public class FcsModule : IFcsModule
             NestRef = nest,
             MapSurfaceRef = surface,
         };
-        fireControl.OnShellFired = (pos, shell, fly, fireMission, rem) => renderer2.CreateImpact(pos, shell, fly, rem);
         fireControl.OnQueueChanged = fc => renderer2.UpdateQueueIndicator(fc);
-        fireControl.OnAimChanged = (side, pos, r, b, ready, fly) => renderer2.PushBallistic(side, pos, r, b, ready, fly);
         fireControl.Start();
         display.FcPort = fireControl;
         hud = new FcsHud { Fc = fireControl, GunL = gunL, GunR = gunR };

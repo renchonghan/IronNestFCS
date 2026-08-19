@@ -26,7 +26,7 @@ public class ScenePanel {
 
     /// <summary>火控台三态: 停止 (白/白/红) / 运行 (绿/白/白) / 暂停 (白/黄/白).</summary>
     private enum PanelState { Stopped, Running, Paused }
-    private PanelState _state = PanelState.Stopped;
+    private PanelState _state = PanelState.Paused; // 初始 = 暂停 (冻结待命), 模块在 Build 末尾同步 Fc.Paused
 
     /// <summary>Build 3D 按钮列 + 右键注册 (旧交互层清退后由 FcsModule 调用一次).</summary>
     public void Build() {
@@ -98,12 +98,23 @@ public class ScenePanel {
                 Dc?.RightClickEntity(go);
             }, right: true); // 右键 (左键留给游戏自身拖拽)
         }
-        // 地图令牌 (MapToken_* 棋子): 右键 = 虚拟目标入队 (拖放由 DC 数据循环检测)
+        // 地图令牌 (MapToken_* 棋子): 右键 = 虚拟目标入队 (拖放由 DC 数据循环检测).
+        // 令牌无自带 collider: 挂 FCS 自有点击盒 (与实体右键同款)
         _tokenColliders.RemoveWhere(c => c == null);
         foreach (var go in GameObject.FindObjectsOfType<GameObject>()) {
             if (go == null || !go.name.StartsWith("MapToken")) continue;
             var col = go.GetComponent<Collider>();
-            if (col == null || !_tokenColliders.Add(col)) continue;
+            if (col == null) {
+                if (_tokenColliders.Any(x => x != null && x.transform.parent == go.transform)) continue;
+                var boxGo = new GameObject("FCS2_ClickBox");
+                boxGo.transform.SetParent(go.transform, false);
+                boxGo.transform.localPosition = new Vector3(0f, 0f, -0.01f);
+                var box = boxGo.AddComponent<BoxCollider>();
+                box.size = new Vector3(0.22f, 0.22f, 0.05f);
+                _owned.Add(boxGo); // 随 ShutDown 清理
+                col = box;
+            }
+            if (!_tokenColliders.Add(col)) continue;
             var token = go;
             _clicks.Register(col, () => {
                 Dc?.RightClickToken(token);
@@ -188,13 +199,15 @@ public class ScenePanel {
         Place(start, x, y, z); x -= 0.05f; y -= 0.0045f;
 
         pause = Button("Pause", Color.white, () => {
-            if (_state == PanelState.Running) {
-                _state = PanelState.Paused;
-                if (Fc != null) Fc.Paused = true; // 冻结派发与炮塔控制 (豁免: 飞行计时/落点指示不冻结)
-            }
-            else if (_state == PanelState.Paused) {
+            if (_state == PanelState.Paused) {
                 _state = PanelState.Running;
-                if (Fc != null) Fc.Paused = false;
+                if (Fc != null) { Fc.Paused = false; Fc.SetManual(false); }
+            }
+            else {
+                // Stopped/Running 都可直接拉 Pause (取消 STOP→PAUSE 限制): 冻结派发与炮塔控制 + 解除 Manual
+                // (豁免: 飞行计时/落点指示不冻结)
+                _state = PanelState.Paused;
+                if (Fc != null) { Fc.Paused = true; Fc.SetManual(false); }
             }
             ApplyState(start, pause, stop);
         });
@@ -222,7 +235,8 @@ public class ScenePanel {
                     break;
             }
         }
-        ApplyState(start, pause, stop); // 默认态 = 停止 (白/白/红)
+        ApplyState(start, pause, stop); // 默认态 = 暂停 (白/黄/白)
+        if (Fc != null) { Fc.Paused = true; Fc.SetManual(true); } // 模块同步: 初始 = Manual+Paused (冻结待命), 与 FC 默认 Mode 对齐 — GC.ManualControl 一并置位
     }
 
     private GameObject Button(string label, Color color, System.Action onClick) {
