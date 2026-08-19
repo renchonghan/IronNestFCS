@@ -104,6 +104,8 @@ public class GunControl {
         _deck = deck;
         _purchaseLock = purchaseLock;
         _fireLock = fireLock;
+        // F9 重载沿基线同步: 重载前刚击发没装填时 pendingReload 残留 true, 默认 false 会让第一帧误判开火
+        try { _lastHasFired = _gun.HasFired(); } catch { }
     }
 
     public void Start() {
@@ -274,7 +276,9 @@ public class GunControl {
         AllReady = false;
         Fired = false;
         _latchedFlyTime = float.NaN;
-        _lastHasFired = false;        // 残留的击发沿不许带到下个任务
+        // 击发沿基线同步到当前状态 (不能直接清 false): 上一发击发后未装填时 pendingReload 残留 true,
+        // 清 false 会让下一帧击发自检把残留沿误判成新开火 → 入队瞬间红线闪一下
+        _lastHasFired = _gun.HasFired();
         _impactFlying = false;
         _sawCountdown = false;
         // 外推状态清零: 新目标仰角/方位突变, 旧斜率历史会把外推带飞 (先停旧目标一会/先瞄出去才收敛)

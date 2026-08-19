@@ -102,7 +102,8 @@ public class ScenePanel {
         // 令牌无自带 collider: 挂 FCS 自有点击盒 (与实体右键同款)
         _tokenColliders.RemoveWhere(c => c == null);
         foreach (var go in GameObject.FindObjectsOfType<GameObject>()) {
-            if (go == null || !go.name.StartsWith("MapToken")) continue;
+            // 标记令牌只注册 T1-10 (MapToken_Artillery 系列); 击杀/侦察/参考点令牌不可点
+            if (go == null || !go.name.StartsWith("MapToken_Artillery") || go.name.Contains("Killed")) continue;
             var col = go.GetComponent<Collider>();
             if (col == null) {
                 if (_tokenColliders.Any(x => x != null && x.transform.parent == go.transform)) continue;

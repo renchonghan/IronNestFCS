@@ -29,9 +29,9 @@ public class SandboxRenderer {
 
     // 层级偏移量 (相对板面 z=0, 越负越浮): 所有标记一律挂板面 —
     // 游戏大地图在实体层上堆叠照片 (改透明度), 挂实体的东西会被盖淡/消失, 只能挂板面.
-    private const float GreenOffset = -0.0105f;  // 绿十字+瞄准圈
-    private const float ImpactOffset = -0.01f;  // 落点指示器 (红线/红点/圈/字)
-    private const float RedOffset = -0.005f;     // 红杀伤圈+编号+弹种标签+预瞄线+实体图标
+    private const float GreenOffset = 0f;      // 绿十字+瞄准圈 (renderQueue 5000 压阵后深度排序不依赖 z, 回 20cb07b 低高度版)
+    private const float ImpactOffset = 0.001f;  // 落点指示器 (红线/红点/圈/字)
+    private const float RedOffset = 0.002f;     // 红杀伤圈+编号+弹种标签+预瞄线+实体图标
     private const float SurfScale = 0.212f / 0.81f; // 实体单位 → 板面单位 (实体世界缩放 / 板面世界缩放)
 
     public void Start() {
@@ -300,6 +300,8 @@ public class SandboxRenderer {
                 mark.TargetLine.Color = Color.green;
                 mark.TargetLine.ColorStart = Color.green;
                 mark.TargetLine.ColorEnd = Color.green;
+                var r = go.GetComponent<Renderer>(); // 渲染队列到顶 (恒定实体不走 Line(), 这里单独设)
+                if (r != null) r.material.renderQueue = 5000;
             }
             var nest = (Vector2)MapSurfaceRef.InverseTransformPoint(NestRef.position) - entityBoard;
             mark.TargetLine.Start = new Vector3(nest.x, nest.y, 0f);
@@ -523,6 +525,10 @@ public class SandboxRenderer {
         line.Color = color;
         line.ColorStart = color;
         line.ColorEnd = color;
+        // 强制渲染队列拉到顶 (5000 = 上限): 游戏照片层层堆叠大概也是靠 queue 叠的 — 标记永远最后画,
+        // 斜视角深度排序穿插 → 半透明/消失的问题根治
+        var r = go.GetComponent<Renderer>();
+        if (r != null) r.material.renderQueue = 5000;
         return line;
     }
 

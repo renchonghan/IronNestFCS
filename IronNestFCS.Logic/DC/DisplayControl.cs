@@ -240,7 +240,8 @@ public class DisplayControl {
         if (Time.time - _lastTokenScan > 1f) {
             _lastTokenScan = Time.time;
             foreach (var go in GameObject.FindObjectsOfType<GameObject>()) {
-                if (go == null || !go.name.StartsWith("MapToken")) continue;
+                // 标记令牌只注册 T1-10 (MapToken_Artillery 系列); 击杀/侦察/参考点令牌不注册虚拟目标
+                if (go == null || !go.name.StartsWith("MapToken_Artillery") || go.name.Contains("Killed")) continue;
                 if (_trackedTokens.Add(go.transform)) _tokenOnMap[go.transform] = IsOnMap(go.transform.position);
             }
         }

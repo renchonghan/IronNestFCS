@@ -171,6 +171,8 @@ public static class Glyph16Font {
             line.Color = color;
             line.ColorStart = color;
             line.ColorEnd = color;
+            var r = go.GetComponent<Renderer>(); // 强制渲染队列到顶: 与 SandboxRenderer 线同款, 防照片穿插 (DC 所有元素统一 5000)
+            if (r != null) r.material.renderQueue = 5000;
         }
     }
 }
