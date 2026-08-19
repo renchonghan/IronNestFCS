@@ -565,18 +565,15 @@ public class FireControl {
             }
             if (confirmed) break;
             if (attempt >= 2) break;
-            MelonLogger.Warning($"[FC] {side}: misfire (5s no countdown), re-arm + fire retry {attempt + 1}/2");
+            // 哑炮唯一可能 = 保险没解到位: 重试只再按一次保险 (不碰击发钮 — 游戏侧击发随保险联动)
+            MelonLogger.Warning($"[FC] {side}: misfire (5s no countdown), re-arm retry {attempt + 1}/2");
             if (task.SalvoPair) {
                 if (FireLock == null || ConsolePort == null) break;
                 yield return FireLock.Acquire();
-                try { yield return ConsolePort.ArmBoth(); } // 齐射重试: 双炮保险同时解除 (不许一先一后)
+                try { yield return ConsolePort.ArmBoth(); } // 齐射重试: 双炮保险同时再解 (不许一先一后)
                 finally { FireLock.Release(); }
             }
             else yield return ArmRoutine(gun, side);
-            if (FireLock == null) break;
-            yield return FireLock.Acquire();
-            try { FcsBus.Fire?.Invoke(); } // 击发钮全局一个: 齐射重击只哑炮会响 (已响的炮没弹)
-            finally { FireLock.Release(); }
         }
         if (!confirmed) {
             MelonLogger.Error($"[FC] {side}: gun did not fire after 3 attempts, cancel fc#{task.Id}");
