@@ -184,9 +184,9 @@ public class Radar {
         return -1;
     }
 
-    /// <summary>排除项: 阵亡实体 (留尸 + EnemyKillTokens 击杀令牌, 名字兜底会误抓, 两者都不报).</summary>
+    /// <summary>排除项: 阵亡实体 (留尸 + EnemyKillTokens 击杀令牌, 名字兜底会误抓, 两者都不报) + Phantom Battery (演示幻影炮组, 旧雷达同款).</summary>
     private static bool IsExcluded(string name) {
         var n = (name ?? "").ToLower();
-        return n.Contains("enemykilltokens") || n.Contains("killtokens");
+        return n.Contains("enemykilltokens") || n.Contains("killtokens") || n.Contains("phantom");
     }
 }

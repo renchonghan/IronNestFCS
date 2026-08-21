@@ -194,7 +194,11 @@ public class ScenePanel {
         // 三态指示: 停止 (白/白/红) → 运行 (绿/白/白) → 暂停 (白/黄/白); 当前状态亮在对应按钮, 其余白
         start = Button("Start", Color.white, () => {
             _state = PanelState.Running;
-            if (Fc != null) { Fc.Paused = false; Fc.SetManual(false); } // Start/Resume: AutoFire 已开 → Semi-Auto; 否则 PreAiming
+            if (Fc != null) {
+                Fc.Paused = false;
+                Fc.SetManual(false); // Start/Resume: AutoFire 已开 → Semi-Auto; 否则 PreAiming
+                Fc.SortQueueOnce();  // 乱序重排一次 (45° 内匹配后续任务提前), 之后不动
+            }
             ApplyState(start, pause, stop);
         });
         Place(start, x, y, z); x -= 0.05f; y -= 0.0045f;

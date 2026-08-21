@@ -22,18 +22,18 @@ public enum GunAction {
 /// <summary>
 /// [GC] GunControl — 单炮执行器 (2.0 新架构, 每炮一条, 25fps 常驻线程).
 /// 前向接口 (FC 写): ManualControl / SyncCommand / AzimuthSelect / DesiredShell / DesiredCharge /
-///   DesiredElevation / DesiredAzimuth. 开火不在这里 (统一火控归 FC, DUMP 平射除外).
+///   DesiredElevation / DesiredAzimuth / DesiredDump. 开火不在这里 (统一火控全归 FC).
 /// 状态端口 (FC 读): 实装快照 (动作边界刷新) / Elevation / Azimuth 回读 / Action / FlyTime /
-///   AllReady / Fired / KernelMode.
+///   AllReady / Fired / KernelMode / DumpWaitActive.
 /// 内部: 跟踪稳定器 (TrackAxis, E 恒追; H 仅被 AzimuthSelect 选中时追), 硬件读数缓存,
-///   DUMP 自决, 给药独立 (药包杆与计算台无关, 只受共享药包池约束), 采购台短锁, 动作看门狗 → FALL.
+///   1-3 DUMP 停手等接管 (膛内弹不对/齐射多药 → 进相位停手, FC 撤任务改派 DUMP 占位, GC 不再自行平射),
+///   给药独立 (药包杆与计算台无关, 只受共享药包池约束), 采购台短锁, 动作看门狗 → FALL.
 /// </summary>
 public class GunControl {
     private readonly LeftRight _side;
     private readonly GunSystem _gun;
     private readonly PurchaseDeck _deck;
     private readonly CoroutineLock _purchaseLock; // 采购台短锁 (两炮共享)
-    private readonly CoroutineLock _fireLock;     // 统一火控锁 (与 FC 共享; GC 只用于 DUMP 平射)
 
     // ===== 指令端口 (FC 持续写, 最新值覆盖) =====
     public bool ManualControl;          // 手动: FC 停机, 立即停手不碰硬件 (线程照跑)
@@ -44,6 +44,7 @@ public class GunControl {
     public float DesiredElevation = float.NaN;  // 目标俯仰 (FC 持续输出, 含提前量)
     public float DesiredAzimuth = float.NaN;    // 目标方位 (FC 持续输出, 含提前量)
     public float DesiredDistance = float.NaN;   // 目标距离 km (FC 持续输出; 锁定死区动态口径用)
+    public bool DesiredDump;            // 本轮 DUMP 占位 (FC 强制退弹: 击发自检不画落点/不传导倒计时)
 
     // ===== 状态端口 =====
     public string Chamber { get; private set; } = "";   // 膛内弹种 (实装快照)
@@ -57,6 +58,7 @@ public class GunControl {
     public GunAction Action { get; private set; } = GunAction.Idle;
     public float FlyTime { get; private set; } = float.NaN;        // 飞行时间 (游戏自解: 瞄准期 PredictedImpactTime / 击发后锁存)
     public bool AllReady { get; private set; }                     // 弹药确认且追踪稳定; 不稳定回退
+    public bool DumpWaitActive { get; private set; }               // 1-3 DUMP 相位停手等接管中 (FC 据此撤任务改派 DUMP 占位)
     public bool Fired { get; private set; }                        // 本发已击发 (GC 内部防重; 不对外 — FC 用 FlyRemaining 作击发确认)
     public bool KernelMode { get; private set; }                   // 内核态: 硬件动作执行中 (指令只记录不生效)
     /// <summary>游戏 CANFIRE 信号 (实测不含保险: 装填完成 — 弹+药+炮闩锁 — 未开保险即 True;
@@ -98,12 +100,11 @@ public class GunControl {
     /// <summary>齐射对端 (SyncCommand 时相位级同步互相等; 对炮 FALL → 本炮也 FALL 防陪死).</summary>
     public GunControl? SyncPeer;
 
-    public GunControl(LeftRight side, GunSystem gun, PurchaseDeck deck, CoroutineLock purchaseLock, CoroutineLock fireLock) {
+    public GunControl(LeftRight side, GunSystem gun, PurchaseDeck deck, CoroutineLock purchaseLock) {
         _side = side;
         _gun = gun;
         _deck = deck;
         _purchaseLock = purchaseLock;
-        _fireLock = fireLock;
         // F9 重载沿基线同步: 重载前刚击发没装填时 pendingReload 残留 true, 默认 false 会让第一帧误判开火
         try { _lastHasFired = _gun.HasFired(); } catch { }
     }
@@ -163,12 +164,15 @@ public class GunControl {
                 if (sw.HasValue && sw.Value.travelTime > 0.01f) _latchedFlyTime = sw.Value.travelTime;
                 else _latchedFlyTime = FlyTime; // 倒计时未启动 (fireDelay): 瞄准期预测值兜底
                 FlyTime = _latchedFlyTime;      // 击发后: 锁存真值 (瞄准期活读停更, 下一帧 ReadSensors 走 else)
-                // 弹种: 最后非空膛内弹 (击发瞬间膛已空, 活读拿不到 — 开火按最后一次落点指示走); 兜底 DesiredShell
-                BulletType firedShell = System.Enum.TryParse<BulletType>(_lastChamberLive, out var fb) ? fb : DesiredShell;
-                _impactFlying = true;
-                _sawCountdown = false;
-                _impactFiredAt = Time.time;
-                OnImpactFired?.Invoke(_side, _lastAimLive.x, _lastAimLive.y, firedShell, _latchedFlyTime);
+                // DUMP 平射 (FC 强制退弹): 不画落点/不传导倒计时
+                if (!DesiredDump) {
+                    // 弹种: 最后非空膛内弹 (击发瞬间膛已空, 活读拿不到 — 开火按最后一次落点指示走); 兜底 DesiredShell
+                    BulletType firedShell = System.Enum.TryParse<BulletType>(_lastChamberLive, out var fb) ? fb : DesiredShell;
+                    _impactFlying = true;
+                    _sawCountdown = false;
+                    _impactFiredAt = Time.time;
+                    OnImpactFired?.Invoke(_side, _lastAimLive.x, _lastAimLive.y, firedShell, _latchedFlyTime);
+                }
             }
             _lastHasFired = firedNow;
             // 飞行期间: 持续传导游戏倒计时剩余 (与游戏指示器同步); 落地 (已见过倒计时后变 NaN) 传 0 隐藏
@@ -258,7 +262,7 @@ public class GunControl {
         ResetForTask();
         try {
             while (!_disposed) {
-                if (ManualControl || DesiredCharge < 0) yield break; // 撤任务: 别把膛内弹当错弹 DUMP 掉
+                if (ManualControl || DesiredCharge < 0) yield break; // 撤任务: 膛内弹处置 (DUMP/沿用) 归 FC 派发决策, GC 不碰
                 var step = DecidePrepStep();
                 if (step == null) break; // 弹药就绪 → TRAK
                 yield return Exec(step.Value.Action, step.Value.Deadline, step.Value.Routine);
@@ -289,13 +293,14 @@ public class GunControl {
     }
 
     /// <summary>弹药准备决策一步 (单发与齐射导演共用): 下一步动作, null = 弹药就绪.
-    /// 齐射口径: 多药/少药都是错药 (Charges == DesiredCharge).</summary>
+    /// 齐射口径: 多药/少药都是错药 (Charges == DesiredCharge).
+    /// 膛内弹不对/齐射多药 → 1-3 DUMP 相位停手等 FC 接管 (FC 撤任务改派 DUMP 占位, GC 不再自行平射).</summary>
     internal SalvoStep? DecidePrepStep() {
         RefreshSnapshot();
         bool chamberOk = Chamber == DesiredShell.ToString();
         bool chargeOk = !SyncCommand ? Charges >= DesiredCharge : Charges == DesiredCharge;
         bool shellWrong = Chamber.Length > 0 && !chamberOk;
-        if (shellWrong) return new SalvoStep { Action = GunAction.Dump, Deadline = 25f, Routine = DumpRoutine };
+        if (shellWrong) return new SalvoStep { Action = GunAction.Dump, Deadline = 15f, Routine = DumpWaitRoutine };
         if (Chamber.Length == 0) {
             if (!_gun.HaveBulletInCylinder(DesiredShell)) {
                 return new SalvoStep { Action = GunAction.Selc, Deadline = 20f, Routine = SelcRoutine };
@@ -304,8 +309,8 @@ public class GunControl {
             return new SalvoStep { Action = GunAction.Shrd, Deadline = 28f, Routine = ShrdShldStep };
         }
         if (!chargeOk) {
-            if (Charges > DesiredCharge && SyncCommand) { // 齐射多药: 只能整发打掉
-                return new SalvoStep { Action = GunAction.Dump, Deadline = 25f, Routine = DumpRoutine };
+            if (Charges > DesiredCharge && SyncCommand) { // 齐射多药: 同样进 1-3 等 FC 接管 (只能整发打掉)
+                return new SalvoStep { Action = GunAction.Dump, Deadline = 15f, Routine = DumpWaitRoutine };
             }
             // PWDR 拉杆只改"选药" (实装不变), 必须接 LOAD 推药入膛再回决策, 否则 loaded 永远 0 死循环
             return new SalvoStep { Action = GunAction.Pwdr, Deadline = 45f, Routine = PwdrLoadStep };
@@ -538,39 +543,17 @@ public class GunControl {
         RefreshSnapshot();
     }
 
-    /// <summary>DUMP 自决 (最复杂): 膛内弹不对 (或齐射多药/少药) → 给药至少 1 包 (查池, 没药先买) +
-    /// 0° 平射自行击发打掉, 不对准直接打 (统一火控例外: 退弹平射 GC 自己打).</summary>
-    private IEnumerator DumpRoutine() {
-        if (Charges <= 0) {
-            yield return _purchaseLock.Acquire();
-            try {
-                int attempts = 0;
-                while (_gun.RemainingCharges() < 1) {
-                    yield return _deck.BuyPowders();
-                    if (_gun.RemainingCharges() >= 1) break;
-                    if (++attempts >= 10) {
-                        throw new System.Exception($"DUMP buy powder {attempts} times still pool {_gun.RemainingCharges()}");
-                    }
-                    yield return new WaitForSeconds(0.5f);
-                }
-            }
-            finally { _purchaseLock.Release(); }
-            yield return _gun.PullPowders(1);
-            yield return _gun.RamPowder();
-            float waited = 0f;
-            while (!_gun.CanFire() && waited < 15f) {
-                yield return new WaitForSeconds(0.5f);
-                waited += 0.5f;
-            }
-        }
-        yield return _fireLock.Acquire();
+    /// <summary>1-3 DUMP 相位 (不再自行开火): 膛内弹不对/齐射多药 → 停手等 FC 发现 (Action==Dump && DumpWaitActive)
+    /// 撤任务改派 DUMP 占位 (同膛内弹 1 包药 0° 平射, 由 FC 统一火控击发). 退出条件 = 任务被撤 (DesiredCharge&lt;0).</summary>
+    private IEnumerator DumpWaitRoutine() {
+        DumpWaitActive = true;
         try {
-            FcsBus.Fire?.Invoke();
-            yield return _gun.WaitFire();
+            MelonLogger.Msg($"[GC] {_side}: 1-3 DUMP wait for FC takeover (chamber='{Chamber}' charges={Charges})");
+            while (!ManualControl && !_disposed && DesiredCharge >= 0) {
+                yield return new WaitForSeconds(0.25f);
+            }
         }
-        finally { _fireLock.Release(); }
-        yield return new WaitForSeconds(2f); // 机构循环
-        RefreshSnapshot();
+        finally { DumpWaitActive = false; }
     }
 
     /// <summary>REST 复位: 炮口回位.</summary>

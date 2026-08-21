@@ -21,6 +21,10 @@ public class SandboxRenderer {
     // ===== 3D 指示器状态 =====
     private readonly Dictionary<GameObject, QueueIndicator> _queueMarks = new();
     private readonly Dictionary<LeftRight, ImpactIndicator> _impacts = new(); // 恒定实体: 每炮一套 (虚线/实线/点), 不用就隐藏
+    private readonly Dictionary<LeftRight, TrackIndicator> _tracks = new();     // 火控目标线 (开火前解算, 粗粒度绿虚线) 每炮一条
+    private readonly Dictionary<LeftRight, TrackIndicator> _finals = new();     // 最终轨迹线 (击发冻结缩短, 细粒度绿虚线) 每炮一条
+    private const float TrackDashLen = 0.06f, TrackGapLen = 0.06f; // 火控线粗粒度 (虚线周期长)
+    private const float FinalDashLen = 0.03f, FinalGapLen = 0.03f;  // 最终线细粒度 (虚线周期短)
     private readonly Dictionary<GameObject, GameObject> _icons = new();
     private readonly Dictionary<LeftRight, BallisticMark> _ballistic = new();
 
@@ -50,6 +54,7 @@ public class SandboxRenderer {
         while (!_disposed) {
             yield return null; // 每帧
             UpdateImpacts();
+            UpdateTracks();   // 目标轨迹线: 开火前跟解算, 开火后沿冻结轨迹缩短
             FollowIcons(); // 实体图标挂板面, 每帧跟随实体世界位置
         }
     }
@@ -72,6 +77,10 @@ public class SandboxRenderer {
         _queueMarks.Clear();
         foreach (var i in _impacts.Values) DestroyRoot(i.Root);
         _impacts.Clear();
+        foreach (var t in _tracks.Values) DestroyRoot(t.Root);
+        _tracks.Clear();
+        foreach (var f in _finals.Values) DestroyRoot(f.Root);
+        _finals.Clear();
         foreach (var go in _icons.Values) DestroyRoot(go);
         _icons.Clear();
         foreach (var b in _ballistic.Values) DestroyRoot(b.Root);
@@ -179,7 +188,7 @@ public class SandboxRenderer {
         foreach (var t in fc.Queue) {
             if (t.Entity != null) {
                 seen.Add(t.Entity);
-                UpdateQueueIndicator(t.Entity, Slot.Queue, idx++, t.SalvoPair, t.Shell, t.Mode, 0f, drawLine: false);
+                UpdateQueueIndicator(t.Entity, Slot.Queue, idx++, t.SalvoPair, t.Shell, t.Mode, Vector2.zero, drawLine: false);
             }
         }
         SyncOne(fc.LeftTask, fc.LeftTask == fc.RightTask && fc.LeftTask != null ? Slot.Salvo : Slot.Left, seen);
@@ -197,13 +206,13 @@ public class SandboxRenderer {
     private void SyncOne(FireTask? task, Slot slot, HashSet<GameObject> seen) {
         if (task?.Entity == null) return;
         seen.Add(task.Entity);
-        UpdateQueueIndicator(task.Entity, slot, 0, task.SalvoPair, task.Shell, task.Mode, 0f, drawLine: true);
+        UpdateQueueIndicator(task.Entity, slot, 0, task.SalvoPair, task.Shell, task.Mode, task.AimBoard, drawLine: true);
     }
 
     /// <summary>打击队列指示器 (FC 调用): 红色杀伤圈 + 编号米字数码 (00T/01N/02X; 在炮上 L-N/R-X) + 预瞄线 (仅在炮任务).
     /// 全部挂板面 (不挂实体 — 大地图照片堆叠会盖淡实体挂件), 位置每帧由实体世界坐标反算到板面.
     /// queuePos -1 = 移出队列 (清退).</summary>
-    public void UpdateQueueIndicator(GameObject entity, Slot slot, int queuePos, bool salvo, BulletType shell, ChargeMode mode, float leadOffset, bool drawLine = false) {
+    public void UpdateQueueIndicator(GameObject entity, Slot slot, int queuePos, bool salvo, BulletType shell, ChargeMode mode, Vector2 aimEnd, bool drawLine = false) {
         if (MapSurfaceRef == null) return;
         if (queuePos < 0) {
             if (_queueMarks.TryGetValue(entity, out var old)) { DestroyRoot(old.Root); DestroyRoot(old.LineRoot); _queueMarks.Remove(entity); }
@@ -305,7 +314,7 @@ public class SandboxRenderer {
             }
             var nest = (Vector2)MapSurfaceRef.InverseTransformPoint(NestRef.position) - entityBoard;
             mark.TargetLine.Start = new Vector3(nest.x, nest.y, 0f);
-            mark.TargetLine.End = Vector3.zero;
+            mark.TargetLine.End = new Vector3(aimEnd.x - entityBoard.x, aimEnd.y - entityBoard.y, 0f); // 终点 = 交汇点 (与轨迹线终点同点); 直瞄 = 目标点
             mark.TargetLine.gameObject.SetActive(true);
         }
         else if (mark.TargetLine != null && mark.TargetLine.gameObject.activeSelf) {
@@ -363,6 +372,21 @@ public class SandboxRenderer {
         im.CreatedAt = Time.time;
         im.FlightRemain = float.NaN; // 等 GC 传导倒计时真值
         im.LastShownSecond = -1;
+        // 目标轨迹线: 击发 → 火控线参数转移给最终线 (冻结, 倒计时驱动缩短), 火控线立即释放 (下个任务解算接管)
+        if (_tracks.TryGetValue(side, out var tr) && tr.Root != null && tr.Root.activeSelf && tr.Target != null && MapSurfaceRef != null) {
+            var fin = EnsureTrack(_finals, side, FinalDashLen, FinalGapLen);
+            fin.Target = tr.Target;
+            fin.AimBoard = tr.AimBoard;
+            fin.VBoard = tr.VBoard;
+            fin.ABoard = tr.ABoard;
+            fin.JBoard = tr.JBoard;
+            fin.T0 = tr.T0;
+            fin.P0Board = (Vector2)MapSurfaceRef.InverseTransformPoint(tr.Target.position); // 冻结起点 = 击发瞬间目标位置
+            fin.FiredAt = Time.time;
+            fin.FlightRemain = float.NaN;
+            fin.Root.SetActive(true);
+            tr.Root.SetActive(false); // 火控线释放
+        }
         ClearChildren(im.FixedRoot.transform);
         DashedLine(im.FixedRoot.transform, im.NestBoard, im.ImpactBoard, 0.006f, Color.red, 0.05f, 0.03f);
         // 实线缓存作废: 下一帧 UpdateImpacts 按新弹道重建 (起点=炮口, 终点=新落点)
@@ -396,6 +420,109 @@ public class SandboxRenderer {
         if (!_impacts.TryGetValue(side, out var im) || im.Root == null) return;
         im.FlightRemain = remain;
         if (remain <= 0f && im.Root.activeSelf) im.Root.SetActive(false); // 落地: 隐藏 (恒定实体, 不销毁)
+        if (_finals.TryGetValue(side, out var fin)) fin.FlightRemain = remain; // 最终轨迹线同源缩短
+    }
+
+    // ===== 目标轨迹线 + 交汇点 (FC 解算 push) =====
+
+    /// <summary>轨迹线恒定实体 (每炮一条, dash 池 32 短线只动端点): 火控线粗粒度 / 最终线细粒度.</summary>
+    private TrackIndicator EnsureTrack(Dictionary<LeftRight, TrackIndicator> dict, LeftRight side, float dashLen, float gapLen) {
+        if (dict.TryGetValue(side, out var tr) && tr.Root != null) return tr;
+        tr = new TrackIndicator { Root = new GameObject(dict == _tracks ? "FCS2_TrackLine" : "FCS2_TrackFinal") };
+        tr.Root.transform.SetParent(MapSurfaceRef, false);
+        tr.DashRoot = new GameObject("FCS2_TrackDash");
+        tr.DashRoot.transform.SetParent(tr.Root.transform, false);
+        tr.DashRoot.transform.localPosition = new Vector3(0f, 0f, GreenOffset);
+        tr.DotRoot = new GameObject("FCS2_TrackDot");
+        tr.DotRoot.transform.SetParent(tr.Root.transform, false);
+        tr.DotRoot.transform.localPosition = new Vector3(0f, 0f, GreenOffset);
+        tr.DashLen = dashLen;
+        tr.GapLen = gapLen;
+        for (int i = 0; i < tr.Dashes.Length; i++)
+            tr.Dashes[i] = Line(tr.DashRoot.transform, Vector2.zero, Vector2.zero, 0.006f, Color.green);
+        FillDot(tr.DotRoot.transform, Vector2.zero, 0.01f, Color.green); // 交汇点 (圆画在局部原点, 移父级)
+        dict[side] = tr;
+        return tr;
+    }
+
+    /// <summary>FC 解算 push (25fps): 火控目标线 (粗粒度绿虚线) + 交汇点 (绿点).
+    /// 曲线 P(τ) = 目标位置 + V·τ + ½A·τ² + ⅙J·τ³ (三次插值弧线), τ∈[0,T], 每帧随解算更新;
+    /// 击发时参数转移给最终线 (见 ImpactFired). target null (无任务/DUMP/解算无效) → 隐藏.</summary>
+    public void UpdateFireSolution(LeftRight side, Transform? target, Vector2 aimBoard, Vector2 vBoard, Vector2 aBoard, Vector2 jBoard, float T) {
+        var tr = EnsureTrack(_tracks, side, TrackDashLen, TrackGapLen);
+        if (target == null || float.IsNaN(T) || T <= 0f) {
+            tr.Root.SetActive(false);
+            tr.Target = null;
+            return;
+        }
+        tr.Target = target;
+        tr.AimBoard = aimBoard;
+        tr.VBoard = vBoard;
+        tr.ABoard = aBoard;
+        tr.JBoard = jBoard;
+        tr.T0 = T;
+        tr.Root.SetActive(true);
+    }
+
+    /// <summary>每帧: 火控线 (τ∈[0,T0], 起点活读目标) 与最终线 (τ∈[progress·T0, T0] 沿冻结曲线缩短,
+    /// 终点恒 = 开火瞬间交汇点, 倒计时归零 = 落地隐藏). dash 段数按曲线弧长/周期动态铺, 多余短线隐藏.</summary>
+    private void UpdateTracks() {
+        foreach (var tr in _tracks.Values) { // 火控线: 开火前解算 (粗粒度)
+            if (tr.Root == null || !tr.Root.activeSelf) continue;
+            if (tr.Target == null || MapSurfaceRef == null) { tr.Root.SetActive(false); continue; } // 目标阵亡/离图 → 隐藏
+            var p0 = (Vector2)MapSurfaceRef.InverseTransformPoint(tr.Target.position); // 起点活读目标
+            int n = BuildDashes(tr, p0, 0f, tr.T0);
+            for (int i = n; i < tr.Dashes.Length; i++) tr.Dashes[i].gameObject.SetActive(false);
+            tr.DotRoot.transform.localPosition = new Vector3(tr.AimBoard.x, tr.AimBoard.y, GreenOffset);
+        }
+        foreach (var fin in _finals.Values) { // 最终线: 击发冻结缩短 (细粒度)
+            if (fin.Root == null || !fin.Root.activeSelf) continue;
+            float remain = fin.FlightRemain;
+            if (float.IsNaN(remain)) remain = fin.T0 - (Time.time - fin.FiredAt); // 本地计时兜底 (GC 静默/表没绑)
+            if (remain <= 0f) { fin.Root.SetActive(false); continue; } // 落地: 隐藏
+            float progress = 1f - remain / fin.T0; // 与红线同口径: 0=刚出膛 1=落地
+            int n = BuildDashes(fin, fin.P0Board, fin.T0 * progress, fin.T0);
+            for (int i = n; i < fin.Dashes.Length; i++) fin.Dashes[i].gameObject.SetActive(false);
+            fin.DotRoot.transform.localPosition = new Vector3(fin.AimBoard.x, fin.AimBoard.y, GreenOffset); // 交汇点不动
+        }
+    }
+
+    private static Vector2 TrackCurve(Vector2 p0, Vector2 v, Vector2 a, Vector2 j, float t) =>
+        p0 + v * t + 0.5f * a * t * t + j * (t * t * t) / 6f;
+
+    /// <summary>沿曲线 τ∈[t0,t1] 按周期 (dash+gap) 铺 dash: 64 点采样累计弧长, dash 端点弧长插值定位.
+    /// 返回铺出的 dash 数 (上限池容量; 曲线短 dash 少, 多余隐藏).</summary>
+    private static int BuildDashes(TrackIndicator tr, Vector2 p0, float t0, float t1) {
+        const int S = 64;
+        tr.Pts[0] = TrackCurve(p0, tr.VBoard, tr.ABoard, tr.JBoard, t0);
+        tr.Cum[0] = 0f;
+        for (int i = 1; i <= S; i++) {
+            tr.Pts[i] = TrackCurve(p0, tr.VBoard, tr.ABoard, tr.JBoard, t0 + (t1 - t0) * i / S);
+            tr.Cum[i] = tr.Cum[i - 1] + (tr.Pts[i] - tr.Pts[i - 1]).magnitude;
+        }
+        float len = tr.Cum[S];
+        float period = tr.DashLen + tr.GapLen;
+        int n = 0;
+        for (float s = 0f; n < tr.Dashes.Length && s < len; n++, s += period) {
+            float e = Mathf.Min(s + tr.DashLen, len);
+            Vector2 a = SampleAt(tr, s), b = SampleAt(tr, e);
+            tr.Dashes[n].Start = new Vector3(a.x, a.y, 0f);
+            tr.Dashes[n].End = new Vector3(b.x, b.y, 0f);
+            tr.Dashes[n].gameObject.SetActive(true);
+        }
+        return n;
+    }
+
+    /// <summary>累计弧长 → 曲线点 (二分定位段 + 线性插值).</summary>
+    private static Vector2 SampleAt(TrackIndicator tr, float s) {
+        int lo = 0, hi = 64;
+        while (lo + 1 < hi) {
+            int mid = (lo + hi) / 2;
+            if (tr.Cum[mid] <= s) lo = mid; else hi = mid;
+        }
+        float seg = tr.Cum[hi] - tr.Cum[lo];
+        float f = seg > 1e-6f ? (s - tr.Cum[lo]) / seg : 0f;
+        return Vector2.Lerp(tr.Pts[lo], tr.Pts[hi], f);
     }
 
     /// <summary>每帧: 落点指示器推进 — 实线未飞段渐短 + 实心红点弹头沿线移动 + 计时数字每秒刷新; 结束隐藏.</summary>
@@ -647,6 +774,26 @@ public class SandboxRenderer {
         public bool Pierce;
         public int LastShownSecond = -1;
         public Il2CppShapes.Line? SolidLine; // 未飞段实线 (缓存, 每帧只动端点)
+    }
+
+    /// <summary>目标轨迹预测线 (每炮两条恒定实体, 绿色 = 火控解算内容): 火控线 = 目标 → 交汇点轨迹 (FC 25fps push, 粗粒度虚线);
+    /// 最终线 = 击发时参数转移冻结 (终点 = 交汇点), 沿冻结曲线缩短 (倒计时驱动), 缩没 = 落地 (细粒度虚线).
+    /// dash 段数按曲线弧长/周期动态铺 (32 短线池每帧只动端点, 多余隐藏).</summary>
+    private class TrackIndicator {
+        public GameObject Root = null!;
+        public GameObject DashRoot = null!;
+        public GameObject DotRoot = null!;
+        public readonly Il2CppShapes.Line[] Dashes = new Il2CppShapes.Line[32];
+        public readonly Vector2[] Pts = new Vector2[65]; // 弧长采样缓存 (避免每帧分配)
+        public readonly float[] Cum = new float[65];
+        public Transform? Target;          // 目标引用 (火控线起点活读)
+        public Vector2 AimBoard;           // 交汇点 (板面)
+        public Vector2 VBoard, ABoard, JBoard; // 轨迹参数 (板面/s, /s², /s³) — 曲线 P(τ) = P0 + V·τ + ½A·τ² + ⅙J·τ³
+        public Vector2 P0Board;            // 最终线冻结起点 (击发瞬间目标位置)
+        public float T0;                   // 解算飞时 (曲线总时长)
+        public float DashLen, GapLen;      // 虚线周期 (火控线粗 / 最终线细)
+        public float FiredAt = float.NaN;  // 冻结时刻 (本地计时兜底)
+        public float FlightRemain = float.NaN; // 倒计时 (GC 传导; NaN = 本地兜底)
     }
 
     private class BallisticMark {

@@ -137,13 +137,20 @@ public class FcsHud {
         // 前导位 = 预定打击时间 (默认 -1 → [--:--:--]); 齐射时右炮行前导 >>>[SALVO] (1.x 同款, 左炮为主炮)
         string id = task != null && task.PlannedStrikeTime > 0f ? MissionClock.Format(task.PlannedStrikeTime) : "[--:--:--]";
         if (!isL && task != null && task.SalvoPair && Fc != null && Fc.LeftTask == task) id = ">>>[SALVO]";
-        string ang = task != null ? $"{task.Angle:000.0}" : "---.-";
-        string dst = task != null ? $"{task.Distance:00.00}" : "--.--";
+        string ang = task != null ? (task.Dump ? "---.-" : $"{task.Angle:000.0}") : "---.-";
+        string dst = task != null ? (task.Dump ? "--.--" : $"{task.Distance:00.00}") : "--.--";
         GUI.Label(new Rect(x, y, _panelRect.width, h),
             $" [{label}] PHASE {code} {name} | [{Center(chamber, 4)}] E:{eStr} A:{aStr} C:{cStr} | FT:{ft}".PadRight(LineWidth));
         y += lh;
         // 第二行 = 火控解析 (与炮无关, FC 解算持续刷新): 解算仰角/方位/装药; 弹种 = 火控指定的弹 (任务给的, 不读膛内); 无任务 [----]
         // T:- = 火控解析飞时 (射表直算, 静态 — 实际倒计时归 Finish Queue 记); 不依赖游戏炮表
+        if (task != null && task.Dump) {
+            // DUMP 占位 (FC 强制退弹): 前导 >>>>[DUMP], 无诸元 — 只显示膛内弹 (平射打掉的那发)
+            GUI.Label(new Rect(x, y, _panelRect.width, h),
+                $" >>>>[DUMP] ---.- --.-- | [{Center(chamber, 4)}] E:--.-- A:---.- C:- | T:---.--".PadRight(LineWidth));
+            y += lh;
+            return;
+        }
         float solE = Fc != null ? (isL ? Fc.SolElevL : Fc.SolElevR) : float.NaN;
         int solC = Fc != null ? (isL ? Fc.SolChargeL : Fc.SolChargeR) : -1;
         string solEStr = task != null && !float.IsNaN(solE) ? $"{solE:00.00}" : "--.--";

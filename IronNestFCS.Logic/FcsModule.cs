@@ -18,7 +18,7 @@ public class FcsModule : IFcsModule
     private GunControl? gunL;
     private GunControl? gunR;
     private CoroutineLock? gcPurchaseLock;
-    private CoroutineLock? gcFireLock;
+    private CoroutineLock? fireLock; // 统一火控锁 (FC 专用 — GC 已不自行平射)
     private Radar? radar2;
     private DisplayControl? display;
     private SandboxRenderer? renderer2;
@@ -45,13 +45,13 @@ public class FcsModule : IFcsModule
         FcsBus.Fire = () => fcs.TriggerConsole.Fire();
 
         gcPurchaseLock = new CoroutineLock();
-        gcFireLock = new CoroutineLock();
+        fireLock = new CoroutineLock();
         var deck = new PurchaseDeck();
         deck.TryBind();
 
         // GC: 两炮执行器
-        gunL = new GunControl(LeftRight.Left, fcs.LeftGun, deck, gcPurchaseLock, gcFireLock);
-        gunR = new GunControl(LeftRight.Right, fcs.RightGun, deck, gcPurchaseLock, gcFireLock);
+        gunL = new GunControl(LeftRight.Left, fcs.LeftGun, deck, gcPurchaseLock);
+        gunR = new GunControl(LeftRight.Right, fcs.RightGun, deck, gcPurchaseLock);
         gunL.SyncPeer = gunR;
         gunR.SyncPeer = gunL;
         gunL.Start();
@@ -89,11 +89,13 @@ public class FcsModule : IFcsModule
             GunR = gunR,
             ConsolePort = fcs.TriggerConsole,
             Calculator = fcs.BallisticCalculator,
-            FireLock = gcFireLock,
+            FireLock = fireLock,
             NestRef = nest,
             MapSurfaceRef = surface,
+            DcPort = display, // 目标参数表直读 (位置/轨迹参数; Entity 失效 → 撤任务)
         };
         fireControl.OnQueueChanged = fc => renderer2.UpdateQueueIndicator(fc);
+        fireControl.OnFireSolution = (side, target, aim, v, a, j, t) => renderer2.UpdateFireSolution(side, target, aim, v, a, j, t);
         fireControl.Start();
         display.FcPort = fireControl;
         hud = new FcsHud { Fc = fireControl, GunL = gunL, GunR = gunR };
