@@ -203,7 +203,10 @@ public class FireControl {
                 aimKm = aim;
             }
             Vector2 nestBoard = MapSurfaceRef != null && NestRef != null ? (Vector2)MapSurfaceRef.InverseTransformPoint(NestRef.position) : Vector2.zero;
-            t.AimBoard = nestBoard + aimKm * GeoMap.MapCellSize; // 交汇点 (板面, 与轨迹线终点同点)
+            // SRC 模式 (TWS 关, 无预瞄) → 预瞄线/交汇点不显示 (NaN 哨兵)
+            t.AimBoard = target.Velocity.magnitude > 0.0001f
+                ? nestBoard + aimKm * GeoMap.MapCellSize
+                : new Vector2(float.NaN, float.NaN);
             t.Angle = angle;
             t.Distance = dist;
         }
@@ -377,7 +380,10 @@ public class FireControl {
                 dist = ld; angle = la; aimKm = aim;
             }
             Vector2 nestBoard = MapSurfaceRef != null && NestRef != null ? (Vector2)MapSurfaceRef.InverseTransformPoint(NestRef.position) : Vector2.zero;
-            task.AimBoard = nestBoard + aimKm * GeoMap.MapCellSize; // 交汇点 (板面, 与轨迹线终点同点)
+            // SRC 模式 (TWS 关, 无预瞄) → 预瞄线/交汇点不显示 (NaN 哨兵); 有预瞄 = 交汇点 (板面, 与轨迹线终点同点)
+            task.AimBoard = vKm.magnitude > 0.0001f
+                ? nestBoard + aimKm * GeoMap.MapCellSize
+                : new Vector2(float.NaN, float.NaN);
             // 装药冻结: 派发帧锁存一次 (初始解析), 之后不再重解析 — 目标运动/距离变化不改变装填计划
             // (每帧重解析会让 DesiredCharge 中途变卦: 装填链换药 COFM 报错 / 膛内药数与仰角解算脱节打飞)
             if (task.LockedCharge < 0) {
@@ -415,7 +421,9 @@ public class FireControl {
             var aKm = isL ? _solAL : _solAR;
             var jKm = isL ? _solJL : _solJR;
             float T = isL ? _solTL : _solTR;
-            bool valid = task != null && !task.Dump && (isL ? _solTaskL : _solTaskR) == task && !float.IsNaN(T);
+            bool valid = task != null && !task.Dump && (isL ? _solTaskL : _solTaskR) == task && !float.IsNaN(T)
+                && vKm.magnitude > 0.0001f   // SRC 模式 (无预瞄): 目标轨迹线/交汇点不 push (DC 隐藏)
+                && !(isL ? _fireL : _fireR); // 击发后冻结: 解算点停住 (继续 push 会前移, 红线终点 = 击发瞬间瞄准点 → 相对滞后)
             OnFireSolution(isL ? LeftRight.Left : LeftRight.Right,
                 valid ? task!.Entity?.transform : null,
                 nestBoard + aimKm * cell, // 交汇点 (板面)
@@ -475,8 +483,9 @@ public class FireControl {
 
     /// <summary>提前量解析解 (三次轨迹曲线): 预测点 = p + v·T + ½a·T² + ⅙j·T³ (e' 在弧上, 不是切线直线),
     /// T = k·r (飞时线性), v/a/j 为地图局部系 (km/s, km/s², km/s³).
-    /// a/j≈0 走原闭式一元二次; 否则数值不动点 8 次 (r = |p + v·k·r + ½a·(k·r)² + ⅙j·(k·r)³|, 收敛快).
-    /// 返回 (瞄准距离 km, 瞄准方位, 瞄准矢量 km 局部系 — 交汇点渲染用).</summary>
+    /// 无 fireDelay 补偿: 解算每帧滑动, 出膛瞬间炮指向的就是最新解算, 按钮→出膛延迟 Δ 只是把双方同步平移,
+    /// 加补偿反而把 aim 前移 Δ·v 打远.
+    /// a/j≈0 走闭式一元二次; 否则数值不动点 8 次. 返回 (瞄准距离 km, 瞄准方位, 瞄准矢量 km 局部系 — 交汇点渲染用).</summary>
     private static (float dist, float angle, Vector2 aim) LeadSolve(float dist, float angle, Vector2 v, Vector2 a, Vector2 j) {
         float k = ShellData.FlightTime(1f, 6); // 飞时斜率 (s/km) 与装药弱相关, 骨架先按满装药取
         Vector2 dir = new(Mathf.Sin(angle * Mathf.Deg2Rad), Mathf.Cos(angle * Mathf.Deg2Rad)); // 方位 0°=+y (北) 顺时针
@@ -484,8 +493,10 @@ public class FireControl {
         float r;
         Vector2 aimF;
         if (a.sqrMagnitude < 1e-10f && j.sqrMagnitude < 1e-10f) { // 匀速: 一元二次闭式
+            // 方程: r = |p + k·r·v| → (1−k²v²)r² − 2k(p·v)r − p² = 0 → b = −2kpv
+            // (b 符号反了会解出 r = |p − k·r·v|: 提前量被反向扣除, 炮弹落在目标身后)
             float pv = Vector2.Dot(p, v), v2 = v.sqrMagnitude;
-            float qa = 1f - k * k * v2, b = 2f * k * pv, c = -p.sqrMagnitude;
+            float qa = 1f - k * k * v2, b = -2f * k * pv, c = -p.sqrMagnitude;
             r = (-b + Mathf.Sqrt(Mathf.Max(b * b - 4f * qa * c, 0f))) / (2f * qa);
             aimF = p + k * r * v;
         }
@@ -558,7 +569,10 @@ public class FireControl {
             if (!armed || !gun.AllReady || !gun.AzimuthSelect) continue; // 不稳回退: 不开火 (已 Arm 不自动回保险; 已击发由 _fire 锁拦)
             if (side == LeftRight.Left ? _fireL : _fireR) continue; // 击发已按 (等触发核心击发 + 收尾)
             if (Mode == FireMode.PreAiming) {
-                if (!float.IsNaN(gun.FlyRemaining)) StartCoroutineHost(FinishRoutine(gun, side, task)); // 玩家击发 (炮表倒计时启动) → 收尾
+                if (!float.IsNaN(gun.FlyRemaining)) { // 玩家击发 (炮表倒计时启动) → 收尾; 置位冻结解算 push (见 PushFireSolutions)
+                    if (side == LeftRight.Left) _fireL = true; else _fireR = true;
+                    StartCoroutineHost(FinishRoutine(gun, side, task));
+                }
                 continue;
             }
             // 预定打击时间: 当前任务时钟 + FlyTime ≥ 预定 → 开火; -1 = 就绪即打
@@ -715,7 +729,11 @@ public class FireControl {
         if (FireLock == null) yield break;
         yield return FireLock.Acquire();
         try {
-            MelonLogger.Msg($"[FC] {side}: FIRE pressed");
+            // 开火对账 (定位"打歪"用): 设定值 vs 实际指向 + 解算交汇点/飞时 (落点与目标轨迹对账)
+            bool isL = side == LeftRight.Left;
+            var aimKm = isL ? _solAimL : _solAimR;
+            float T = isL ? _solTL : _solTR;
+            MelonLogger.Msg($"[FC] {side}: FIRE pressed E: desired={gun.DesiredElevation:F2} actual={gun.Elevation:F2} | A: desired={gun.DesiredAzimuth:F1} actual={gun.Azimuth:F1} | aim=({aimKm.x:F2},{aimKm.y:F2})km T={T:F2}s");
             FcsBus.Fire?.Invoke(); // 击发钮全局一个: 齐射一按两炮齐
         }
         finally { FireLock.Release(); }

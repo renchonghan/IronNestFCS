@@ -43,16 +43,20 @@ public class ClickRaycaster
 
         var mousePos = mouse.position.ReadValue();
         var ray = cam.ScreenPointToRay(new Vector3(mousePos.x, mousePos.y, 0f));
-        if (!Physics.Raycast(ray, out var hit, 1000f))
-            return;
-
-        var hitCollider = hit.collider;
-        foreach (var (collider, onClick, isRight) in targets) {
-            if (collider == null || !collider.Equals(hitCollider)) continue;
-            if (isRight != right) continue;
-            try { onClick?.Invoke(); }
-            catch (Exception ex) { MelonLogger.Error($"[Click] Callback exception: {ex}"); }
-            break;
+        // 取全部命中 (近→远): 不被前景 collider 挡 — 特定视角下游戏 UI/其他棋子先被命中导致目标盒点不动
+        var hits = Physics.RaycastAll(ray, 1000f);
+        System.Array.Sort<RaycastHit>(hits, (a, b) => a.distance.CompareTo(b.distance));
+        foreach (var hit in hits) {
+            bool handled = false;
+            foreach (var (collider, onClick, isRight) in targets) {
+                if (collider == null || !collider.Equals(hit.collider)) continue;
+                if (isRight != right) continue;
+                try { onClick?.Invoke(); }
+                catch (Exception ex) { MelonLogger.Error($"[Click] Callback exception: {ex}"); }
+                handled = true;
+                break;
+            }
+            if (handled) return; // 命中即派发, 不穿透 (前景已注册的 collider 优先)
         }
     }
 

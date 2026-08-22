@@ -27,8 +27,7 @@ public class DisplayControl {
 
     // ===== 内部 =====
     private readonly Dictionary<GameObject, DcTarget> _targetMap = new();    // 目标参数表 (对象复用, FC 直读; Entity → 位置/轨迹参数)
-    private readonly Dictionary<GameObject, List<Vector3>> _posHist = new(); // 粗跟: 5 帧位置环 (所有目标)
-    private readonly Dictionary<GameObject, List<Vector3>> _fineHist = new();// 精跟: 25 帧深度缓存 (上炮目标, 二阶曲线)
+    private readonly Dictionary<GameObject, List<Vector3>> _posHist = new(); // TWS: 5 帧位置环 (所有目标, 定速模型线性滤波)
     private readonly HashSet<GameObject> _icons = new();                     // 已挂图标 (差集用)
     private object? _loopHandle;
     private bool _disposed;
@@ -49,7 +48,6 @@ public class DisplayControl {
         Requests.Clear();
         _targetMap.Clear();
         _posHist.Clear();
-        _fineHist.Clear();
         _icons.Clear();
     }
 
@@ -68,6 +66,9 @@ public class DisplayControl {
 
     /// <summary>铁巢棋子吸附 (旧版 SyncIronNestToken 同款): 按炮塔实际网格位置放棋子, 紧急转移后跟得上.</summary>
     private ImpactMarkerManager? _impactManager;
+
+    // 测试驱动已移除 (自建实体/令牌驱动均为临时测试设施)
+
     private void SyncNestToken() {
         if (NestRef == null) return;
         if (_impactManager == null) {
@@ -107,11 +108,24 @@ public class DisplayControl {
         Targets.AddRange(_targetMap.Values); // 渲染差集/扫荡用列表 (引用复用)
     }
 
-    /// <summary>单目标参数更新/建表: 精跟 = 上炮任务目标 (活读 FC 槽位), TWS 轨迹参数按粗/精跟分档.</summary>
+    /// <summary>单目标参数更新/建表: TWS 轨迹参数 (定速模型, 5 帧线性滤波).</summary>
+    private int _trakFrame;
+    private float _lastTargetLog;
     private void UpsertTarget(GameObject go, string name, Vector3 pos, Side3 side, EntityKind kind, int armour, bool isVirtual) {
-        bool fine = FcPort != null && (FcPort.LeftTask?.Entity == go || FcPort.RightTask?.Entity == go);
+        bool onGun = FcPort != null && (FcPort.LeftTask?.Entity == go || FcPort.RightTask?.Entity == go);
         Vector2 vel = Vector2.zero, acc = Vector2.zero, jerk = Vector2.zero;
-        if (Tws) (vel, acc, jerk) = TrackMotion(go, pos, fine);
+        if (Tws) (vel, acc, jerk) = TrackMotion(go, pos);
+        // 追踪日志: 上炮目标每 8 帧一条 (探针降频, 本体追踪不动)
+        _trakFrame++;
+        if (onGun && _trakFrame % 8 == 0) {
+            MelonLogger.Msg($"[DC] trak {name}: v=({vel.x:F3},{vel.y:F3}) |v|={vel.magnitude:F3}km/s");
+        }
+        // 目标点对账日志: 上炮目标每秒一条板面位置 (与开火探针的 aim/T 对账: 落地时刻目标在哪 vs 落点在哪)
+        if (onGun && Time.time - _lastTargetLog >= 1f) {
+            _lastTargetLog = Time.time;
+            var b = MapSurfaceRef != null ? (Vector2)MapSurfaceRef.InverseTransformPoint(pos) : Vector2.zero;
+            MelonLogger.Msg($"[DC] tgt {name}: board=({b.x:F3},{b.y:F3})");
+        }
         if (_targetMap.TryGetValue(go, out var t)) {
             t.WorldPos = pos;
             t.Velocity = vel;
@@ -132,55 +146,31 @@ public class DisplayControl {
         if (go == null) return null;
         return _targetMap.TryGetValue(go, out var t) ? t : null;
     }
-
-    /// <summary>TWS 运动估计 (轨迹参数: 速度/加速度/三次项, km/s, km/s², km/s³):
-    /// 粗跟 (所有目标): 5 帧环一阶 LS 直出; 精跟 (上炮目标): 25 深度缓存 — 进入时压入粗跟记录接续 (不丢历史),
-    /// 缓存满 25 帧 (采样帧 1/9/17/25 = a-b-c-d 三段轨迹固定) 转三次插值曲线; 积累期继续一阶输出; 退出精跟降回粗跟 (清缓存).</summary>
-    private (Vector2 v, Vector2 a, Vector2 j) TrackMotion(GameObject go, Vector3 pos, bool fine) {
+    /// <summary>TWS 运动估计 (定速模型): 25 帧环一阶最小二乘 (线性滤波) → v; a/j 不估 (恒 0).
+    /// 窗口 25 帧 (1s): 匀速直线拟合精确且噪声低一个量级 (5 帧窗口 v 噪声 ~3.6% → 15s 飞时提前量偏半个身位);
+    /// 变速目标天然滞后 0.5s — 定速模型的既定取舍. FC 走 v-only 闭式解, 渲染退化直线.</summary>
+    private (Vector2 v, Vector2 a, Vector2 j) TrackMotion(GameObject go, Vector3 pos) {
+        // 位置统一转板面局部系: 实体世界与板面有 ~2 倍缩放差 (surface TransformPoint 缩放),
+        // 差分必须在同尺度 — 3.8164 (km→板面) 是板面口径
+        if (MapSurfaceRef != null) pos = MapSurfaceRef.InverseTransformPoint(pos);
         if (!_posHist.TryGetValue(go, out var hist)) _posHist[go] = hist = new List<Vector3>();
         hist.Add(pos);
-        if (hist.Count > 5) hist.RemoveAt(0);
-        if (fine) {
-            if (!_fineHist.TryGetValue(go, out var fh)) {
-                _fineHist[go] = fh = new List<Vector3>();
-                fh.AddRange(hist); // 粗跟记录压入 (接续, 不丢历史)
-            }
-            fh.Add(pos);
-            if (fh.Count > 25) fh.RemoveAt(0);
-            if (fh.Count >= 25) return ThirdOrder(fh); // 缓存满 (帧 1/9/17/25 = 4 采样点): a-b-c-d 三段轨迹固定 → 三次插值曲线 (e' 预测)
-        }
-        else {
-            _fineHist.Remove(go); // 退出精跟: 降回粗跟
-        }
+        if (hist.Count > 25) hist.RemoveAt(0);
         if (hist.Count < 5) return (Vector2.zero, Vector2.zero, Vector2.zero); // 不足 5 帧: 无跟踪
-        // 一阶: 最近 5 帧最小二乘斜率 (Σ(t-t̄)²=10); 精跟过渡期同样走这里
+        int n = hist.Count;
+        float tbar = (n - 1) / 2f;
+        float den = 0f;
+        for (int i = 0; i < n; i++) den += (i - tbar) * (i - tbar);
         Vector2 slope = Vector2.zero;
-        for (int i = 0; i < hist.Count; i++) slope += (Vector2)hist[i] * (i - 2);
-        slope /= 10f;
-        return (slope * 25f / 3.8164f, Vector2.zero, Vector2.zero); // 帧斜率 × 25fps → km/s
-    }
-
-    /// <summary>三次插值曲线解析 (精跟, 缓存满 25 帧): 采样点帧 1/9/17/25 (索引 0/8/16/24, 间隔 8 帧 = 0.32s),
-    /// 三次插值多项式过 4 点 (插值样条/SAI2 手感, 无尖角), 最新点 P₃ 端点导数 = 牛顿后差闭式:
-    /// v = [11P₃-18P₂+9P₁-2P₀]/(6h), a = [2P₃-5P₂+4P₁-P₀]/h², j = [P₃-3P₂+3P₁-P₀]/h³.
-    /// 曲线延伸 P(d+T) = p + vT + ½aT² + ⅙jT³ (e' 在弧上, 不是切线直线); 匀速直线 Δ²=Δ³=0 自动退化纯 v.
-    /// 返回 (v, a, j) km/s, km/s², km/s³.</summary>
-    private static (Vector2 v, Vector2 a, Vector2 j) ThirdOrder(List<Vector3> hist) {
-        const float h = 8f * 0.04f; // 采样间隔 8 帧 = 0.32s (25fps)
-        Vector2 p0 = hist[0], p1 = hist[8], p2 = hist[16], p3 = hist[24];
-        Vector2 v = (p3 * 11f - p2 * 18f + p1 * 9f - p0 * 2f) / (6f * h);
-        Vector2 a = (p3 * 2f - p2 * 5f + p1 * 4f - p0) / (h * h);
-        Vector2 j = (p3 - p2 * 3f + p1 * 3f - p0) / (h * h * h);
-        return (v / 3.8164f, a / 3.8164f, j / 3.8164f); // 世界单位 → km
+        for (int i = 0; i < n; i++) slope += (Vector2)hist[i] * (i - tbar);
+        slope /= den;
+        return (slope * 25f * 3.8164f, Vector2.zero, Vector2.zero); // 帧斜率 (板面/帧) × 25fps × 3.8164 = km/s
     }
 
     private void PruneHistories(HashSet<GameObject> alive) {
         var dead = new List<GameObject>();
         foreach (var k in _posHist.Keys) if (!alive.Contains(k)) dead.Add(k);
         foreach (var k in dead) _posHist.Remove(k);
-        dead.Clear();
-        foreach (var k in _fineHist.Keys) if (!alive.Contains(k)) dead.Add(k);
-        foreach (var k in dead) _fineHist.Remove(k);
     }
 
     /// <summary>实体图标差集 (DC 自己的活): 在列表→画, 不在→删 (渲染线程执行 3D 挂件管理); 令牌虚拟目标不画.</summary>
@@ -328,7 +318,7 @@ public class DisplayControl {
 
     /// <summary>开关 (3D 按钮列/火控台按钮由场景交互层调用).</summary>
     public void SetAutoTask(bool on) { AutoTask = on; }
-    public void SetTws(bool on) { Tws = on; if (!on) { _posHist.Clear(); _fineHist.Clear(); } }
+    public void SetTws(bool on) { Tws = on; if (!on) _posHist.Clear(); }
 
     // ===== 渲染线程回调 (SandboxRenderer 挂接) =====
     public System.Action<DcTarget>? OnIconSpawn;    // 新实体 → 画图标

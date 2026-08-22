@@ -68,13 +68,30 @@ public class ScenePanel {
         _built = false;
     }
 
-    /// <summary>每帧: 点击检测 + 新实体右键注册 (1s 一批, 去重).</summary>
+    /// <summary>每帧: 点击检测 + 点击盒世界归正 + 新实体右键注册 (1s 一批, 去重).</summary>
     public void Update() {
         if (!_built) return;
         _clicks.Update();
+        StraightenClickBoxes(); // 盒世界系水平归正 (棋子照片倾斜时盒跟着斜, 特定视角射线擦边点不中)
         if (Time.time - _lastRegister > 1f) {
             _lastRegister = Time.time;
             RegisterEntityRightClicks();
+        }
+    }
+
+    /// <summary>点击盒每帧归正: 旋转清零 (世界水平薄片, 任何视角可命中) + 位置只跟实体位置 (不受实体倾斜牵连).</summary>
+    private void StraightenClickBoxes() {
+        _entityColliders.RemoveWhere(c => c == null);
+        _tokenColliders.RemoveWhere(c => c == null);
+        foreach (var c in _entityColliders) {
+            var t = c.transform;
+            t.rotation = Quaternion.identity;
+            t.position = t.parent.position;
+        }
+        foreach (var c in _tokenColliders) {
+            var t = c.transform;
+            t.rotation = Quaternion.identity;
+            t.position = t.parent.position;
         }
     }
 
@@ -89,7 +106,7 @@ public class ScenePanel {
             boxGo.transform.SetParent(c.Entity.transform, false);
             boxGo.transform.localPosition = new Vector3(0f, 0f, -0.01f);
             var box = boxGo.AddComponent<BoxCollider>();
-            box.size = new Vector3(0.22f, 0.22f, 0.05f);
+            box.size = new Vector3(0.26f, 0.26f, 0.1f);
             _owned.Add(boxGo); // 随 ShutDown 清理
             _entityColliders.Add(box);
             var go = c.Entity;
@@ -111,7 +128,7 @@ public class ScenePanel {
                 boxGo.transform.SetParent(go.transform, false);
                 boxGo.transform.localPosition = new Vector3(0f, 0f, -0.01f);
                 var box = boxGo.AddComponent<BoxCollider>();
-                box.size = new Vector3(0.22f, 0.22f, 0.05f);
+                box.size = new Vector3(0.26f, 0.26f, 0.1f);
                 _owned.Add(boxGo); // 随 ShutDown 清理
                 col = box;
             }
