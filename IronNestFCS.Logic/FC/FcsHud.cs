@@ -70,17 +70,17 @@ public class FcsHud {
         GUI.color = Color.white;
     }
 
-    /// <summary>队列行: [预定打击时间] 方位 距离 弹种 模式字母 (弹种不补宽, 固定两空格); 预定 -1 = [--:--:--].</summary>
+    /// <summary>队列行: [预定打击时间] 方位 距离 弹种 模式字母 (弹种补宽居中 4, 与膛内显示同口径 — 2 字符弹种前后各补一空格, 队列行对齐); 预定 -1 = [--:--:--].</summary>
     private static string QueueRow(FireTask t) {
         string planned = t.PlannedStrikeTime > 0f ? MissionClock.Format(t.PlannedStrikeTime) : "[--:--:--]";
         char mode = t.Mode switch { ChargeMode.Tight => 'T', ChargeMode.Extra => 'X', _ => 'N' };
-        return $"{planned} {t.Angle:000.0} {t.Distance:00.00}  {t.Shell}  {mode}";
+        return $"{planned} {t.Angle:000.0} {t.Distance:00.00}  {Center(t.Shell.ToString(), 4)}  {mode}";
     }
 
     /// <summary>齐射对第二行: 前导 >>>[SALVO] (10 字符, 与 [--:--:--] 同宽), 数据同首行.</summary>
     private static string SalvoRow(FireTask t) {
         char mode = t.Mode switch { ChargeMode.Tight => 'T', ChargeMode.Extra => 'X', _ => 'N' };
-        return $">>>[SALVO] {t.Angle:000.0} {t.Distance:00.00}  {t.Shell}  {mode}";
+        return $">>>[SALVO] {t.Angle:000.0} {t.Distance:00.00}  {Center(t.Shell.ToString(), 4)}  {mode}";
     }
 
     /// <summary>完成行: 抵达时刻 [HH:MM:SS] (无任务时钟 = 横线) 方位 距离 T:-剩余秒 (炮表倒计时, 与任务时钟无关).</summary>
