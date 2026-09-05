@@ -85,9 +85,9 @@ public class FcsHud {
 
     /// <summary>完成行: 抵达时刻 [HH:MM:SS] (无任务时钟 = 横线) 方位 距离 T:-剩余秒.
     /// 封存双信号: 活读炮表归零 = 炮表口径落地, 立即封存 (与游戏计时器同步; 单炮不会两弹同飞,
-    /// 落地信号必在下一发开火前发生, 不会失守); 本地归零 (Fly − 击发时刻) 只做双保险 —
-    /// 但注意 FireMission 记的是收尾时刻, 比真击发晚 ~1.2s, 本地剩余晚归零 1.2s, 不能单独靠它判.
-    /// 活读值明显大于本地剩余 (>1.5s) = 不属于自己, 回本地; NaN → 本地兜底显示.</summary>
+    /// 落地信号必在下一发开火前发生, 不会失守); 本地归零 (Fly − FireMission) 双保险.
+    /// FireMission = GC 记的出膛时刻 (见 FinishTask), 本地与红线同基准;
+    /// 炮表倒计时启动晚 ~1s, 活读恒比本地大 ~1s (正常, 与游戏计时器同口径), 超过 1.5s = 不属于自己 → 回本地; NaN = 落地 (GC 停止传导).</summary>
     private static string FinishRow(FireControl.FinishedEntry f) {
         string arrival = MissionClock.Format(f.FireMission + f.Fly);
         float remain;

@@ -791,7 +791,9 @@ public class FireControl {
         if (gun == null) return;
         task.LockedCharge = -1; // 装药冻结随任务生命周期走
         if (!task.Dump) { // DUMP 占位不进完成队列 (内部退弹不是打击任务)
-            _finished.Add(new FinishedEntry { Task = task, Fly = gun.FlyTime, FireMission = MissionClock.Seconds, RemainingSource = () => gun.FlyRemaining }); // 活读炮表 (HUD 侧落地封存, 不再跟着后续发射跳)
+            // FireMission = GC 记的出膛时刻任务时钟 — 炮表倒计时启动晚 ~1s, 用启动时刻会让抵达时刻/本地剩余系统性偏晚 (传导时间问题)
+            float firedAt = !float.IsNaN(gun.FiredAtMission) ? gun.FiredAtMission : MissionClock.Seconds;
+            _finished.Add(new FinishedEntry { Task = task, Fly = gun.FlyTime, FireMission = firedAt, RemainingSource = () => gun.FlyRemaining }); // 活读炮表 (HUD 侧落地封存, 不再跟着后续发射跳)
             if (_finished.Count > 8) _finished.RemoveAt(0);
         }
         MelonLogger.Msg($"[FC] {side}: {(task.Dump ? "DUMP done (chamber cleared)" : $"finished fc#{task.Id} (fly={gun.FlyTime:F2}s)")}");

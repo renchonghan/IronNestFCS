@@ -164,7 +164,7 @@ public class DisplayControl {
         Vector2 slope = Vector2.zero;
         for (int i = 0; i < n; i++) slope += (Vector2)hist[i] * (i - tbar);
         slope /= den;
-        return (slope * 25f * 3.8164f, Vector2.zero, Vector2.zero); // 帧斜率 (板面/帧) × 25fps × 3.8164 = km/s
+        return (slope * 25f * GeoMap.KmPerLocal, Vector2.zero, Vector2.zero); // 帧斜率 (板面/帧) × 25fps × KmPerLocal = km/s
     }
 
     private void PruneHistories(HashSet<GameObject> alive) {
@@ -289,13 +289,10 @@ public class DisplayControl {
         }
     }
 
-    /// <summary>棋盘边界 (A-T × 1-10 网格, 留 0.2 余量): 令牌世界坐标 → 板面局部判定.</summary>
+    /// <summary>棋盘边界 (A-T × 1-10 网格, 留 0.2 余量): 令牌世界坐标 → 板面局部判定 (统一 GeoMap.IsOnBoard).</summary>
     private bool IsOnMap(Vector3 worldPos) {
         if (MapSurfaceRef == null) return false;
-        var lp = MapSurfaceRef.InverseTransformPoint(worldPos);
-        float x0 = GeoMap.MapBottomLeft.x - 0.2f, x1 = GeoMap.MapBottomLeft.x + 20f * GeoMap.MapCellSize + 0.2f;
-        float y0 = GeoMap.MapBottomLeft.y - 0.2f, y1 = GeoMap.MapBottomLeft.y + 10f * GeoMap.MapCellSize + 0.2f;
-        return lp.x >= x0 && lp.x <= x1 && lp.y >= y0 && lp.y <= y1;
+        return GeoMap.IsOnBoard(MapSurfaceRef.InverseTransformPoint(worldPos), 0.2f);
     }
 
     /// <summary>地图上令牌右键 → 虚拟目标入队 (与实体右键同款 toggle 语义).</summary>

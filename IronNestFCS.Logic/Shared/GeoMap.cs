@@ -8,10 +8,11 @@ namespace IronNestFCS.Logic.FCS;
 /// </summary>
 public static class GeoMap {
     // 沙盘校准: 网格 A-T × 1-10 映射到棋子局部系
-    // 格长用代码原有比例 1/3.8164 (1 棋盘单位 = 3.8164 km); 左下角用 1 药平射真实落点解出:
+    // 格长用代码原有比例 1/KmPerLocal (1 棋盘单位 = 3.8164 km); 左下角用 1 药平射真实落点解出:
     // 目标 (-1.88,0.97) = 左下角 + 网格 (2.85,8.95) × 格长
-    public static readonly Vector2 MapBottomLeft = new(-2.6238f, -1.3741f); // 网格原点 (A1) 在棋子空间的位置 (含目测修正: 右 0.1 小格 / 上 1/20 小格)
-    public static readonly float MapCellSize = 1f / 3.8164f;                 // 每大格的棋子空间尺寸
+    public const float KmPerLocal = 3.8164f;                                  // 1 板面/棋子局部单位 = 3.8164 km (历史"×/÷ 弄反"事故地, 换算一律经这里)
+    public static readonly float MapCellSize = 1f / KmPerLocal;               // 每大格的棋子空间尺寸
+    public static readonly Vector2 MapBottomLeft = new(-2.6238f, -1.3741f);   // 网格原点 (A1) 在棋子空间的位置 (含目测修正: 右 0.1 小格 / 上 1/20 小格)
     /// <summary>公里 → 棋子局部系偏移 (Fire Mission Root 局部 km 坐标基准, 自既有公式提取).</summary>
     public static readonly Vector3 KmOffset = new(10.016f, 5.235f, 0f);
 
@@ -20,14 +21,22 @@ public static class GeoMap {
         new(MapBottomLeft.x + grid.x * MapCellSize, MapBottomLeft.y + grid.y * MapCellSize, z);
 
     /// <summary>棋子局部坐标 → 公里坐标 (Fire Mission 系).</summary>
-    public static Vector3 LocalToKm(Vector3 local) => local * 3.8164f + KmOffset;
+    public static Vector3 LocalToKm(Vector3 local) => local * KmPerLocal + KmOffset;
 
     /// <summary>地图局部系两点差 → (距离 km, 方位角°, 0-360).</summary>
     public static (float dist, float angle) RelToTarget(Vector2 from, Vector2 to) {
         var t = to - from;
-        float dist = t.magnitude * 3.8164f;
+        float dist = t.magnitude * KmPerLocal;
         float angle = Vector2.SignedAngle(t, Vector2.up);
         if (angle < 0) angle += 360;
         return (dist, angle);
+    }
+
+    /// <summary>棋盘边界判定 (板面局部坐标): A-T × 1-10 网格, 向外扩 margin (板面单位).
+    /// 落点/令牌上下图判定统一走这里 (旧有两份口径不同的边界代码).</summary>
+    public static bool IsOnBoard(Vector2 local, float margin) {
+        float x0 = MapBottomLeft.x - margin, x1 = MapBottomLeft.x + 20f * MapCellSize + margin;
+        float y0 = MapBottomLeft.y - margin, y1 = MapBottomLeft.y + 10f * MapCellSize + margin;
+        return local.x >= x0 && local.x <= x1 && local.y >= y0 && local.y <= y1;
     }
 }

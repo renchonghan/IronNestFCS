@@ -314,16 +314,7 @@ public class SandboxRenderer {
         // LineRoot 直接挂板面 (落点层), 线 z=0 即可; 恒定实体: 建一次, 不用就隐藏
         if (drawLine && NestRef != null) {
             if (mark.TargetLine == null) {
-                var go = new GameObject("FCS2_TargetLine");
-                go.transform.SetParent(mark.LineRoot.transform, false);
-                mark.TargetLine = go.AddComponent<Il2CppShapes.Line>();
-                mark.TargetLine.Thickness = 0.006f;
-                mark.TargetLine.Dashed = true;
-                mark.TargetLine.Color = Color.green;
-                mark.TargetLine.ColorStart = Color.green;
-                mark.TargetLine.ColorEnd = Color.green;
-                var r = go.GetComponent<Renderer>(); // 恒定实体不走 Line(), 这里单独设 (绿层: 绿色元素统一绿权重)
-                if (r != null) r.material.renderQueue = QueueTop - GreenPrio;
+                mark.TargetLine = CreateDashedLine(mark.LineRoot.transform, "FCS2_TargetLine", 0.006f, Color.green, GreenPrio); // 绿层: 绿色元素统一绿权重
             }
             var nest = (Vector2)MapSurfaceRef.InverseTransformPoint(NestRef.position) - entityBoard;
             var endPt = hasAim ? aimEnd - entityBoard : Vector2.zero; // 无预瞄: 直瞄线 (终点 = 目标)
@@ -360,12 +351,8 @@ public class SandboxRenderer {
             && !float.IsNaN(trLine.AimBoard.x) && !float.IsNaN(trLine.AimBoard.y)) {
             MelonLogger.Msg($"[DC] impact src: gc=({board.x:F3},{board.y:F3}) fc=({trLine.AimBoard.x:F3},{trLine.AimBoard.y:F3}) d={Vector2.Distance(board, trLine.AimBoard):F3}板面");
         }
-        // 边界检查: 落点出地图 (向外扩一小格) 不显示指示器 — 落点打到板外时红线别飞出火控台
-        float x0 = GeoMap.MapBottomLeft.x - GeoMap.MapCellSize;
-        float x1 = GeoMap.MapBottomLeft.x + 20f * GeoMap.MapCellSize + GeoMap.MapCellSize;
-        float y0 = GeoMap.MapBottomLeft.y - GeoMap.MapCellSize;
-        float y1 = GeoMap.MapBottomLeft.y + 10f * GeoMap.MapCellSize + GeoMap.MapCellSize;
-        if (board.x < x0 || board.x > x1 || board.y < y0 || board.y > y1) return;
+        // 边界检查: 落点出地图 (向外扩一小格) 不显示指示器 — 落点打到板外时红线别飞出火控台 (统一 GeoMap.IsOnBoard)
+        if (!GeoMap.IsOnBoard(board, GeoMap.MapCellSize)) return;
         if (!_impacts.TryGetValue(side, out var im) || im.Root == null) {
             im = new ImpactIndicator { Root = new GameObject("FCS2_ImpactIndicator") };
             im.Root.transform.SetParent(MapSurfaceRef, false);
@@ -417,16 +404,7 @@ public class SandboxRenderer {
         }
         // 红色固定虚线 (全长弹道, 落地保留): 与 A1 同款 — 游戏 Dashed 材质单线, 保持红色 (恒定实体, 建一次)
         if (im.FixedLine == null) {
-            var go = new GameObject("FCS2_ImpactFixed");
-            go.transform.SetParent(im.FixedRoot.transform, false);
-            im.FixedLine = go.AddComponent<Il2CppShapes.Line>();
-            im.FixedLine.Thickness = 0.006f;
-            im.FixedLine.Dashed = true;
-            im.FixedLine.Color = Color.red;
-            im.FixedLine.ColorStart = Color.red;
-            im.FixedLine.ColorEnd = Color.red;
-            var r = go.GetComponent<Renderer>(); // 恒定实体不走 Line(), 单独设 (Impact 层)
-            if (r != null) r.material.renderQueue = QueueTop - ImpactPrio;
+            im.FixedLine = CreateDashedLine(im.FixedRoot.transform, "FCS2_ImpactFixed", 0.006f, Color.red, ImpactPrio);
         }
         im.FixedLine.Start = new Vector3(im.NestBoard.x, im.NestBoard.y, 0f);
         im.FixedLine.End = new Vector3(im.ImpactBoard.x, im.ImpactBoard.y, 0f);
@@ -734,6 +712,22 @@ public class SandboxRenderer {
     }
 
     // ===== 图元 =====
+
+    /// <summary>游戏 Dashed 材质单线 (A1 预瞄线 / C1 红固定虚线同款): 恒定实体建一次, 之后只动端点.
+    /// 恒定实体不走 Line(), renderQueue 在此单独按层设.</summary>
+    private static Il2CppShapes.Line CreateDashedLine(Transform parent, string name, float thickness, Color color, int prio) {
+        var go = new GameObject(name);
+        go.transform.SetParent(parent, false);
+        var line = go.AddComponent<Il2CppShapes.Line>();
+        line.Thickness = thickness;
+        line.Dashed = true;
+        line.Color = color;
+        line.ColorStart = color;
+        line.ColorEnd = color;
+        var r = go.GetComponent<Renderer>();
+        if (r != null) r.material.renderQueue = QueueTop - prio;
+        return line;
+    }
 
     private static Il2CppShapes.Line Line(Transform parent, Vector2 a, Vector2 b, float thickness, Color color, int prio = GreenPrio) {
         var go = new GameObject("FCS2_Seg");
