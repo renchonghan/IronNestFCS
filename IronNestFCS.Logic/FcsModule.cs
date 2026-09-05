@@ -151,7 +151,7 @@ public class FcsModule : IFcsModule
         fireControl = null;
         hud = null;
         scenePanel = null;
-        MissionClock.Reset();
+        IronNestFCS.Logic.FCS.MissionClock.Reset(); // 全限定: Il2Cpp 命名空间有同名 MissionClock (游戏新版本), 消歧义
         FcsBus.TurretRead = null;
         FcsBus.TurretVelRead = null;
         FcsBus.TurretSet = null;

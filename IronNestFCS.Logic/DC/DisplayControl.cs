@@ -27,7 +27,7 @@ public class DisplayControl {
 
     // ===== 内部 =====
     private readonly Dictionary<GameObject, DcTarget> _targetMap = new();    // 目标参数表 (对象复用, FC 直读; Entity → 位置/轨迹参数)
-    private readonly Dictionary<GameObject, List<Vector3>> _posHist = new(); // TWS: 5 帧位置环 (所有目标, 定速模型线性滤波)
+    private readonly Dictionary<GameObject, List<Vector3>> _posHist = new(); // TWS: 75 帧位置环 (所有目标, 定速模型线性滤波)
     private readonly HashSet<GameObject> _icons = new();                     // 已挂图标 (差集用)
     private object? _loopHandle;
     private bool _disposed;
@@ -85,7 +85,7 @@ public class DisplayControl {
     }
 
     /// <summary>SRC → 目标参数表 (对象复用, FC 直读): 相对位置 (方位/距离) + TWS 轨迹参数 (速度/加速度).
-    /// 粗跟 (所有目标): 5 帧环一阶; 精跟 (上炮目标): 25 深度缓存二阶曲线 (过渡期一阶输出).</summary>
+    /// 所有目标同轨: 75 帧环一阶定速 (无精跟/粗跟之分).</summary>
     private void RefreshTargets() {
         var alive = new HashSet<GameObject>();
         foreach (var c in RadarPort.Contacts) {
@@ -108,7 +108,7 @@ public class DisplayControl {
         Targets.AddRange(_targetMap.Values); // 渲染差集/扫荡用列表 (引用复用)
     }
 
-    /// <summary>单目标参数更新/建表: TWS 轨迹参数 (定速模型, 5 帧线性滤波).</summary>
+    /// <summary>单目标参数更新/建表: TWS 轨迹参数 (定速模型, 75 帧线性滤波).</summary>
     private int _trakFrame;
     private float _lastTargetLog;
     private void UpsertTarget(GameObject go, string name, Vector3 pos, Side3 side, EntityKind kind, int armour, bool isVirtual) {
@@ -146,16 +146,16 @@ public class DisplayControl {
         if (go == null) return null;
         return _targetMap.TryGetValue(go, out var t) ? t : null;
     }
-    /// <summary>TWS 运动估计 (定速模型): 25 帧环一阶最小二乘 (线性滤波) → v; a/j 不估 (恒 0).
-    /// 窗口 25 帧 (1s): 匀速直线拟合精确且噪声低一个量级 (5 帧窗口 v 噪声 ~3.6% → 15s 飞时提前量偏半个身位);
-    /// 变速目标天然滞后 0.5s — 定速模型的既定取舍. FC 走 v-only 闭式解, 渲染退化直线.</summary>
+    /// <summary>TWS 运动估计 (定速模型): 75 帧环一阶最小二乘 (线性滤波) → v; a/j 不估 (恒 0).
+    /// 窗口 75 帧 (3s): 匀速直线拟合精确, 窗口愈长噪声愈低 (LS 斜率噪声 ∝ 1/√N) — 预瞄点 = 目标 + v×T, v 的帧间波动被飞时放大, 长窗口直接压预瞄抖动;
+    /// 变速目标天然滞后 1.5s — 定速模型的既定取舍. FC 走 v-only 闭式解, 渲染退化直线.</summary>
     private (Vector2 v, Vector2 a, Vector2 j) TrackMotion(GameObject go, Vector3 pos) {
         // 位置统一转板面局部系: 实体世界与板面有 ~2 倍缩放差 (surface TransformPoint 缩放),
         // 差分必须在同尺度 — 3.8164 (km→板面) 是板面口径
         if (MapSurfaceRef != null) pos = MapSurfaceRef.InverseTransformPoint(pos);
         if (!_posHist.TryGetValue(go, out var hist)) _posHist[go] = hist = new List<Vector3>();
         hist.Add(pos);
-        if (hist.Count > 25) hist.RemoveAt(0);
+        if (hist.Count > 75) hist.RemoveAt(0);
         if (hist.Count < 5) return (Vector2.zero, Vector2.zero, Vector2.zero); // 不足 5 帧: 无跟踪
         int n = hist.Count;
         float tbar = (n - 1) / 2f;

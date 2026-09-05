@@ -63,7 +63,7 @@ public class FcsHud {
         }
         for (int i = 0; i < 8; i++) {
             string left = i < rows.Count ? rows[i] : "";
-            string right = i < finished.Count ? FinishRow(finished[i]) : "";
+            string right = i < finished.Count ? FinishRow(finished[finished.Count - 1 - i]) : ""; // 完成队列倒序: 最新在最上面
             GUI.Label(new Rect(x, y, _panelRect.width, h), $" {left,-30}|{right}");
             y += lh;
         }
@@ -83,13 +83,26 @@ public class FcsHud {
         return $">>>[SALVO] {t.Angle:000.0} {t.Distance:00.00} {Center(t.Shell.ToString(), 4)} {mode}";
     }
 
-    /// <summary>完成行: 抵达时刻 [HH:MM:SS] (无任务时钟 = 横线) 方位 距离 T:-剩余秒 (炮表倒计时, 与任务时钟无关).</summary>
+    /// <summary>完成行: 抵达时刻 [HH:MM:SS] (无任务时钟 = 横线) 方位 距离 T:-剩余秒.
+    /// 封存双信号: 活读炮表归零 = 炮表口径落地, 立即封存 (与游戏计时器同步; 单炮不会两弹同飞,
+    /// 落地信号必在下一发开火前发生, 不会失守); 本地归零 (Fly − 击发时刻) 只做双保险 —
+    /// 但注意 FireMission 记的是收尾时刻, 比真击发晚 ~1.2s, 本地剩余晚归零 1.2s, 不能单独靠它判.
+    /// 活读值明显大于本地剩余 (>1.5s) = 不属于自己, 回本地; NaN → 本地兜底显示.</summary>
     private static string FinishRow(FireControl.FinishedEntry f) {
         string arrival = MissionClock.Format(f.FireMission + f.Fly);
-        float remain = f.RemainingSource?.Invoke() ?? float.NaN;
-        if (float.IsNaN(remain)) {
+        float remain;
+        if (f.Done) {
+            remain = 0f; // 已落地封存
+        }
+        else {
             float now = MissionClock.Seconds;
-            remain = float.IsNaN(now) ? 0f : f.Fly - (now - f.FireMission);
+            float local = float.IsNaN(now) ? float.NaN : f.Fly - (now - f.FireMission);
+            if (!float.IsNaN(local) && local <= 0f) { f.Done = true; remain = 0f; } // 双保险: 本地归零
+            else {
+                remain = f.RemainingSource?.Invoke() ?? float.NaN;
+                if (remain <= 0.01f || float.IsNaN(remain)) { f.Done = true; remain = 0f; } // 归零或 NaN (落地后 GC 不再传导) = 落地, 立即封存 (主信号)
+                else if (remain > local + 1.5f) remain = local; // 不属于自己 (活读明显大于本地剩余) → 本地显示
+            }
         }
         string cd = remain > 0.01f ? $"{remain:00.00}" : "--.--"; // 前缀 T:- 固定, 占位只补 --.--
         return $"{arrival} {f.Task.Angle:000.0} {f.Task.Distance:00.00} T:-{cd}";

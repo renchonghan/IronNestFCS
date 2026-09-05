@@ -791,7 +791,7 @@ public class FireControl {
         if (gun == null) return;
         task.LockedCharge = -1; // 装药冻结随任务生命周期走
         if (!task.Dump) { // DUMP 占位不进完成队列 (内部退弹不是打击任务)
-            _finished.Add(new FinishedEntry { Task = task, Fly = gun.FlyTime, FireMission = MissionClock.Seconds, RemainingSource = () => gun.FlyRemaining });
+            _finished.Add(new FinishedEntry { Task = task, Fly = gun.FlyTime, FireMission = MissionClock.Seconds, RemainingSource = () => gun.FlyRemaining }); // 活读炮表 (HUD 侧落地封存, 不再跟着后续发射跳)
             if (_finished.Count > 8) _finished.RemoveAt(0);
         }
         MelonLogger.Msg($"[FC] {side}: {(task.Dump ? "DUMP done (chamber cleared)" : $"finished fc#{task.Id} (fly={gun.FlyTime:F2}s)")}");
@@ -804,12 +804,14 @@ public class FireControl {
         ClearSyncIfAlone();
     }
 
-    /// <summary>完成队列条目 (HUD Finish Queue 用): 抵达时刻 = FireMission + Fly; 倒计时吃炮表剩余 (与任务时钟无关).</summary>
+    /// <summary>完成队列条目 (HUD Finish Queue 用): 抵达时刻 = FireMission + Fly; 倒计时活读炮表剩余,
+    /// 归零后 HUD 侧置 Done 封存 (不再活读 — 防止跟随后续发射跳).</summary>
     public class FinishedEntry {
         public FireTask Task = null!;
         public float Fly;
         public float FireMission;
         public System.Func<float>? RemainingSource;
+        public bool Done; // 落地封存 (倒计时不再活读)
     }
 
     private readonly List<FinishedEntry> _finished = new();

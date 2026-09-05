@@ -21,10 +21,9 @@ public class SandboxRenderer {
     // ===== 3D 指示器状态 =====
     private readonly Dictionary<GameObject, QueueIndicator> _queueMarks = new();
     private readonly Dictionary<LeftRight, ImpactIndicator> _impacts = new(); // 恒定实体: 每炮一套 (虚线/实线/点), 不用就隐藏
-    private readonly Dictionary<LeftRight, TrackIndicator> _tracks = new();     // 火控目标线 (开火前解算, 粗粒度绿虚线) 每炮一条
-    private readonly Dictionary<LeftRight, TrackIndicator> _finals = new();     // 最终轨迹线 (击发冻结缩短, 细粒度绿虚线) 每炮一条
-    private const float TrackDashLen = 0.06f, TrackGapLen = 0.06f; // 火控线粗粒度 (虚线周期长)
-    private const float FinalDashLen = 0.03f, FinalGapLen = 0.03f;  // 最终线细粒度 (虚线周期短)
+    private readonly Dictionary<LeftRight, TrackIndicator> _tracks = new();     // 火控目标线 (开火前解算, 绿点线) 每炮一条
+    private readonly Dictionary<LeftRight, TrackIndicator> _finals = new();     // 最终轨迹线 (击发冻结缩短, 绿点线) 每炮一条
+    private const float TrackDotDia = 0.006f; // 轨迹点直径 (= 线宽 0.006); 点距 = 均分 len/(n-1) (最小 0.008, 无上限, 最多 32 点)
     private readonly Dictionary<GameObject, GameObject> _icons = new();
     private readonly Dictionary<LeftRight, BallisticMark> _ballistic = new();
 
@@ -33,9 +32,17 @@ public class SandboxRenderer {
 
     // 层级偏移量 (相对板面 z=0, 越负越浮): 所有标记一律挂板面 —
     // 游戏大地图在实体层上堆叠照片 (改透明度), 挂实体的东西会被盖淡/消失, 只能挂板面.
-    private const float GreenOffset = 0f;      // 绿十字+瞄准圈 (renderQueue 5000 压阵后深度排序不依赖 z, 回 20cb07b 低高度版)
-    private const float ImpactOffset = 0.001f;  // 落点指示器 (红线/红点/圈/字)
-    private const float RedOffset = 0.002f;     // 红杀伤圈+编号+弹种标签+预瞄线+实体图标
+    // ===== 渲染分层 (画画模型: queue 数值大 = 后渲染, 后画的笔迹盖在上面) =====
+    // renderQueue = QueueTop − prio: 绿层 5000 = 队列上限最后一笔画, 永远显示在最上; 红层 4998 最先画垫底.
+    // z = ZStep × prio 是同 queue 内的次级深度排序 (防止同层互盖).
+    private const int QueueTop = 5000;          // 渲染队列上限 (游戏照片层靠 queue 叠, 标记永远最后画)
+    private const float ZStep = 0.001f;         // 层间 z 步进 (同 queue 内的深度差)
+    private const int GreenPrio = 0;            // GC 弹道 (绿十字/瞄准圈/飞时) + 轨迹点/最终线/交汇点
+    private const int ImpactPrio = 1;           // 预瞄线 + 落点指示器 (红虚线/红实线/红点/落点圈/计时/弹种)
+    private const int RedPrio = 2;              // 队列标记 (红杀伤圈/编号/弹种/菱形/齐射框) + 实体图标
+    private const float GreenOffset = ZStep * GreenPrio;   // 0
+    private const float ImpactOffset = ZStep * ImpactPrio; // 0.001
+    private const float RedOffset = ZStep * RedPrio;       // 0.002
     private const float SurfScale = 0.212f / 0.81f; // 实体单位 → 板面单位 (实体世界缩放 / 板面世界缩放)
 
     public void Start() {
@@ -243,13 +250,13 @@ public class SandboxRenderer {
                 new Vector3(0f, -r2, 0f), new Vector3(-r2, 0f, 0f),
             };
             for (int s = 0; s < 4; s++) {
-                Line(mark.OuterRoot.transform, pts2[s], pts2[(s + 1) % 4], 0.01f * SurfScale, Color.red);
+                Line(mark.OuterRoot.transform, pts2[s], pts2[(s + 1) % 4], 0.01f * SurfScale, Color.red, RedPrio);
             }
             _queueMarks[entity] = mark;
         }
         // 根在实体 (菱形选中框留目标); 编号/弹种标签/杀伤圈跟预瞄点 (hasAim 时偏移); 无预瞄回实体
         mark.Root.transform.localPosition = new Vector3(entityBoard.x, entityBoard.y, RedOffset);
-        mark.LineRoot.transform.localPosition = new Vector3(entityBoard.x, entityBoard.y, ImpactOffset); // 预瞄线根在实体 (线终点 = aimEnd)
+        mark.LineRoot.transform.localPosition = new Vector3(entityBoard.x, entityBoard.y, GreenOffset); // 预瞄线根在实体 (线终点 = aimEnd); 绿权重 (绿层, 永远浮红线上)
         bool hasAim = !float.IsNaN(aimEnd.x) && !float.IsNaN(aimEnd.y) && aimEnd.sqrMagnitude > 1e-8f;
         Vector2 aimOff = hasAim ? aimEnd - entityBoard : Vector2.zero;
         mark.RadiusRoot.transform.localPosition = new Vector3(aimOff.x, aimOff.y, 0f); // 圈跟预瞄点
@@ -268,7 +275,7 @@ public class SandboxRenderer {
                     new Vector3(0f, -r3, 0f), new Vector3(-r3, 0f, 0f),
                 };
                 for (int s = 0; s < 4; s++) {
-                    Line(mark.SalvoRoot.transform, pts[s], pts[(s + 1) % 4], 0.01f * SurfScale, Color.red);
+                    Line(mark.SalvoRoot.transform, pts[s], pts[(s + 1) % 4], 0.01f * SurfScale, Color.red, RedPrio);
                 }
             }
         }
@@ -276,7 +283,7 @@ public class SandboxRenderer {
         float rKm = ShellData.KillRadiusKm(shell);
         bool pierce = IsArmorPierce(shell);
         RebuildCircle(mark.RadiusRoot.transform, rKm, RedOffset, Color.red, solid: shell == BulletType.DRIL, pierce: pierce,
-            ref mark.RadiusKm, ref mark.SegCount, ref mark.Pierce);
+            ref mark.RadiusKm, ref mark.SegCount, ref mark.Pierce, RedPrio);
         // 编号米字数码 (旧版 SetMarkLabel 逐条复刻, 板面空间: 实体局部字号 × SurfScale): 字号 0.045×5/6, 间距 1.4×, 上方 0.14+dy
         const float segW = 0.045f * 5f / 6f * SurfScale;
         float step = segW * 1.4f;
@@ -302,11 +309,10 @@ public class SandboxRenderer {
         }
         // 弹种标签位置每帧设 (跟预瞄点)
         mark.BulletRoot.transform.localPosition = new Vector3(aimOff.x - ((bt.Length - 1) * step + segW) / 2f, aimOff.y + 0.14f * SurfScale + dy + segW * 1.6f + (step - segW) + 0.02775f * SurfScale, 0f);
-        // 预瞄线 (旧版 BuildTargetLine 同款: 游戏 Dashed=true, 厚 0.006, 纯绿; 只画在炮任务上)
-        // LineRoot 直接挂板面 (落点层), 线 z=0 即可; 恒定实体: 建一次, 不用就隐藏 —
-        // LineRoot 每帧跟实体走, 线局部端点随 LineRoot 平移不变, 每次重建是浪费 (Destroy 延迟还瞬态堆积)
-        // aimEnd NaN = SRC 模式 (TWS 关, 无预瞄): 预瞄线不显示
-        if (drawLine && NestRef != null && !float.IsNaN(aimEnd.x) && !float.IsNaN(aimEnd.y)) {
+        // 预瞄线 (炮 → 任务点, 厚 0.006 纯绿, 游戏 Dashed 材质): 只要炮上有任务就显示 (与 TWS 无关);
+        // 终点 = 交汇点 (有预瞄); 静目标/TWS 关 (aimEnd NaN) → 直瞄线指向目标本身.
+        // LineRoot 直接挂板面 (落点层), 线 z=0 即可; 恒定实体: 建一次, 不用就隐藏
+        if (drawLine && NestRef != null) {
             if (mark.TargetLine == null) {
                 var go = new GameObject("FCS2_TargetLine");
                 go.transform.SetParent(mark.LineRoot.transform, false);
@@ -316,12 +322,13 @@ public class SandboxRenderer {
                 mark.TargetLine.Color = Color.green;
                 mark.TargetLine.ColorStart = Color.green;
                 mark.TargetLine.ColorEnd = Color.green;
-                var r = go.GetComponent<Renderer>(); // 渲染队列到顶 (恒定实体不走 Line(), 这里单独设)
-                if (r != null) r.material.renderQueue = 5000;
+                var r = go.GetComponent<Renderer>(); // 恒定实体不走 Line(), 这里单独设 (绿层: 绿色元素统一绿权重)
+                if (r != null) r.material.renderQueue = QueueTop - GreenPrio;
             }
             var nest = (Vector2)MapSurfaceRef.InverseTransformPoint(NestRef.position) - entityBoard;
+            var endPt = hasAim ? aimEnd - entityBoard : Vector2.zero; // 无预瞄: 直瞄线 (终点 = 目标)
             mark.TargetLine.Start = new Vector3(nest.x, nest.y, 0f);
-            mark.TargetLine.End = new Vector3(aimEnd.x - entityBoard.x, aimEnd.y - entityBoard.y, 0f); // 终点 = 交汇点 (与轨迹线终点同点); 直瞄 = 目标点
+            mark.TargetLine.End = new Vector3(endPt.x, endPt.y, 0f);
             mark.TargetLine.gameObject.SetActive(true);
         }
         else if (mark.TargetLine != null && mark.TargetLine.gameObject.activeSelf) {
@@ -374,7 +381,7 @@ public class SandboxRenderer {
             foreach (var c in new[] { im.FixedRoot, im.SolidRoot, im.DotRoot })
                 c.transform.localPosition = new Vector3(0f, 0f, ImpactOffset);
             // 实心红点 (圆画在局部原点, 后续移动父级位置即可, 只建一次)
-            FillDot(im.DotRoot.transform, Vector2.zero, 0.012f, Color.red);
+            FillDot(im.DotRoot.transform, Vector2.zero, 0.012f, Color.red, ImpactPrio);
             _impacts[side] = im;
         }
         // 每发重画/重置 (弹道终点/弹种可能变)
@@ -395,7 +402,7 @@ public class SandboxRenderer {
         // 目标轨迹线: 击发 → 火控线参数转移给最终线 (冻结, 倒计时驱动缩短), 火控线立即释放 (下个任务解算接管).
         // 不看 activeSelf: 击发后 FC push 冻结已把线隐藏, 数据仍在
         if (_tracks.TryGetValue(side, out var tr) && tr.Root != null && tr.Target != null && MapSurfaceRef != null) {
-            var fin = EnsureTrack(_finals, side, FinalDashLen, FinalGapLen);
+            var fin = EnsureTrack(_finals, side);
             fin.Target = tr.Target;
             fin.AimBoard = tr.AimBoard;
             fin.VBoard = tr.VBoard;
@@ -408,14 +415,28 @@ public class SandboxRenderer {
             fin.Root.SetActive(true);
             tr.Root.SetActive(false); // 火控线释放
         }
-        ClearChildren(im.FixedRoot.transform);
-        DashedLine(im.FixedRoot.transform, im.NestBoard, im.ImpactBoard, 0.006f, Color.red, 0.05f, 0.03f);
+        // 红色固定虚线 (全长弹道, 落地保留): 与 A1 同款 — 游戏 Dashed 材质单线, 保持红色 (恒定实体, 建一次)
+        if (im.FixedLine == null) {
+            var go = new GameObject("FCS2_ImpactFixed");
+            go.transform.SetParent(im.FixedRoot.transform, false);
+            im.FixedLine = go.AddComponent<Il2CppShapes.Line>();
+            im.FixedLine.Thickness = 0.006f;
+            im.FixedLine.Dashed = true;
+            im.FixedLine.Color = Color.red;
+            im.FixedLine.ColorStart = Color.red;
+            im.FixedLine.ColorEnd = Color.red;
+            var r = go.GetComponent<Renderer>(); // 恒定实体不走 Line(), 单独设 (Impact 层)
+            if (r != null) r.material.renderQueue = QueueTop - ImpactPrio;
+        }
+        im.FixedLine.Start = new Vector3(im.NestBoard.x, im.NestBoard.y, 0f);
+        im.FixedLine.End = new Vector3(im.ImpactBoard.x, im.ImpactBoard.y, 0f);
+        im.FixedLine.gameObject.SetActive(true);
         // 实线缓存作废: 下一帧 UpdateImpacts 按新弹道重建 (起点=炮口, 终点=新落点)
         if (im.SolidLine != null) { try { UnityEngine.Object.Destroy(im.SolidLine.gameObject); } catch { } im.SolidLine = null; }
         // 红落点圈 (弹种杀伤半径, 随弹种)
         float rKm = ShellData.KillRadiusKm(im.Shell);
         RebuildCircle(im.CircleRoot.transform, rKm, 0f, Color.red, solid: im.Shell == BulletType.DRIL, pierce: IsArmorPierce(im.Shell),
-            ref im.RadiusKm, ref im.SegCount, ref im.Pierce);
+            ref im.RadiusKm, ref im.SegCount, ref im.Pierce, ImpactPrio);
         im.CircleRoot.transform.localPosition = new Vector3(im.ImpactBoard.x, im.ImpactBoard.y, ImpactOffset);
         // 弹种标签 (飞行时挪到队列编号位: 与队列时 L-X 同 y = 0.14 + dy; 板面空间 = 实体空间常量 × SurfScale)
         float segW = 0.045f * 5f / 6f * SurfScale;
@@ -465,8 +486,8 @@ public class SandboxRenderer {
 
     // ===== 目标轨迹线 + 交汇点 (FC 解算 push) =====
 
-    /// <summary>轨迹线恒定实体 (每炮一条, dash 池 32 短线只动端点): 火控线粗粒度 / 最终线细粒度.</summary>
-    private TrackIndicator EnsureTrack(Dictionary<LeftRight, TrackIndicator> dict, LeftRight side, float dashLen, float gapLen) {
+    /// <summary>轨迹线恒定实体 (每炮一条): 火控线 = 点池 32 点 (点直径 0.006, 只动端点); 最终线 = 单条细实线.</summary>
+    private TrackIndicator EnsureTrack(Dictionary<LeftRight, TrackIndicator> dict, LeftRight side) {
         if (dict.TryGetValue(side, out var tr) && tr.Root != null) return tr;
         tr = new TrackIndicator { Root = new GameObject(dict == _tracks ? "FCS2_TrackLine" : "FCS2_TrackFinal") };
         tr.Root.transform.SetParent(MapSurfaceRef, false);
@@ -476,11 +497,14 @@ public class SandboxRenderer {
         tr.DotRoot = new GameObject("FCS2_TrackDot");
         tr.DotRoot.transform.SetParent(tr.Root.transform, false);
         tr.DotRoot.transform.localPosition = new Vector3(0f, 0f, GreenOffset);
-        tr.DashLen = dashLen;
-        tr.GapLen = gapLen;
-        for (int i = 0; i < tr.Dashes.Length; i++)
-            tr.Dashes[i] = Line(tr.DashRoot.transform, Vector2.zero, Vector2.zero, 0.006f, Color.green);
-        FillDot(tr.DotRoot.transform, Vector2.zero, 0.01f, Color.green); // 交汇点 (圆画在局部原点, 移父级)
+        if (dict == _tracks) {
+            for (int i = 0; i < tr.Dots.Length; i++)
+                tr.Dots[i] = Line(tr.DashRoot.transform, Vector2.zero, Vector2.zero, TrackDotDia, Color.green); // 点 = 直径长短线, 沿轨迹切线摆
+        }
+        else {
+            tr.Solid = Line(tr.DashRoot.transform, Vector2.zero, Vector2.zero, 0.004f, Color.green); // 最终线: 细实线 (冻结轨迹缩短)
+        }
+        FillDot(tr.DotRoot.transform, Vector2.zero, 0.0067f, Color.green); // 交汇点 (圆画在局部原点, 移父级)
         dict[side] = tr;
         return tr;
     }
@@ -489,11 +513,10 @@ public class SandboxRenderer {
     /// 曲线 P(τ) = 目标位置 + V·τ + ½A·τ² + ⅙J·τ³ (三次插值弧线), τ∈[0,T], 每帧随解算更新;
     /// 击发时参数转移给最终线 (见 ImpactFired). target null (无任务/DUMP/解算无效) → 隐藏.</summary>
     public void UpdateFireSolution(LeftRight side, Transform? target, Vector2 aimBoard, Vector2 vBoard, Vector2 aBoard, Vector2 jBoard, float T) {
-        var tr = EnsureTrack(_tracks, side, TrackDashLen, TrackGapLen);
+        var tr = EnsureTrack(_tracks, side);
         if (target == null || float.IsNaN(T) || T <= 0f) {
             tr.Root.SetActive(false);
-            tr.Target = null;
-            return;
+            return; // Target 保留最后有效值: 击发后 GC 确认转移 (ImpactFired) 还需要 (Root 已隐藏, UpdateTracks 不活读, 安全)
         }
         tr.Target = target;
         tr.AimBoard = aimBoard;
@@ -504,25 +527,26 @@ public class SandboxRenderer {
         tr.Root.SetActive(true);
     }
 
-    /// <summary>每帧: 火控线 (τ∈[0,T0], 起点活读目标) 与最终线 (τ∈[progress·T0, T0] 沿冻结曲线缩短,
-    /// 终点恒 = 开火瞬间交汇点, 倒计时归零 = 落地隐藏). dash 段数按曲线弧长/周期动态铺, 多余短线隐藏.</summary>
+    /// <summary>每帧: 火控线 (τ∈[0,T0], 起点活读目标, 点式虚线) 与最终线 (τ∈[progress·T0, T0] 沿冻结轨迹缩短的细实线,
+    /// 终点恒 = 开火瞬间交汇点, 倒计时归零 = 落地隐藏). 点数按弧长动态铺, 多余隐藏.</summary>
     private void UpdateTracks() {
-        foreach (var tr in _tracks.Values) { // 火控线: 开火前解算 (粗粒度)
+        foreach (var tr in _tracks.Values) { // 火控线: 开火前解算 (点式)
             if (tr.Root == null || !tr.Root.activeSelf) continue;
             if (tr.Target == null || MapSurfaceRef == null) { tr.Root.SetActive(false); continue; } // 目标阵亡/离图 → 隐藏
             var p0 = (Vector2)MapSurfaceRef.InverseTransformPoint(tr.Target.position); // 起点活读目标
-            int n = BuildDashes(tr, p0, 0f, tr.T0);
-            for (int i = n; i < tr.Dashes.Length; i++) tr.Dashes[i].gameObject.SetActive(false);
+            int n = BuildDots(tr, p0, 0f, tr.T0);
+            for (int i = n; i < tr.Dots.Length; i++) tr.Dots[i].gameObject.SetActive(false);
             tr.DotRoot.transform.localPosition = new Vector3(tr.AimBoard.x, tr.AimBoard.y, GreenOffset);
         }
-        foreach (var fin in _finals.Values) { // 最终线: 击发冻结缩短 (细粒度)
+        foreach (var fin in _finals.Values) { // 最终线: 击发冻结缩短 (细实线)
             if (fin.Root == null || !fin.Root.activeSelf) continue;
             float local = fin.T0 - (Time.time - fin.FiredAt);
             float remain = FixRemain(fin.FlightRemain, local, ref fin.LastGc, ref fin.GcLag); // 与红线同口径 (gc 冻结修正)
             if (remain <= 0f) { fin.Root.SetActive(false); continue; } // 落地: 隐藏
             float progress = 1f - remain / fin.T0; // 与红线同口径: 0=刚出膛 1=落地
-            int n = BuildDashes(fin, fin.P0Board, fin.T0 * progress, fin.T0);
-            for (int i = n; i < fin.Dashes.Length; i++) fin.Dashes[i].gameObject.SetActive(false);
+            var head = TrackCurve(fin.P0Board, fin.VBoard, fin.ABoard, fin.JBoard, fin.T0 * progress);
+            fin.Solid.Start = new Vector3(head.x, head.y, 0f);
+            fin.Solid.End = new Vector3(fin.AimBoard.x, fin.AimBoard.y, 0f); // 终点 = 开火瞬间交汇点 (不动)
             fin.DotRoot.transform.localPosition = new Vector3(fin.AimBoard.x, fin.AimBoard.y, GreenOffset); // 交汇点不动
         }
     }
@@ -547,9 +571,10 @@ public class SandboxRenderer {
         return float.IsNaN(gc) ? lagged : Mathf.Min(gc, lagged);
     }
 
-    /// <summary>沿曲线 τ∈[t0,t1] 按周期 (dash+gap) 铺 dash: 64 点采样累计弧长, dash 端点弧长插值定位.
-    /// 返回铺出的 dash 数 (上限池容量; 曲线短 dash 少, 多余隐藏).</summary>
-    private static int BuildDashes(TrackIndicator tr, Vector2 p0, float t0, float t1) {
+    /// <summary>沿曲线 τ∈[t0,t1] 铺点 (点式虚线): 64 点采样累计弧长, 点位置弧长插值定位, 点方向 = 轨迹切线.
+    /// 点距 = 均分 len/(n-1): 最小 0.008 (实测手感值), 无上限, 最多 32 点 —
+    /// 轨迹长 ∝ 目标速度, 点疏密直观反映速度. 返回铺出的点数, 多余由调用方隐藏.</summary>
+    private static int BuildDots(TrackIndicator tr, Vector2 p0, float t0, float t1) {
         const int S = 64;
         tr.Pts[0] = TrackCurve(p0, tr.VBoard, tr.ABoard, tr.JBoard, t0);
         tr.Cum[0] = 0f;
@@ -558,14 +583,26 @@ public class SandboxRenderer {
             tr.Cum[i] = tr.Cum[i - 1] + (tr.Pts[i] - tr.Pts[i - 1]).magnitude;
         }
         float len = tr.Cum[S];
-        float period = tr.DashLen + tr.GapLen;
-        int n = 0;
-        for (float s = 0f; n < tr.Dashes.Length && s < len; n++, s += period) {
-            float e = Mathf.Min(s + tr.DashLen, len);
-            Vector2 a = SampleAt(tr, s), b = SampleAt(tr, e);
-            tr.Dashes[n].Start = new Vector3(a.x, a.y, 0f);
-            tr.Dashes[n].End = new Vector3(b.x, b.y, 0f);
-            tr.Dashes[n].gameObject.SetActive(true);
+        if (len < 0.001f) return 0; // 曲线退化: 不铺
+        const float minSpacing = 0.0075f; // 最小点距 (实测手感值)
+        int n = Mathf.Min(tr.Dots.Length, (int)(len / minSpacing) + 1);
+        const float dotSeg = 0.0015f; // 点线段长 (极小: 胶囊两端圆帽相接 ≈ 正圆; 0 = 起终点重合不渲染)
+        if (n <= 1) { // 单点
+            var c = SampleAt(tr, 0f);
+            tr.Dots[0].Start = new Vector3(c.x, c.y, 0f);
+            tr.Dots[0].End = new Vector3(c.x + dotSeg, c.y, 0f);
+            tr.Dots[0].gameObject.SetActive(true);
+            return 1;
+        }
+        float step = len / (n - 1);
+        for (int i = 0; i < n; i++) {
+            float s = i * step;
+            Vector2 c = SampleAt(tr, s);
+            Vector2 t = (SampleAt(tr, Mathf.Min(s + 0.001f, len)) - SampleAt(tr, Mathf.Max(s - 0.001f, 0f))).normalized;
+            if (t.sqrMagnitude < 1e-6f) t = Vector2.right;
+            tr.Dots[i].Start = new Vector3(c.x - t.x * dotSeg * 0.5f, c.y - t.y * dotSeg * 0.5f, 0f);
+            tr.Dots[i].End = new Vector3(c.x + t.x * dotSeg * 0.5f, c.y + t.y * dotSeg * 0.5f, 0f);
+            tr.Dots[i].gameObject.SetActive(true);
         }
         return n;
     }
@@ -596,7 +633,7 @@ public class SandboxRenderer {
             Vector2 shell = Vector2.Lerp(im.NestBoard, im.ImpactBoard, progress);
             // 实线: 弹头 → 落点 (未飞段) — 只动端点不重建
             if (im.SolidLine == null) {
-                im.SolidLine = Line(im.SolidRoot.transform, shell, im.ImpactBoard, 0.006f, Color.red);
+                im.SolidLine = Line(im.SolidRoot.transform, shell, im.ImpactBoard, 0.006f, Color.red, ImpactPrio);
             }
             else {
                 im.SolidLine.Start = new Vector3(shell.x, shell.y, 0f);
@@ -632,7 +669,7 @@ public class SandboxRenderer {
             _ => Color.red,                 // 敌对红 (与杀伤圈同一红)
         };
         // 尺寸归一: 板面单位 = 实体单位 × SurfScale (实体/令牌视觉同款大小)
-        DrawIcon(root.transform, t.Kind, color, SurfScale);
+        DrawIcon(root.transform, t.Kind, color, SurfScale, t.Armour);
         _icons[t.Entity] = root;
     }
 
@@ -641,24 +678,24 @@ public class SandboxRenderer {
     }
 
     /// <summary>实体图标三遍遍历渲染 (用户定稿):
-    /// 第一遍 菱形框 (除参考点外的所有目标) → 第二遍 装甲正方形 → 第三遍 内容符号 (参考点十字/AA/FDC 六芒星/炮兵圆).</summary>
-    private static void DrawIcon(Transform parent, EntityKind kind, Color color, float s = 1f) {
+    /// 第一遍 菱形框 (除参考点外的所有目标) → 第二遍 装甲正方形 (装甲类或有装甲值 — FDC 带装甲也画) → 第三遍 内容符号 (参考点十字/AA/FDC 六芒星/炮兵圆).</summary>
+    private static void DrawIcon(Transform parent, EntityKind kind, Color color, float s = 1f, int armour = 0, int prio = RedPrio) {
         float thin = 0.01f * s, thick = 0.02f * s;
         // 第一遍: 菱形框 (参考点不是目标, 不画框)
         if (kind != EntityKind.Reference) {
             float r = 0.05f * Mathf.Sqrt(2f) * s;
-            Line(parent, new Vector2(0f, r), new Vector2(r, 0f), thin, color);
-            Line(parent, new Vector2(r, 0f), new Vector2(0f, -r), thin, color);
-            Line(parent, new Vector2(0f, -r), new Vector2(-r, 0f), thin, color);
-            Line(parent, new Vector2(-r, 0f), new Vector2(0f, r), thin, color);
+            Line(parent, new Vector2(0f, r), new Vector2(r, 0f), thin, color, prio);
+            Line(parent, new Vector2(r, 0f), new Vector2(0f, -r), thin, color, prio);
+            Line(parent, new Vector2(0f, -r), new Vector2(-r, 0f), thin, color, prio);
+            Line(parent, new Vector2(-r, 0f), new Vector2(0f, r), thin, color, prio);
         }
-        // 第二遍: 装甲正方形 (边长 0.1, 半边长 0.05)
-        if (kind == EntityKind.Armour) {
+        // 第二遍: 装甲正方形 (边长 0.1, 半边长 0.05) — kind==Armour 或带装甲值 (FDC 有装甲也要指示)
+        if (kind == EntityKind.Armour || armour > 0) {
             float sq = 0.05f * s;
-            Line(parent, new Vector2(-sq, -sq), new Vector2(sq, -sq), thin, color);
-            Line(parent, new Vector2(sq, -sq), new Vector2(sq, sq), thin, color);
-            Line(parent, new Vector2(sq, sq), new Vector2(-sq, sq), thin, color);
-            Line(parent, new Vector2(-sq, sq), new Vector2(-sq, -sq), thin, color);
+            Line(parent, new Vector2(-sq, -sq), new Vector2(sq, -sq), thin, color, prio);
+            Line(parent, new Vector2(sq, -sq), new Vector2(sq, sq), thin, color, prio);
+            Line(parent, new Vector2(sq, sq), new Vector2(-sq, sq), thin, color, prio);
+            Line(parent, new Vector2(-sq, sq), new Vector2(-sq, -sq), thin, color, prio);
         }
         // 第三遍: 内容符号
         switch (kind) {
@@ -667,7 +704,7 @@ public class SandboxRenderer {
                 for (int i = 0; i < 3; i++) {
                     float a = i * 60f * Mathf.Deg2Rad;
                     var dir = new Vector2(Mathf.Cos(a), Mathf.Sin(a));
-                    Line(parent, -dir * r, dir * r, thin, color);
+                    Line(parent, -dir * r, dir * r, thin, color, prio);
                 }
                 break;
             }
@@ -676,21 +713,21 @@ public class SandboxRenderer {
                 const int n = 24;
                 for (int i = 0; i < n; i++) {
                     float a0 = i * 2f * Mathf.PI / n, a1 = (i + 1) * 2f * Mathf.PI / n;
-                    Line(parent, new Vector2(Mathf.Cos(a0), Mathf.Sin(a0)) * r, new Vector2(Mathf.Cos(a1), Mathf.Sin(a1)) * r, thin, color);
+                    Line(parent, new Vector2(Mathf.Cos(a0), Mathf.Sin(a0)) * r, new Vector2(Mathf.Cos(a1), Mathf.Sin(a1)) * r, thin, color, prio);
                 }
                 break;
             }
             case EntityKind.Aa: { // 两短竖线 + 2 倍粗底座
                 float half = 0.0267f * s, bx = 0.03f * s, x0 = 0.02f * s;
-                Line(parent, new Vector2(-x0, -half), new Vector2(-x0, half), thin, color);
-                Line(parent, new Vector2(x0, -half), new Vector2(x0, half), thin, color);
-                Line(parent, new Vector2(-bx, -half / 2f), new Vector2(bx, -half / 2f), thick, color);
+                Line(parent, new Vector2(-x0, -half), new Vector2(-x0, half), thin, color, prio);
+                Line(parent, new Vector2(x0, -half), new Vector2(x0, half), thin, color, prio);
+                Line(parent, new Vector2(-bx, -half / 2f), new Vector2(bx, -half / 2f), thick, color, prio);
                 break;
             }
             case EntityKind.Reference: { // 绿色十字 (半臂 0.05, 非点击目标)
                 float r = 0.05f * s;
-                Line(parent, new Vector2(-r, 0f), new Vector2(r, 0f), thin, color);
-                Line(parent, new Vector2(0f, -r), new Vector2(0f, r), thin, color);
+                Line(parent, new Vector2(-r, 0f), new Vector2(r, 0f), thin, color, prio);
+                Line(parent, new Vector2(0f, -r), new Vector2(0f, r), thin, color, prio);
                 break;
             }
         }
@@ -698,7 +735,7 @@ public class SandboxRenderer {
 
     // ===== 图元 =====
 
-    private static Il2CppShapes.Line Line(Transform parent, Vector2 a, Vector2 b, float thickness, Color color) {
+    private static Il2CppShapes.Line Line(Transform parent, Vector2 a, Vector2 b, float thickness, Color color, int prio = GreenPrio) {
         var go = new GameObject("FCS2_Seg");
         go.transform.SetParent(parent, false);
         var line = go.AddComponent<Il2CppShapes.Line>();
@@ -708,36 +745,31 @@ public class SandboxRenderer {
         line.Color = color;
         line.ColorStart = color;
         line.ColorEnd = color;
-        // 强制渲染队列拉到顶 (5000 = 上限): 游戏照片层层堆叠大概也是靠 queue 叠的 — 标记永远最后画,
-        // 斜视角深度排序穿插 → 半透明/消失的问题根治
+        // 渲染队列按层 (画画模型): queue 大 = 后渲染 = 盖在上面. prio 0 → 5000 最后一笔, 永远显示;
+        // 游戏照片层层堆叠大概也是靠 queue 叠的 — 斜视角深度排序穿插 → 半透明/消失的问题根治
         var r = go.GetComponent<Renderer>();
-        if (r != null) r.material.renderQueue = 5000;
+        if (r != null) r.material.renderQueue = QueueTop - prio;
         return line;
     }
 
-    /// <summary>虚线 (两段循环): dashLen 实线 / gapLen 空.</summary>
-    private static void DashedLine(Transform parent, Vector2 a, Vector2 b, float thickness, Color color, float dashLen, float gapLen) {
-        float len = (b - a).magnitude;
-        var dir = (b - a) / len;
-        for (float d = 0f; d < len; d += dashLen + gapLen) {
-            float e = Mathf.Min(d + dashLen, len);
-            Line(parent, a + dir * d, a + dir * e, thickness, color);
-        }
-    }
-
-    /// <summary>实心圆点 (8 段扇形填色近似).</summary>
-    private static void FillDot(Transform parent, Vector2 center, float radius, Color color) {
-        const int n = 8;
-        for (int i = 0; i < n; i++) {
-            float a0 = i * 2f * Mathf.PI / n, a1 = (i + 1) * 2f * Mathf.PI / n;
-            Line(parent, center, center + new Vector2(Mathf.Cos(a1), Mathf.Sin(a1)) * radius, radius * 1.6f, color);
+    /// <summary>实心圆点 (单圆环: 环心半径 = 半径/2, 线宽 = 半径, 内缘恰好覆圆心 → 16 段即实心圆;
+    /// 旧 8 段扇形辐条呈梅花, 同心圆环段数多, 均弃用).</summary>
+    private static void FillDot(Transform parent, Vector2 center, float radius, Color color, int prio = GreenPrio) {
+        const int segs = 16;
+        float ringR = radius / 2f;
+        for (int i = 0; i < segs; i++) {
+            float a0 = i * 2f * Mathf.PI / segs, a1 = (i + 1) * 2f * Mathf.PI / segs;
+            Line(parent,
+                center + new Vector2(Mathf.Cos(a0), Mathf.Sin(a0)) * ringR,
+                center + new Vector2(Mathf.Cos(a1), Mathf.Sin(a1)) * ringR,
+                radius, color, prio);
         }
     }
 
     /// <summary>杀伤圈 (旧版 BuildKillCircle 逐条复刻): 段数 = 2πr/(2×dashLen) 取偶 (奇数不轴对称),
     /// 各圈自转 90°/n, 实线覆盖角 = dash/r; solid=整圆 24 段; pierce = 从圆周向内 4 条半半径 X 线.
     /// 全部挂板面, 板面单位直接画.</summary>
-    private static void RebuildCircle(Transform root, float rKm, float z, Color color, bool solid, bool pierce, ref float lastR, ref int lastN, ref bool lastPierce) {
+    private static void RebuildCircle(Transform root, float rKm, float z, Color color, bool solid, bool pierce, ref float lastR, ref int lastN, ref bool lastPierce, int prio = GreenPrio) {
         float rB = rKm * GeoMap.MapCellSize;               // 板面单位 (段数/虚线长按板面算)
         const float dashB = 0.01f;                         // KillDashLen (板面单位)
         int n = solid ? 24 : Mathf.Max(4, (int)Mathf.Round(2f * Mathf.PI * rB / (2f * dashB)));
@@ -753,13 +785,13 @@ public class SandboxRenderer {
         for (int s = 0; s < n; s++) {
             float a0 = Mathf.PI * 2f * s / n + (solid ? 0f : Mathf.PI / (2f * n)); // 各圈各自转 90°/n
             float a1 = a0 + (solid ? Mathf.PI * 2f / n : dash / r);                // 实线覆盖角
-            Line(root, new Vector2(Mathf.Cos(a0), Mathf.Sin(a0)) * r, new Vector2(Mathf.Cos(a1), Mathf.Sin(a1)) * r, t, color);
+            Line(root, new Vector2(Mathf.Cos(a0), Mathf.Sin(a0)) * r, new Vector2(Mathf.Cos(a1), Mathf.Sin(a1)) * r, t, color, prio);
         }
         if (pierce) { // 穿甲指示: 从圆周向内 4 条半半径长线, X 型 (对角方向)
             Vector2[] xdirs = { new(1f, 1f), new(-1f, 1f), new(1f, -1f), new(-1f, -1f) };
             foreach (var d in xdirs) {
                 Vector2 dn = d.normalized;
-                Line(root, dn * r, dn * (r * 0.5f), t, color);
+                Line(root, dn * r, dn * (r * 0.5f), t, color, prio);
             }
         }
     }
@@ -795,7 +827,7 @@ public class SandboxRenderer {
         public GameObject LineRoot = null!;
         public GameObject OuterRoot = null!;
         public GameObject SalvoRoot = null!;
-        public Il2CppShapes.Line? TargetLine; // 预瞄线 (恒定实体: 建一次, 不用就隐藏)
+        public Il2CppShapes.Line? TargetLine; // 预瞄线 (恒定实体: 建一次, 不用就隐藏; 游戏 Dashed 材质)
         public Slot Slot;
         public int QueuePos;
         public bool Salvo;
@@ -818,6 +850,7 @@ public class SandboxRenderer {
         public GameObject BulletRoot = null!;
         public Vector2 ImpactBoard;
         public Vector2 NestBoard;
+        public Il2CppShapes.Line? FixedLine;  // 红色固定虚线 (游戏 Dashed 单线, 恒定实体)
         public BulletType Shell;
         public float FlightTime;
         public float CreatedAt;
@@ -842,7 +875,8 @@ public class SandboxRenderer {
         public GameObject Root = null!;
         public GameObject DashRoot = null!;
         public GameObject DotRoot = null!;
-        public readonly Il2CppShapes.Line[] Dashes = new Il2CppShapes.Line[32];
+        public readonly Il2CppShapes.Line[] Dots = new Il2CppShapes.Line[32]; // 火控线点池 (最终线不用, 用 Solid)
+        public Il2CppShapes.Line Solid = null!;              // 最终线细实线 (击发冻结缩短)
         public readonly Vector2[] Pts = new Vector2[65]; // 弧长采样缓存 (避免每帧分配)
         public readonly float[] Cum = new float[65];
         public Transform? Target;          // 目标引用 (火控线起点活读)
@@ -850,7 +884,6 @@ public class SandboxRenderer {
         public Vector2 VBoard, ABoard, JBoard; // 轨迹参数 (板面/s, /s², /s³) — 曲线 P(τ) = P0 + V·τ + ½A·τ² + ⅙J·τ³
         public Vector2 P0Board;            // 最终线冻结起点 (击发瞬间目标位置)
         public float T0;                   // 解算飞时 (曲线总时长)
-        public float DashLen, GapLen;      // 虚线周期 (火控线粗 / 最终线细)
         public float FiredAt = float.NaN;  // 冻结时刻 (本地计时兜底)
         public float FlightRemain = float.NaN; // 倒计时 (GC 传导; NaN = 本地兜底)
         public float LastGc = float.NaN;   // gc 冻结检测 (与红线同口径)
