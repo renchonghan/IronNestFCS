@@ -38,9 +38,9 @@ internal static class SalvoDirector {
                     MelonLogger.Error($"[GC] salvo FALL L={l.Action} R={r.Action}, stop director");
                     yield break; // FALL 交 FC 换策略
                 }
-                // 死区: 两炮都确认真实相位结束 (码确认在例程内) 再等半秒 — 机构停稳/共享分配器让出才走下一步,
+                // 死区: 两炮都确认真实相位结束 (码确认在例程内) 再等 0.75s — 机构停稳/共享分配器让出才走下一步,
                 // 防一炮抢跑 (另一炮还在用分配器, 按钮不激活 → 9s 超时错位)
-                yield return new WaitForSeconds(0.5f);
+                yield return new WaitForSeconds(0.75f);
             }
             if (l.Action == GunAction.Fall || r.Action == GunAction.Fall) yield break;
 

@@ -33,6 +33,7 @@ public class Flight {
         }
         float lagged = local - (float.IsNaN(_gcLag) ? 0f : _gcLag);
         Remain = float.IsNaN(gcRaw) ? lagged : Mathf.Min(gcRaw, lagged);
+        if (Remain < 0f) Remain = 0f; // 尾段 gc 清表后 lagged 带负 (GcLag 锁定差 ~1s, 落地前 ~1s 会负) — 显示钳 0
         if (local <= 0f) { Landed = true; Remain = 0f; } // 本地归零 = 落地 (与红线同基准, 出膛时刻起算)
     }
 }

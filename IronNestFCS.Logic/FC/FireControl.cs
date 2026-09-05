@@ -251,8 +251,8 @@ public class FireControl {
                 MelonLogger.Msg($"[FC] dispatch SALVO fc#{head.Id} {head.Shell}");
                 continue;
             }
-            GunControl? freeL = GunL != null && _taskL == null && !_dumpStuckL ? GunL : null;
-            GunControl? freeR = GunR != null && _taskR == null && !_dumpStuckR ? GunR : null;
+            GunControl? freeL = GunL != null && _taskL == null && !_dumpStuckL && GunL.Action != GunAction.Fall ? GunL : null;
+            GunControl? freeR = GunR != null && _taskR == null && !_dumpStuckR && GunR.Action != GunAction.Fall ? GunR : null;
             if (freeL == null && freeR == null) break;
             // 空闲炮挑选: 弹种匹配队首者优先 (都匹配/都不匹配 → L)
             GunControl pick;
@@ -569,7 +569,7 @@ public class FireControl {
             if (!armed || !gun.AllReady || !gun.AzimuthSelect) continue; // 不稳回退: 不开火 (已 Arm 不自动回保险; 已击发由 _fire 锁拦)
             if (side == LeftRight.Left ? _fireL : _fireR) continue; // 击发已按 (等触发核心击发 + 收尾)
             if (Mode == FireMode.PreAiming) {
-                if (!float.IsNaN(gun.FlyRemaining)) { // 玩家击发 (炮表倒计时启动) → 收尾; 置位冻结解算 push (见 PushFireSolutions)
+                if (gun.Fired) { // 玩家击发 (GC HasFired 沿 — 真出膛; 不用 FlyRemaining: 装填期炮表残留值会骗过早收尾) → 收尾; 置位冻结解算 push (见 PushFireSolutions)
                     if (side == LeftRight.Left) _fireL = true; else _fireR = true;
                     StartCoroutineHost(FinishRoutine(gun, side, task));
                 }
@@ -623,8 +623,8 @@ public class FireControl {
         }
         if (!bothReady || _fireL || _fireR) return; // armed 后不稳/已按 → 等收尾 (已击发由 _fire 锁拦)
         if (Mode == FireMode.PreAiming) {
-            if (!float.IsNaN(GunL?.FlyRemaining ?? float.NaN) || !float.IsNaN(GunR?.FlyRemaining ?? float.NaN))
-                StartCoroutineHost(FinishRoutine(GunL, LeftRight.Left, task)); // 玩家击发 (任一炮表倒计时启动) → 收尾
+            if ((GunL != null && GunL.Fired) || (GunR != null && GunR.Fired))
+                StartCoroutineHost(FinishRoutine(GunL, LeftRight.Left, task)); // 玩家击发 (任一炮 GC HasFired 沿 — 真出膛) → 收尾
             return;
         }
         // 预定打击时间 (与单发同口径, 按主炮左炮飞时)
@@ -642,13 +642,7 @@ public class FireControl {
             if (FireLock == null || ConsolePort == null) yield break;
             yield return FireLock.Acquire();
             try {
-                if (Calculator != null) {
-                    yield return Calculator.SetDistance(task.Distance);
-                    yield return Calculator.SetDirection(task.Angle);
-                    yield return Calculator.SetCharge(task.LockedCharge > 0 ? task.LockedCharge : 1); // 初始解析结果 (冻结), 不用实时 DesiredCharge
-                    yield return Calculator.SetShellType(task.Shell);
-                    yield return Calculator.Calculate();
-                }
+                // 计算台不重设 (装填期 PWDR 前已 Calculate 一次; 五步确认按 mod 缓存值走)
                 yield return ConsolePort.ConfirmTask();
                 yield return ConsolePort.ConfirmBullet();
                 yield return ConsolePort.ConfirmRotation();
@@ -688,13 +682,8 @@ public class FireControl {
             if (FireLock == null || ConsolePort == null) yield break;
             yield return FireLock.Acquire();
             try {
-                if (Calculator != null) {
-                    yield return Calculator.SetDistance(task.Distance);
-                    yield return Calculator.SetDirection(task.Angle);
-                    yield return Calculator.SetCharge(task.LockedCharge > 0 ? task.LockedCharge : 1); // 初始解析结果 (冻结), 不用实时 DesiredCharge
-                    yield return Calculator.SetShellType(task.Shell);
-                    yield return Calculator.Calculate();
-                }
+                // 计算台不再重设 (装填期 PWDR 前已 Calculate 一次 — 读数刷新 + 少一张记事本卡;
+                // 五步确认按 mod 缓存值走, 不惯着游戏重新算)
                 yield return ConsolePort.ConfirmTask();
                 yield return ConsolePort.ConfirmBullet();
                 yield return ConsolePort.ConfirmRotation();
@@ -740,19 +729,20 @@ public class FireControl {
         yield return FinishRoutine(gun, side, task);
     }
 
-    /// <summary>等击发确认 (炮表倒计时启动 = FlyRemaining 从 NaN 变有效; 齐射等两炮) → 收尾: 完成队列 + 槽位释放.
-    /// 哑炮防护: 5s 无倒计时 = 哑炮 → 重新解保险 + 再击发 (最多 3 次击发); 全哑 → 报错撤任务
+    /// <summary>等击发确认 (GC HasFired 沿 = 真出膛; 齐射等两炮) → 收尾: 完成队列 + 槽位释放.
+    /// 不用 FlyRemaining 作判据 — 装填期炮表残留值会骗过早收尾 (收尾时 CurrentFlight 还是旧发, 完成队列绑错 Flight).
+    /// 哑炮防护: 5s 无击发沿 = 哑炮 → 重新解保险 + 再击发 (最多 3 次击发); 全哑 → 报错撤任务
     /// (膛内哑弹由下一任务自然消耗 — DecidePrepStep 见膛内弹对就直接用, 系统自愈).
     /// 落点指示不归 FC — GC 常驻循环自检击发 (pendingReload 上升沿) 锁存+通知 DC, 手动开火同样出轨迹.</summary>
     private IEnumerator FinishRoutine(GunControl gun, LeftRight side, FireTask task) {
         bool confirmed = false;
         for (int attempt = 0; attempt < 3; attempt++) {
-            // 击发确认等待: 炮表倒计时启动 (齐射 = 两炮都有)
+            // 击发确认等待: GC HasFired 沿 (齐射 = 两炮都有)
             float waited = 0f;
             while (waited < 5f) {
                 bool ok = task.SalvoPair
-                    ? !float.IsNaN(GunL?.FlyRemaining ?? float.NaN) && !float.IsNaN(GunR?.FlyRemaining ?? float.NaN)
-                    : !float.IsNaN(gun.FlyRemaining);
+                    ? GunL != null && GunL.Fired && GunR != null && GunR.Fired
+                    : gun.Fired;
                 if (ok) { confirmed = true; break; }
                 yield return new WaitForSeconds(0.1f);
                 waited += 0.1f;

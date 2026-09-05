@@ -1,4 +1,5 @@
 using System.Collections;
+using System.Collections.Generic;
 using Il2Cpp;
 using MelonLoader;
 using UnityEngine;
@@ -59,6 +60,12 @@ public class GunControl {
     public float FlyTime { get; private set; } = float.NaN;        // 飞行时间 (游戏自解: 瞄准期 PredictedImpactTime / 击发后锁存)
     public bool AllReady { get; private set; }                     // 弹药确认且追踪稳定; 不稳定回退
     public bool DumpWaitActive { get; private set; }               // 1-3 DUMP 相位停手等接管中 (FC 据此撤任务改派 DUMP 占位)
+    /// <summary>解算台 (装填期 PWDR 前 Calculate — 刷新分配器读数缓存, 每任务仅一次).</summary>
+    public BallisticCalculator? Calculator;
+    /// <summary>解算台短锁 (与 FC 共用同一把 FireLock — 计算台是共享硬件).</summary>
+    public CoroutineLock? CalculatorLock;
+    /// <summary>装填期 Calculate 已完成 (齐射右炮等它 — 计算台共享, 不能抢先按解算推药).</summary>
+    public bool CalcDone;
     public bool Fired { get; private set; }                        // 本发已击发 (GC 内部防重; 不对外 — FC 用 FlyRemaining 作击发确认)
     public bool KernelMode { get; private set; }                   // 内核态: 硬件动作执行中 (指令只记录不生效)
     /// <summary>游戏 CANFIRE 信号 (实测不含保险: 装填完成 — 弹+药+炮闩锁 — 未开保险即 True;
@@ -81,6 +88,8 @@ public class GunControl {
     private object? _taskHandle;
     private bool _lastHasFired;                // pendingReload 上升沿检测 (击发自检)
     private bool? _lastCanFire;                // CanFire 沿检测 (装填完成 → 击发沿复位)
+    private bool _forceFullPowder;             // 上轮 LOAD 推药失败: 下轮 PWDR 无视分配器读数强制拉满
+    private readonly List<object> _childHandles = new(); // 子协程句柄 (2-2 并行 Calculate 等; Stop 时回收, F9 防泄漏)
     private bool _disposed;
     /// <summary>当前飞行 (击发时创建, 落地后保留引用 — HUD/DC 读 Landed/Remain; 下一发击发覆盖; DUMP 不建).</summary>
     public Flight? CurrentFlight;
@@ -116,6 +125,8 @@ public class GunControl {
         TryStop(_loopHandle);
         TryStop(_taskHandle);
         _loopHandle = _taskHandle = null;
+        foreach (var h in _childHandles) { try { MelonCoroutines.Stop(h); } catch { } }
+        _childHandles.Clear();
         KernelMode = false;
         AllReady = false;
         Action = GunAction.Idle;
@@ -253,6 +264,7 @@ public class GunControl {
                 var step = DecidePrepStep();
                 if (step == null) break; // 弹药就绪 → TRAK
                 yield return Exec(step.Value.Action, step.Value.Deadline, step.Value.Routine);
+                yield return new WaitForSeconds(0.5f); // 单发步间死区 (对齐齐射节奏: 机构停稳/共享硬件让出, 防意外情况)
             }
             if (ManualControl || _disposed) yield break;
             yield return RunTrak(); // 3-1 TRAK: 持续追踪直到击发 (AllReady 供 FC 统一火控)
@@ -269,6 +281,7 @@ public class GunControl {
     internal void ResetForTask() {
         AllReady = false;
         Fired = false;
+        CalcDone = false; // 每任务一次 Calculate 信号复位
         // 击发沿基线同步到当前状态 (不能直接清 false): 上一发击发后未装填时 pendingReload 残留 true,
         // 清 false 会让下一帧击发自检把残留沿误判成新开火 → 入队瞬间红线闪一下
         _lastHasFired = _gun.HasFired();
@@ -472,20 +485,69 @@ public class GunControl {
         RefreshSnapshot();
     }
 
-    /// <summary>SHLD 推弹: 按推弹按钮 + 等入膛 (机构动作中不读膛内, 用 WaitShellRammed 的状态机判定).</summary>
+    /// <summary>SHLD 推弹: 按推弹按钮 + 等入膛 (机构动作中不读膛内, 用 WaitShellRammed 的状态机判定).
+    /// 推弹按钮按下后立即并行 Calculate (子协程 — ~3s 计算被 ~5-10s 推弹动画覆盖, 不白等);
+    /// 齐射只左炮算 (计算台共享), 右炮在 2-3 等 CalcDone.</summary>
     private IEnumerator ShldRoutine() {
         yield return _gun.PressRammer();
+        if (!(SyncCommand && _side == LeftRight.Right)) StartChild(CalcPowderRefresh());
         yield return _gun.WaitRammingStart();
         yield return _gun.WaitShellRammed();
         RefreshSnapshot();
+    }
+
+    /// <summary>子协程启动 (句柄回收, F9 防泄漏).</summary>
+    private void StartChild(IEnumerator it) {
+        _childHandles.Add(MelonCoroutines.Start(it));
+    }
+
+    /// <summary>计算台 Calculate (每任务至多一次, CalcDone 去重): 刷新分配器读数缓存 —
+    /// 读数是计算台缓存, 开火/推药后与物理分配器脱节 ~16s 才同步, Calculate 后立即是真值 (1.x 同款).
+    /// 每次 Calculate 记事本多一张卡, 故 2-2 算过则 2-3 跳过. 2-2 起子协程并行 / 2-3 串行兜底.</summary>
+    private IEnumerator CalcPowderRefresh() {
+        if (Calculator == null || CalculatorLock == null || CalcDone) yield break;
+        yield return CalculatorLock.Acquire();
+        try {
+            if (!float.IsNaN(DesiredDistance)) yield return Calculator.SetDistance(DesiredDistance);
+            if (!float.IsNaN(DesiredAzimuth)) yield return Calculator.SetDirection(DesiredAzimuth);
+            yield return Calculator.SetCharge(DesiredCharge);
+            yield return Calculator.SetShellType(DesiredShell);
+            yield return Calculator.Calculate();
+        }
+        finally { CalculatorLock.Release(); }
+        CalcDone = true;
+        MelonLogger.Msg($"[GC] {_side}: calculate done (powder reading cache refresh)");
     }
 
     /// <summary>PWDR 给药: 查池不足锁内买药 (药包杆与计算台无关), 补拉差, 不推药.
     /// 齐射: 锁内一次买够两炮总量 (2×need, 1.x 同款), 双炮并行给药不抢池.
     /// 拉杆前等游戏状态机进 SelectPowderCharge (推弹完全结束, 码确认; 超时兜底继续).</summary>
     private IEnumerator PwdrRoutine() {
+        // 拉杆前等机构停稳 (同 SHRD/RamPowder 口径): 膛内弹直装路径起链后 2ms 即进 PWDR,
+        // 上一发机构未复位时 Button Dispencer 不激活 (左炮高发 — 9s 超时白等 + 拉杆错位)
+        yield return _gun.WaitForReloadReady();
         if (!_gun.ReloadStateAtOrAfter("SelectPowderCharge")) yield return _gun.WaitReloadState("SelectPowderCharge");
+        // 计算台 Calculate (每任务至多一次, CalcDone 去重): 2-2 推弹完成已算过则跳过 —
+        // 这里是 2-3 前兜底 (膛内弹直装路径无 2-2). 齐射: 只左炮拉 (计算台共享),
+        // 右炮等左炮 CalcDone 信号 — 不能抢先按解算推药
+        if (SyncCommand && _side == LeftRight.Right) {
+            float calcWaited = 0f;
+            while (SyncPeer != null && !SyncPeer.CalcDone && calcWaited < 10f) {
+                yield return new WaitForSeconds(0.1f);
+                calcWaited += 0.1f;
+            }
+        }
+        else {
+            yield return CalcPowderRefresh();
+        }
         int selected = _gun.SelectedPowderCharges();
+        // 上轮 LOAD 推药失败 (COFM 超时): 分配器读数不可信 (开火后里程表 ~16s 滞后残留, 虚高会把空分配器判成满)
+        // → 本轮无视读数按空算拉满. 真药包场景 (玩家手动拉满): 分配器已满拉不动, 重复拉杆只是 9s 白等, 不会超量.
+        if (_forceFullPowder) {
+            _forceFullPowder = false;
+            selected = 0;
+            MelonLogger.Msg($"[GC] {_side}: PWDR force full pull (last LOAD failed, reading untrusted)");
+        }
         int need = DesiredCharge;
         if (selected > need) yield break; // 超出 (齐射多药在决策层 DUMP; 单发多药由 FC 侧 useActual 处理)
         int target = SyncCommand ? 2 * need : need; // 齐射查池按两倍药量
@@ -520,12 +582,18 @@ public class GunControl {
         float waited = 0f;
         const float cofmTimeout = 25f; // 装填全流程 (RamCharges→BreachLocked) 实测 ~20s, 留裕量
         // COFM 实装确认: 弹对 + 药对 (齐射多药/少药都是错药 ==) + 炮闩锁定 = 整体封膛完成
+        bool cofm = false;
         while (waited < cofmTimeout) {
             bool shellOk = _gun.BulletInChamber() == DesiredShell.ToString();
             bool powderOk = SyncCommand ? _gun.LoadedPowderCharges() == DesiredCharge : _gun.LoadedPowderCharges() >= DesiredCharge;
-            if (shellOk && powderOk && _gun.ReloadStateAtOrAfter("BreachLocked")) break;
+            if (shellOk && powderOk && _gun.ReloadStateAtOrAfter("BreachLocked")) { cofm = true; break; }
             yield return new WaitForSeconds(0.5f);
             waited += 0.5f;
+        }
+        if (!cofm) {
+            // 推药失败/药没推进膛: 分配器实际量与读数脱节 (读数残留/滞后), 下轮 PWDR 无视读数强制拉满
+            _forceFullPowder = true;
+            MelonLogger.Msg($"[GC] {_side}: LOAD cofm timeout — loaded={_gun.LoadedPowderCharges()}, powder reading untrusted, next PWDR force full");
         }
         RefreshSnapshot();
     }

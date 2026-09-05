@@ -54,6 +54,11 @@ public class FcsModule : IFcsModule
         gunR = new GunControl(LeftRight.Right, fcs.RightGun, deck, gcPurchaseLock);
         gunL.SyncPeer = gunR;
         gunR.SyncPeer = gunL;
+        // 解算台注入 (装填期 PWDR 前 Calculate 刷新分配器读数缓存; 锁与 FC 共用同一把 — 计算台是共享硬件)
+        gunL.Calculator = fcs.BallisticCalculator;
+        gunR.Calculator = fcs.BallisticCalculator;
+        gunL.CalculatorLock = fireLock;
+        gunR.CalculatorLock = fireLock;
         gunL.Start();
         gunR.Start();
 
