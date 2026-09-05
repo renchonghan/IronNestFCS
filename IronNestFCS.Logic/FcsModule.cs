@@ -77,11 +77,9 @@ public class FcsModule : IFcsModule
         // GC → DC_D: 实时弹道 push (GC 全权: 瞄准点/杀伤圈/弹种/AllReady/飞时)
         gunL.OnBallisticPush = (side, x, y, r, b, ready, fly) => renderer2.PushBallistic(side, new Vector2(x, y), r, b, ready, fly);
         gunR.OnBallisticPush = (side, x, y, r, b, ready, fly) => renderer2.PushBallistic(side, new Vector2(x, y), r, b, ready, fly);
-        // GC → DC_D: 落点指示器 (GC 击发确认 → DC 画线; GC 飞行期持续传导倒计时剩余)
-        gunL.OnImpactFired = (side, x, y, shell, fly) => renderer2.ImpactFired(side, x, y, shell, fly);
-        gunR.OnImpactFired = (side, x, y, shell, fly) => renderer2.ImpactFired(side, x, y, shell, fly);
-        gunL.OnImpactRemain = (side, r) => renderer2.PushImpactRemain(side, r);
-        gunR.OnImpactRemain = (side, r) => renderer2.PushImpactRemain(side, r);
+        // GC → DC_D: 落点指示器 (GC 击发确认 → DC 画线; Flight 引用直读 — 剩余/落地由 DC 每帧读字段, 不再逐帧传导)
+        gunL.OnImpactFired = (side, x, y, shell, fly, flight) => renderer2.ImpactFired(side, x, y, shell, fly, flight);
+        gunR.OnImpactFired = (side, x, y, shell, fly, flight) => renderer2.ImpactFired(side, x, y, shell, fly, flight);
 
         // FC
         fireControl = new FireControl {

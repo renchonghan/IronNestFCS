@@ -342,7 +342,7 @@ public class SandboxRenderer {
     /// 落点 = 开火瞬间的瞄准点缓存 (GC 口径: 落弹点就是 GC 传给 DC 的落弹点, 不另传坐标).
     /// 恒定实体: 每炮一套 (6 个根), 击发时重画激活, 飞行结束隐藏 — 不新建不销毁.
     /// 剩余时间由 GC 持续传导 (游戏倒计时真值, 与游戏指示器同步); DC 侧本地计时兜底.</summary>
-    public void ImpactFired(LeftRight side, float aimX, float aimY, BulletType shell, float flightTime) {
+    public void ImpactFired(LeftRight side, float aimX, float aimY, BulletType shell, float flightTime, Flight flight) {
         if (MapSurfaceRef == null || NestRef == null) return;
         var board = new Vector2(aimX, aimY); // GC 冻结的开火前最后瞄准点 (开火后游戏把标记拉回铁巢, DC 侧缓存不可靠)
         // 射表偏差探针: GC 标记 = 游戏按炮口 E/A 自解的真实落点 (弹坑所在); FC aim = 射表解算.
@@ -375,9 +375,7 @@ public class SandboxRenderer {
         im.ImpactBoard = board;
         im.NestBoard = (Vector2)MapSurfaceRef.InverseTransformPoint(NestRef.position);
         im.Shell = shell;
-        im.FlightTime = Mathf.Max(flightTime, 0.01f);
-        im.CreatedAt = Time.time;
-        im.FlightRemain = float.NaN; // 等 GC 传导倒计时真值
+        im.Flight = flight; // 剩余/落地统一口径 (GC 每帧更新 Flight, 这里只存引用直读字段)
         im.LastShownSecond = -1;
         im.Landed = false;
         // 上一发落地后隐藏的飞行件恢复激活 (虚线一直留着, 见 LandImpact)
@@ -397,8 +395,7 @@ public class SandboxRenderer {
             fin.JBoard = tr.JBoard;
             fin.T0 = tr.T0;
             fin.P0Board = (Vector2)MapSurfaceRef.InverseTransformPoint(tr.Target.position); // 冻结起点 = 击发瞬间目标位置
-            fin.FiredAt = Time.time;
-            fin.FlightRemain = float.NaN;
+            fin.Flight = flight; // 最终线缩短驱动 (统一口径)
             fin.Root.SetActive(true);
             tr.Root.SetActive(false); // 火控线释放
         }
@@ -435,15 +432,7 @@ public class SandboxRenderer {
         im.Root.SetActive(true);
     }
 
-    /// <summary>GC 飞行期持续传导: 游戏倒计时剩余 (与游戏指示器逐帧同步); 0 = 落地.</summary>
-    public void PushImpactRemain(LeftRight side, float remain) {
-        if (!_impacts.TryGetValue(side, out var im) || im.Root == null) return;
-        im.FlightRemain = remain;
-        if (remain <= 0f) { LogLanding(side, im); LandImpact(im); } // 落地: 飞行件隐藏, 虚线+圈保留 (恒定实体, 不销毁)
-        if (_finals.TryGetValue(side, out var fin)) fin.FlightRemain = remain; // 最终轨迹线同源缩短
-    }
-
-    /// <summary>落地对账: 游戏计时器判定的落地时刻, 目标彼时实际位置 vs 落点 — 直接差 = 打远/打近 (不依赖铁巢/开火计时).</summary>
+    /// <summary>落地对账: Flight 判定的落地时刻, 目标彼时实际位置 vs 落点 — 直接差 = 打远/打近 (不依赖铁巢/开火计时).</summary>
     private void LogLanding(LeftRight side, ImpactIndicator im) {
         if (MapSurfaceRef == null || !_finals.TryGetValue(side, out var fin) || fin.Target == null) return;
         var tb = (Vector2)MapSurfaceRef.InverseTransformPoint(fin.Target.position);
@@ -518,10 +507,8 @@ public class SandboxRenderer {
         }
         foreach (var fin in _finals.Values) { // 最终线: 击发冻结缩短 (细实线)
             if (fin.Root == null || !fin.Root.activeSelf) continue;
-            float local = fin.T0 - (Time.time - fin.FiredAt);
-            float remain = FixRemain(fin.FlightRemain, local, ref fin.LastGc, ref fin.GcLag); // 与红线同口径 (gc 冻结修正)
-            if (remain <= 0f) { fin.Root.SetActive(false); continue; } // 落地: 隐藏
-            float progress = 1f - remain / fin.T0; // 与红线同口径: 0=刚出膛 1=落地
+            if (fin.Flight == null || fin.Flight.Landed) { fin.Root.SetActive(false); continue; } // 落地: 隐藏
+            float progress = 1f - fin.Flight.Remain / fin.Flight.FlyTime; // 0=刚出膛 1=落地 (Flight 统一口径)
             var head = TrackCurve(fin.P0Board, fin.VBoard, fin.ABoard, fin.JBoard, fin.T0 * progress);
             fin.Solid.Start = new Vector3(head.x, head.y, 0f);
             fin.Solid.End = new Vector3(fin.AimBoard.x, fin.AimBoard.y, 0f); // 终点 = 开火瞬间交汇点 (不动)
@@ -531,23 +518,6 @@ public class SandboxRenderer {
 
     private static Vector2 TrackCurve(Vector2 p0, Vector2 v, Vector2 a, Vector2 j, float t) =>
         p0 + v * t + 0.5f * a * t * t + j * (t * t * t) / 6f;
-
-    private static void SetDash(Il2CppShapes.Line l, Vector2 a, Vector2 b) {
-        l.Start = new Vector3(a.x, a.y, 0f);
-        l.End = new Vector3(b.x, b.y, 0f);
-    }
-
-    /// <summary>剩余时间修正: gc (游戏倒计时传导) 正常更新时锁定基准差 GcLag = local − gc
-    /// (击发检测滞后, 恒 ~1s); gc 冻结 (新任务起链抢表, 帧间降速 < 0.05) / NaN 后
-    /// 用 local − GcLag 继续 — 与真实落地时刻对齐, 不慢不跳.</summary>
-    private static float FixRemain(float gc, float local, ref float lastGc, ref float gcLag) {
-        if (!float.IsNaN(gc) && (float.IsNaN(lastGc) || Mathf.Abs(gc - lastGc) > 0.05f)) {
-            lastGc = gc;
-            gcLag = local - gc; // gc 正常降速: 刷新基准差
-        }
-        float lagged = local - (float.IsNaN(gcLag) ? 0f : gcLag);
-        return float.IsNaN(gc) ? lagged : Mathf.Min(gc, lagged);
-    }
 
     /// <summary>沿曲线 τ∈[t0,t1] 铺点 (点式虚线): 64 点采样累计弧长, 点位置弧长插值定位, 点方向 = 轨迹切线.
     /// 点距 = 均分 len/(n-1): 最小 0.008 (实测手感值), 无上限, 最多 32 点 —
@@ -598,16 +568,15 @@ public class SandboxRenderer {
     }
 
     /// <summary>每帧: 落点指示器推进 — 实线未飞段渐短 + 实心红点弹头沿线移动 + 计时数字每秒刷新; 落地 → 飞行件隐藏
-    /// (红色虚线弹道 + 落点圈保留到下一次开火). 剩余时间取 本地计时 与 GC 传导值 的小值:
-    /// 游戏倒计时最后 ~2s 会卡住不降 (传导值停住), 本地计时继续走 — 以本地为准收尾.</summary>
+    /// (红色虚线弹道 + 落点圈保留到下一次开火). 剩余/落地直读 Flight 字段 (唯一口径, GC 已修正炮表冻结/清表).</summary>
     private void UpdateImpacts() {
         foreach (var kv in _impacts) {
             var im = kv.Value;
             if (im.Root == null || !im.Root.activeSelf || im.Landed) continue; // 未激活/已落地 不动
-            float local = im.FlightTime - (Time.time - im.CreatedAt); // 本地计时 (锁存总飞时基准)
-            float remain = FixRemain(im.FlightRemain, local, ref im.LastGc, ref im.GcLag);
-            if (remain <= 0f) { LogLanding(kv.Key, im); LandImpact(im); continue; }
-            float progress = 1f - remain / im.FlightTime; // 0=刚出膛 1=落地
+            if (im.Flight == null) continue;
+            if (im.Flight.Landed) { LogLanding(kv.Key, im); LandImpact(im); continue; } // 落地: 飞行件隐藏
+            float remain = im.Flight.Remain;
+            float progress = 1f - remain / im.Flight.FlyTime; // 0=刚出膛 1=落地
             Vector2 shell = Vector2.Lerp(im.NestBoard, im.ImpactBoard, progress);
             // 实线: 弹头 → 落点 (未飞段) — 只动端点不重建
             if (im.SolidLine == null) {
@@ -846,9 +815,7 @@ public class SandboxRenderer {
         public Vector2 NestBoard;
         public Il2CppShapes.Line? FixedLine;  // 红色固定虚线 (游戏 Dashed 单线, 恒定实体)
         public BulletType Shell;
-        public float FlightTime;
-        public float CreatedAt;
-        public float FlightRemain = float.NaN; // GC 传导的游戏倒计时剩余 (NaN = 未收到, 本地计时兜底)
+        public Flight? Flight;   // 飞行状态引用 (剩余/落地统一口径, GC 每帧更新 — DC 直读)
         public float SegW;      // 计时/弹种标签字号 (板面空间)
         public float Step;      // 字符间距
         public float TimerY;    // 计时标签 y (板面空间)
@@ -858,8 +825,6 @@ public class SandboxRenderer {
         public int LastShownSecond = -1;
         public Il2CppShapes.Line? SolidLine; // 未飞段实线 (缓存, 每帧只动端点)
         public bool Landed; // 已落地: 飞行件 (实线/红点/计时/弹种标签) 隐藏, 虚线弹道+落点圈保留到下一次开火
-        public float LastGc = float.NaN;   // gc 冻结检测 (帧间降速 < 0.05 = 表被抢)
-        public float GcLag = float.NaN;    // 基准差锁定 (gc 正常时 local − gc ≈ 击发检测滞后)
     }
 
     /// <summary>目标轨迹预测线 (每炮两条恒定实体, 绿色 = 火控解算内容): 火控线 = 目标 → 交汇点轨迹 (FC 25fps push, 粗粒度虚线);
@@ -878,10 +843,7 @@ public class SandboxRenderer {
         public Vector2 VBoard, ABoard, JBoard; // 轨迹参数 (板面/s, /s², /s³) — 曲线 P(τ) = P0 + V·τ + ½A·τ² + ⅙J·τ³
         public Vector2 P0Board;            // 最终线冻结起点 (击发瞬间目标位置)
         public float T0;                   // 解算飞时 (曲线总时长)
-        public float FiredAt = float.NaN;  // 冻结时刻 (本地计时兜底)
-        public float FlightRemain = float.NaN; // 倒计时 (GC 传导; NaN = 本地兜底)
-        public float LastGc = float.NaN;   // gc 冻结检测 (与红线同口径)
-        public float GcLag = float.NaN;    // 基准差锁定
+        public Flight? Flight;             // 飞行状态引用 (最终线缩短/落地驱动 — 统一口径)
     }
 
     private class BallisticMark {

@@ -60,7 +60,6 @@ public class GunControl {
     public bool AllReady { get; private set; }                     // 弹药确认且追踪稳定; 不稳定回退
     public bool DumpWaitActive { get; private set; }               // 1-3 DUMP 相位停手等接管中 (FC 据此撤任务改派 DUMP 占位)
     public bool Fired { get; private set; }                        // 本发已击发 (GC 内部防重; 不对外 — FC 用 FlyRemaining 作击发确认)
-    public float FiredAtMission = float.NaN;                       // 出膛时刻任务时钟 (FC FireMission 同口径; 炮表倒计时启动晚 ~1s, 不能拿启动时刻当击发时刻)
     public bool KernelMode { get; private set; }                   // 内核态: 硬件动作执行中 (指令只记录不生效)
     /// <summary>游戏 CANFIRE 信号 (实测不含保险: 装填完成 — 弹+药+炮闩锁 — 未开保险即 True;
     /// 就是"俯仰手柄解锁"的综合信号): 绿十字/落弹点显示门槛 (1.x 同口径, 弹没装好不出落点).</summary>
@@ -80,23 +79,20 @@ public class GunControl {
     private const float SlopeAlphaA = 0.5f;  // H 斜率平滑加大 (过最近点角速度急变段跟快点)
     private object? _loopHandle;
     private object? _taskHandle;
-    private float _latchedFlyTime = float.NaN; // 击发后锁存总飞时
     private bool _lastHasFired;                // pendingReload 上升沿检测 (击发自检)
     private bool? _lastCanFire;                // CanFire 沿检测 (装填完成 → 击发沿复位)
-    private bool _impactFlying;                // 落点指示器飞行中 (GC 持续传导倒计时剩余)
-    private bool _sawCountdown;                // 已见过倒计时真值 (落地判定: 见过后又 NaN = 落地)
-    private float _impactFiredAt;              // 击发确认时刻 (倒计时未启动兜底)
     private bool _disposed;
+    /// <summary>当前飞行 (击发时创建, 落地后保留引用 — HUD/DC 读 Landed/Remain; 下一发击发覆盖; DUMP 不建).</summary>
+    public Flight? CurrentFlight;
 
     // 实时弹道指示器 push 目标 (FcsModule 注入 DC 回调; GC 全权): (瞄准点, 杀伤圈, 弹种, AllReady, 飞时)
     public delegate void BallisticPush(LeftRight side, float aimX, float aimY, float killRadiusKm, int bulletType, bool ready, float flyTime);
     public BallisticPush? OnBallisticPush;
 
     // ===== GC → DC: 落点指示器 (FcsModule 注入 DC 回调) =====
-    /// <summary>击发确认 (锁存总飞时已取到): DC 画落点线 — 落点 = GC 冻结的开火前最后瞄准点 (板面坐标, 开火后游戏把标记拉回铁巢, 必须 GC 侧冻结).</summary>
-    public System.Action<LeftRight, float, float, BulletType, float>? OnImpactFired;
-    /// <summary>飞行期间持续传导游戏倒计时剩余 (与游戏指示器逐帧同步); 0 = 落地隐藏.</summary>
-    public System.Action<LeftRight, float>? OnImpactRemain;
+    /// <summary>击发确认 (锁存总飞时已取到): DC 画落点线 — 落点 = GC 冻结的开火前最后瞄准点 (板面坐标, 开火后游戏把标记拉回铁巢, 必须 GC 侧冻结).
+    /// 附 Flight 引用 — 剩余/落地由 DC 每帧直接读字段 (统一口径, 不逐帧传导).</summary>
+    public System.Action<LeftRight, float, float, BulletType, float, Flight>? OnImpactFired;
 
     /// <summary>齐射对端 (SyncCommand 时相位级同步互相等; 对炮 FALL → 本炮也 FALL 防陪死).</summary>
     public GunControl? SyncPeer;
@@ -152,7 +148,6 @@ public class GunControl {
                 if (cf) {
                     Fired = false;
                     _lastHasFired = false;
-                    _latchedFlyTime = float.NaN;
                 }
                 _lastCanFire = cf;
             }
@@ -161,38 +156,26 @@ public class GunControl {
             bool firedNow = _gun.HasFired();
             if (firedNow && !_lastHasFired && !Fired && !cf) {
                 Fired = true; // 内部防重 (不对外 — FC 用 FlyRemaining 作击发确认)
-                FiredAtMission = MissionClock.Seconds; // 出膛时刻任务时钟 (FC 完成队列 FireMission 同口径)
                 var sw = _gun.StopwatchLatch();
-                if (sw.HasValue && sw.Value.travelTime > 0.01f) _latchedFlyTime = sw.Value.travelTime;
-                else _latchedFlyTime = FlyTime; // 倒计时未启动 (fireDelay): 瞄准期预测值兜底
-                FlyTime = _latchedFlyTime;      // 击发后: 锁存真值 (瞄准期活读停更, 下一帧 ReadSensors 走 else)
-                // DUMP 平射 (FC 强制退弹): 不画落点/不传导倒计时
+                float fly = sw.HasValue && sw.Value.travelTime > 0.01f ? sw.Value.travelTime : FlyTime; // 倒计时未启动 (fireDelay): 瞄准期预测值兜底
+                FlyTime = fly; // 击发后: 锁存真值 (瞄准期活读停更, 下一帧 ReadSensors 走 else)
+                // DUMP 平射 (FC 强制退弹): 不建 Flight (不画落点/不传导倒计时)
                 if (!DesiredDump) {
                     // 弹种: 最后非空膛内弹 (击发瞬间膛已空, 活读拿不到 — 开火按最后一次落点指示走); 兜底 DesiredShell
                     BulletType firedShell = System.Enum.TryParse<BulletType>(_lastChamberLive, out var fb) ? fb : DesiredShell;
-                    _impactFlying = true;
-                    _sawCountdown = false;
-                    _impactFiredAt = Time.time;
-                    OnImpactFired?.Invoke(_side, _lastAimLive.x, _lastAimLive.y, firedShell, _latchedFlyTime);
+                    CurrentFlight = new Flight {
+                        FlyTime = fly,
+                        FiredAtLocal = Time.time,
+                        FiredAtMission = MissionClock.Seconds, // 出膛时刻任务时钟 (FC 完成队列 FireMission 同口径)
+                    };
+                    OnImpactFired?.Invoke(_side, _lastAimLive.x, _lastAimLive.y, firedShell, fly, CurrentFlight);
                 }
             }
             _lastHasFired = firedNow;
-            // 飞行期间: 持续传导游戏倒计时剩余 (与游戏指示器同步); 落地传 0 隐藏.
-            // 落地判据 = 已见过倒计时后变 NaN 且本地时长接近飞时 — 装填期 (切任务起链) 游戏瞬时 NaN
-            // 不能算落地 (上一发还在飞, 误判会让红线提前消失)
-            if (_impactFlying) {
-                float r = _gun.CountdownRemainingSeconds();
-                if (!float.IsNaN(r) && r > 0f) {
-                    _sawCountdown = true;
-                    OnImpactRemain?.Invoke(_side, r);
-                }
-                else if (_sawCountdown && float.IsNaN(r) && Time.time - _impactFiredAt >= _latchedFlyTime - 0.5f) {
-                    _impactFlying = false;
-                    OnImpactRemain?.Invoke(_side, 0f); // 落地 (本地时长对齐)
-                }
-                else if (!_sawCountdown && Time.time - _impactFiredAt > 3f) {
-                    _impactFlying = false; // 表没绑/倒计时没启动: 兜底结束 (DC 侧本地计时兜底进度)
-                }
+            // 飞行期间: 每帧更新 Flight (Remain 统一口径 — 唯一落地判定; DC/HUD 直读字段, 不逐帧传导);
+            // 炮表冻结/清表由 Flight 本地外推兜底
+            if (CurrentFlight != null && !CurrentFlight.Landed) {
+                CurrentFlight.Update(_gun.CountdownRemainingSeconds(), Time.time);
             }
             if (ManualControl) {               // 手动: 立即停手, 残局交玩家, 线程照跑 (落点指示不受手动影响 — 已在上方 push)
                 TryStop(_taskHandle);
@@ -279,15 +262,13 @@ public class GunControl {
         finally { _taskHandle = null; }
     }
 
-    /// <summary>任务开工复位: AllReady/Fired/飞时锁存/双轴稳定器 (单发与齐射导演共用).
-    /// 注意: 不清 _impactFlying/_sawCountdown — 出膛后膛空, 新任务立即起链装填 (20-40s),
-    /// 而上一发飞时 ~13s, 装填开始时常上一发还在天上飞; 清了 = OnImpactRemain 传导被新任务掐断
-    /// (DC 侧全靠 FixRemain 外推兜底, 游戏不会这么干 — 传导应持续到落地). 同一门炮
-    /// 上一发落地前不可能击发下一发 (装填链时长), 无重叠风险.</summary>
+    /// <summary>任务开工复位: AllReady/Fired/双轴稳定器 (单发与齐射导演共用).
+    /// 注意: 不碰 CurrentFlight — 出膛后膛空, 新任务立即起链装填 (20-40s), 而上一发飞时 ~13s,
+    /// 装填开始时常上一发还在天上飞; Flight 独立于任务生命周期, 上一发由它继续计时 (传导不因新任务断,
+    /// 游戏不会干这种奇怪事). 同一门炮上一发落地前不可能击发下一发 (装填链时长), 无重叠风险.</summary>
     internal void ResetForTask() {
         AllReady = false;
         Fired = false;
-        _latchedFlyTime = float.NaN;
         // 击发沿基线同步到当前状态 (不能直接清 false): 上一发击发后未装填时 pendingReload 残留 true,
         // 清 false 会让下一帧击发自检把残留沿误判成新开火 → 入队瞬间红线闪一下
         _lastHasFired = _gun.HasFired();

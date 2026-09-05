@@ -84,26 +84,10 @@ public class FcsHud {
     }
 
     /// <summary>完成行: 抵达时刻 [HH:MM:SS] (无任务时钟 = 横线) 方位 距离 T:-剩余秒.
-    /// 封存双信号: 活读炮表归零 = 炮表口径落地, 立即封存 (与游戏计时器同步; 单炮不会两弹同飞,
-    /// 落地信号必在下一发开火前发生, 不会失守); 本地归零 (Fly − FireMission) 双保险.
-    /// FireMission = GC 记的出膛时刻 (见 FinishTask), 本地与红线同基准;
-    /// 炮表倒计时启动晚 ~1s, 活读恒比本地大 ~1s (正常, 与游戏计时器同口径), 超过 1.5s = 不属于自己 → 回本地; NaN = 落地 (GC 停止传导).</summary>
+    /// 剩余/落地直读 Flight 字段 (唯一口径, 判定在 GC — HUD 只显示): 落地 → --.--; Flight null (DUMP 除外不会) → --.--.</summary>
     private static string FinishRow(FireControl.FinishedEntry f) {
         string arrival = MissionClock.Format(f.FireMission + f.Fly);
-        float remain;
-        if (f.Done) {
-            remain = 0f; // 已落地封存
-        }
-        else {
-            float now = MissionClock.Seconds;
-            float local = float.IsNaN(now) ? float.NaN : f.Fly - (now - f.FireMission);
-            if (!float.IsNaN(local) && local <= 0f) { f.Done = true; remain = 0f; } // 双保险: 本地归零
-            else {
-                remain = f.RemainingSource?.Invoke() ?? float.NaN;
-                if (remain <= 0.01f || float.IsNaN(remain)) { f.Done = true; remain = 0f; } // 归零或 NaN (落地后 GC 不再传导) = 落地, 立即封存 (主信号)
-                else if (remain > local + 1.5f) remain = local; // 不属于自己 (活读明显大于本地剩余) → 本地显示
-            }
-        }
+        float remain = f.Flight != null && !f.Flight.Landed ? f.Flight.Remain : 0f;
         string cd = remain > 0.01f ? $"{remain:00.00}" : "--.--"; // 前缀 T:- 固定, 占位只补 --.--
         return $"{arrival} {f.Task.Angle:000.0} {f.Task.Distance:00.00} T:-{cd}";
     }
