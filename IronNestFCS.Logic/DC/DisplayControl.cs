@@ -30,6 +30,7 @@ public class DisplayControl {
     private readonly Dictionary<GameObject, List<Vector3>> _posHist = new(); // TWS: 75 帧位置环 (所有目标, 定速模型线性滤波)
     private readonly HashSet<GameObject> _icons = new();                     // 已挂图标 (差集用)
     private object? _loopHandle;
+    private float _lastTick;
     private bool _disposed;
 
     /// <summary>显控排布 (舰长席): AutoTask 扫荡 = 只从敌对目标按优先级发请求; 优先级 FDC > 炮兵 > 装甲 > 其他.</summary>
@@ -51,10 +52,12 @@ public class DisplayControl {
         _icons.Clear();
     }
 
-    /// <summary>数据循环 25fps.</summary>
+    /// <summary>数据循环 25fps (硬节流: 不依赖 WaitForSeconds — 协程调度异常时照样锁频).</summary>
     private IEnumerator Loop() {
         while (!_disposed) {
-            yield return new WaitForSeconds(0.04f);
+            yield return null;
+            if (Time.time - _lastTick < 0.04f) continue;
+            _lastTick = Time.time;
             SyncNestToken();     // 铁巢棋子吸附实际炮位 (旧版同款: 棋子摆偏不导致火控打飞)
             if (RadarPort == null) continue;
             RefreshTargets();
@@ -87,6 +90,7 @@ public class DisplayControl {
     /// <summary>SRC → 目标参数表 (对象复用, FC 直读): 相对位置 (方位/距离) + TWS 轨迹参数 (速度/加速度).
     /// 所有目标同轨: 75 帧环一阶定速 (无精跟/粗跟之分).</summary>
     private void RefreshTargets() {
+        if (RadarPort == null) return;
         var alive = new HashSet<GameObject>();
         foreach (var c in RadarPort.Contacts) {
             if (c == null || c.Entity == null) continue;
@@ -101,7 +105,7 @@ public class DisplayControl {
         }
         // 消失的目标 (阵亡/离图): 出表 (FC 读不到 → 撤任务)
         var dead = new List<GameObject>();
-        foreach (var k in _targetMap.Keys) if (k == null || !alive.Contains(k)) dead.Add(k);
+        foreach (var k in _targetMap.Keys) if (k == null || !alive.Contains(k)) dead.Add(k!);
         foreach (var k in dead) _targetMap.Remove(k);
         PruneHistories(alive);
         Targets.Clear();
@@ -231,7 +235,7 @@ public class DisplayControl {
         if (existing != null) {
             // 上炮任务不许改计划 (只能取消, 1.x 口径); 队列中: 右键升级齐射, 再右键取消
             if (existing.SalvoPair || (FcPort != null && FcPort.IsOnGun(existing))) {
-                FcPort.RequestCancel(existing);
+                FcPort!.RequestCancel(existing);
                 MelonLogger.Msg($"[DC] cancel task on {existing.Name}");
             }
             else {

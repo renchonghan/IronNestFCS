@@ -124,25 +124,22 @@ public class ScenePanel {
             }, right: true); // 右键 (左键留给游戏自身拖拽)
         }
         // 地图令牌 (MapToken_* 棋子): 右键 = 虚拟目标入队 (拖放由 DC 数据循环检测).
-        // 令牌无自带 collider: 挂 FCS 自有点击盒 (与实体右键同款)
+        // 令牌自带游戏 collider (0.09) 不可用: 注册它的话 StraightenClickBoxes 每帧归正会拧令牌本体 —
+        // 统一挂 FCS 自建子盒, 尺寸 0.03 局部 (用户定稿: 0.06 再缩一半)
         _tokenColliders.RemoveWhere(c => c == null);
         foreach (var go in GameObject.FindObjectsOfType<GameObject>()) {
             // 标记令牌只注册 T1-10 (MapToken_Artillery 系列); 击杀/侦察/参考点令牌不可点
             if (go == null || !go.name.StartsWith("MapToken_Artillery") || go.name.Contains("Killed")) continue;
-            var col = go.GetComponent<Collider>();
-            if (col == null) {
-                if (_tokenColliders.Any(x => x != null && x.transform.parent == go.transform)) continue;
-                var boxGo = new GameObject("FCS2_ClickBox");
-                boxGo.transform.SetParent(go.transform, false);
-                boxGo.transform.localPosition = new Vector3(0f, 0f, -0.01f);
-                var box = boxGo.AddComponent<BoxCollider>();
-                box.size = new Vector3(0.26f, 0.26f, 0.1f);
-                _owned.Add(boxGo); // 随 ShutDown 清理
-                col = box;
-            }
-            if (!_tokenColliders.Add(col)) continue;
+            if (_tokenColliders.Any(x => x != null && x.transform.parent == go.transform)) continue;
+            var boxGo = new GameObject("FCS2_ClickBox");
+            boxGo.transform.SetParent(go.transform, false);
+            boxGo.transform.localPosition = new Vector3(0f, 0f, -0.01f);
+            var box = boxGo.AddComponent<BoxCollider>();
+            box.size = new Vector3(0.03f, 0.03f, 0.1f);
+            _owned.Add(boxGo); // 随 ShutDown 清理
+            _tokenColliders.Add(box);
             var token = go;
-            _clicks.Register(col, () => {
+            _clicks.Register(box, () => {
                 Dc?.RightClickToken(token);
             }, right: true);
         }

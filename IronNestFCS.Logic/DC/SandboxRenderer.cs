@@ -24,7 +24,7 @@ public class SandboxRenderer {
     private readonly Dictionary<LeftRight, TrackIndicator> _tracks = new();     // 火控目标线 (开火前解算, 绿点线) 每炮一条
     private readonly Dictionary<LeftRight, TrackIndicator> _finals = new();     // 最终轨迹线 (击发冻结缩短, 绿点线) 每炮一条
     private const float TrackDotDia = 0.006f; // 轨迹点直径 (= 线宽 0.006); 点距 = 均分 len/(n-1) (最小 0.008, 无上限, 最多 32 点)
-    private readonly Dictionary<GameObject, GameObject> _icons = new();
+    private readonly Dictionary<GameObject, IconEntry> _icons = new();
     private readonly Dictionary<LeftRight, BallisticMark> _ballistic = new();
 
     private object? _loopHandle;
@@ -44,6 +44,9 @@ public class SandboxRenderer {
     private const float ImpactOffset = ZStep * ImpactPrio; // 0.001
     private const float RedOffset = ZStep * RedPrio;       // 0.002
     private const float SurfScale = 0.212f / 0.81f; // 实体单位 → 板面单位 (实体世界缩放 / 板面世界缩放)
+    // 速度矢量符尺寸 (板面单位, 用户定稿): 空心圆半径 0.005 = 静止点直径; 点缩至原 1/4
+    private const float SpeedR = 0.005f;     // 矢量符圆半径 (线长基准 r: 0.5r/1r/1.5r 对数档)
+    private const float SpeedDotR = 0.0025f; // 静止点半径
 
     public void Start() {
         _disposed = false;
@@ -66,14 +69,33 @@ public class SandboxRenderer {
         }
     }
 
-    /// <summary>实体图标位置跟随 (板面父级, 每帧由实体世界坐标反算; 死亡实体由 DC 差集回调清退).</summary>
+    /// <summary>实体图标位置跟随 (板面父级, 每帧由实体世界坐标反算; 死亡实体由 DC 差集回调清退) + 速度矢量符活读.</summary>
     private void FollowIcons() {
         if (MapSurfaceRef == null) return;
         foreach (var pair in _icons) {
             if (pair.Key == null || pair.Value == null) continue;
             var b = (Vector2)MapSurfaceRef.InverseTransformPoint(pair.Key.transform.position);
-            pair.Value.transform.localPosition = new Vector3(b.x, b.y, RedOffset);
+            pair.Value.Root.transform.localPosition = new Vector3(b.x, b.y, RedOffset);
+            UpdateSpeedVector(pair.Value);
         }
+    }
+
+    /// <summary>速度矢量符 (战雷 TTS 同款): 目标中心往下 0.15 格, 静止 = 点, 运动 = 空心圆 (半径 SpeedR) + 速度方向线 (自圆周伸出).
+    /// 线长对数连续: 1-10 m/s → 0.5r, 10-100 → 1r, 100-1000 → 1.5r, 超 1000 封顶 2r (档内 log10 平滑, 无跳变).
+    /// 数据源 = DC TWS 滤波速度 (板面局部系 km/s, 方向即板面方向); TWS 关 → 速度 0 → 全显示静止点.</summary>
+    private static void UpdateSpeedVector(IconEntry e) {
+        if (e.SpeedRoot == null) return;
+        var v = e.Target.Velocity;
+        float vMps = v.magnitude * 1000f; // km/s → m/s
+        bool moving = vMps >= 1f;
+        e.CircleRoot.SetActive(moving);
+        e.DotRoot.SetActive(!moving);
+        e.SpeedLine.gameObject.SetActive(moving);
+        if (!moving) return;
+        float len = Mathf.Clamp(SpeedR * (0.5f + 0.5f * Mathf.Log10(vMps)), 0.5f * SpeedR, 2f * SpeedR);
+        var dir = v / v.magnitude;
+        e.SpeedLine.Start = new Vector3(dir.x, dir.y, 0f) * SpeedR;         // 线从圆周起 (不是圆心)
+        e.SpeedLine.End = new Vector3(dir.x, dir.y, 0f) * (SpeedR + len);
     }
 
     // ===== DC 方法 (其他模块调用) =====
@@ -88,7 +110,7 @@ public class SandboxRenderer {
         _tracks.Clear();
         foreach (var f in _finals.Values) DestroyRoot(f.Root);
         _finals.Clear();
-        foreach (var go in _icons.Values) DestroyRoot(go);
+        foreach (var e in _icons.Values) DestroyRoot(e.Root);
         _icons.Clear();
         foreach (var b in _ballistic.Values) DestroyRoot(b.Root);
         _ballistic.Clear();
@@ -617,11 +639,30 @@ public class SandboxRenderer {
         };
         // 尺寸归一: 板面单位 = 实体单位 × SurfScale (实体/令牌视觉同款大小)
         DrawIcon(root.transform, t.Kind, color, SurfScale, t.Armour);
-        _icons[t.Entity] = root;
+        // 速度矢量符 (战雷 TTS 同款): 目标中心往下 0.15 格 — 空心圆 (半径 SpeedR) + 速度方向线 (对数长度, 自圆周起) / 静止点
+        var speedRoot = new GameObject("FCS2_SpeedVec");
+        speedRoot.transform.SetParent(root.transform, false);
+        speedRoot.transform.localPosition = new Vector3(0f, -0.15f * GeoMap.MapCellSize, 0f);
+        var circleRoot = new GameObject("FCS2_SpeedCircle");
+        circleRoot.transform.SetParent(speedRoot.transform, false);
+        const float spdW = 0.005f / 3f; // 线宽 (用户定稿: 原 0.005 取 1/3)
+        const int spdSegs = 24;
+        for (int i = 0; i < spdSegs; i++) {
+            float a0 = i * 2f * Mathf.PI / spdSegs, a1 = (i + 1) * 2f * Mathf.PI / spdSegs;
+            Line(circleRoot.transform, new Vector2(Mathf.Cos(a0), Mathf.Sin(a0)) * SpeedR,
+                new Vector2(Mathf.Cos(a1), Mathf.Sin(a1)) * SpeedR, spdW, color, RedPrio);
+        }
+        var dotRoot = new GameObject("FCS2_SpeedDot");
+        dotRoot.transform.SetParent(speedRoot.transform, false);
+        FillDot(dotRoot.transform, Vector2.zero, SpeedDotR, color, RedPrio);
+        var line = Line(speedRoot.transform, Vector2.zero, new Vector2(SpeedR, 0f), spdW, color, RedPrio);
+        _icons[t.Entity] = new IconEntry {
+            Root = root, Target = t, SpeedRoot = speedRoot, CircleRoot = circleRoot, DotRoot = dotRoot, SpeedLine = line,
+        };
     }
 
     public void RemoveIcon(GameObject go) {
-        if (_icons.TryGetValue(go, out var root)) { DestroyRoot(root); _icons.Remove(go); }
+        if (_icons.TryGetValue(go, out var entry)) { DestroyRoot(entry.Root); _icons.Remove(go); }
     }
 
     /// <summary>实体图标三遍遍历渲染 (用户定稿):
@@ -781,6 +822,15 @@ public class SandboxRenderer {
     }
 
     public enum Slot { Queue, Left, Right, Salvo }
+
+    private class IconEntry {
+        public GameObject Root = null!;
+        public DcTarget Target = null!; // DC 对象复用引用 (位置/速度每帧被 DC 更新, 活读)
+        public GameObject SpeedRoot = null!;  // 矢量符根 (目标中心往下 0.15 格)
+        public GameObject CircleRoot = null!; // 矢量符圆 (运动显示)
+        public GameObject DotRoot = null!;    // 静止点 (速度 <1 m/s 显示)
+        public Il2CppShapes.Line SpeedLine = null!; // 速度方向线 (每帧只动端点)
+    }
 
     private class QueueIndicator {
         public GameObject Root = null!;

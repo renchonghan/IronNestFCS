@@ -113,7 +113,7 @@
 
 - `ShellId` (string, 如 "AP"/"STAR"; 注意游戏侧 PCLM 叫 PLCM) / `DisplayName` / `Description`
 - **`ShellSpeed` = 0.7 (全部 21 个弹种同值)**
-- **`ImpactRadius` (float, km, 半径!) = 各弹种杀伤半径真值** (AP/LE/PCLM 0.15, APHE/HE/INCN 0.25, THRM 0.35, STAR/CLMN/PRPG 0.5, EQKE/HCHE 0.55, FLCH/PHGN 0.62, CYAN/TEAR/WP 0.75, SMK 1.0, DRIL 0.07, ATMC 3.0)
+- **`ImpactRadius` (float, km, 半径!) = 各弹种杀伤半径真值** (探针全表 2026-09-06, 共 21 弹: AP/LE/PLCM 0.15, APHE/HE/INCN 0.25, THRM 0.35, STAR/CLMN/PRPG 0.5, EQKE/HCHE 0.55, FLCH/PHGN 0.62, CYAN/TEAR/WP 0.75, SMK/EMPT 1.0, DRIL 0.07, ATMC 3.0)
 - `maxPowderCharges` = 6 / `defaultPowderCharge` = 3
 - `chargeRangeMappings` (PowderChargeRangeMapping[]): 每药包 maxRange = 5/10/15/20/25/30 km (minRange 全 0)
 - **`chargeToSpeedMultiplier` (AnimationCurve, 全弹种同一条)**: c1=0.30 c2=0.3728 c3=0.5464 c4=0.7536 c5=0.9272 c6=1.0
@@ -152,6 +152,7 @@
 - **记事本卡片副作用**: 每次 Calculate 在游戏道具"记事本"上多一张卡 — Calculate 次数最小化 (每任务一次)。
 - **CanFire 不含保险**: 装填完成 (弹+药+炮闩锁) 即 True, 未开保险也 True — 只是"俯仰手柄解锁"综合信号, 不能当击发信号 (击发用 pendingReload 沿)。
 - **装填状态码序列** (ReloadStateKey 完整序): GuideDeploy → BreechOpen → ShellRamming (推弹中, 膛内读数不可信) → SelectPowderCharge (P3 拉杆窗口) → RamCharges (P4 推药) → CloseShellGuide → FinalSequence → BreachLocked (封膛完成, 一闪而过) → Done。ReloadStateAtOrAfter 按此序判定"码已过时不盲等"。
+- **道具描述与资产不符**: 游戏内道具称 AP 杀伤 50m, 但 ShellDefinition.ImpactRadius 资产真值 0.15 km (半径 150m) — mod 杀伤圈按资产值画, 不信道具文本。
 
 ---
 

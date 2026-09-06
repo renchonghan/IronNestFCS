@@ -13,7 +13,7 @@ namespace IronNestFCS.Logic;
 /// </summary>
 public class FcsModule : IFcsModule
 {
-    private readonly FSC fcs = new() { LegacyDisabled = true }; // 旧调度层停用, 只保留硬件绑定
+    private readonly FSC fcs = new(); // 硬件绑定壳 (旧调度层已清退)
 
     private GunControl? gunL;
     private GunControl? gunR;
@@ -64,8 +64,9 @@ public class FcsModule : IFcsModule
 
         // RD → DC 数据链
         radar2 = new Radar();
-        radar2.Start();
         var surface = GameObject.Find("Draggable Surface")?.transform;
+        radar2.MapSurfaceRef = surface; // 信号注入载体母体 (板面局部系)
+        radar2.Start();
         var nest = GameObject.Find("Player Turret Piece")?.transform;
         var fmr = GameObject.Find("Fire Mission Root")?.transform;
         renderer2 = new SandboxRenderer { MapSurfaceRef = surface, FireMissionRootRef = fmr, NestRef = nest };
@@ -140,13 +141,14 @@ public class FcsModule : IFcsModule
 
     public void Shutdown()
     {
-        scenePanel?.ShutDown();
-        fireControl?.Stop();
-        display?.Stop();
-        renderer2?.Stop();
-        radar2?.Stop();
-        gunL?.Stop();
-        gunR?.Stop();
+        // 各 Stop 独立 try: 一个炸了不漏全链 (残留实例 → 协程叠加事故防复发)
+        try { scenePanel?.ShutDown(); } catch (System.Exception ex) { MelonLogger.Error($"[Shutdown] scenePanel: {ex}"); }
+        try { fireControl?.Stop(); } catch (System.Exception ex) { MelonLogger.Error($"[Shutdown] fireControl: {ex}"); }
+        try { display?.Stop(); } catch (System.Exception ex) { MelonLogger.Error($"[Shutdown] display: {ex}"); }
+        try { renderer2?.Stop(); } catch (System.Exception ex) { MelonLogger.Error($"[Shutdown] renderer2: {ex}"); }
+        try { radar2?.Stop(); } catch (System.Exception ex) { MelonLogger.Error($"[Shutdown] radar2: {ex}"); }
+        try { gunL?.Stop(); } catch (System.Exception ex) { MelonLogger.Error($"[Shutdown] gunL: {ex}"); }
+        try { gunR?.Stop(); } catch (System.Exception ex) { MelonLogger.Error($"[Shutdown] gunR: {ex}"); }
         gunL = gunR = null;
         radar2 = null;
         display = null;
