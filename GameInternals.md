@@ -77,8 +77,9 @@
 ### 1.6 弹道计算器 (Balistic Calculator Controls)
 
 - 拨盘: `.Range Dial Parent` / `.Charge Dial Parent` / `.Gross Range Dial` (方向) / `.Shell Dial` (弹种)
-- 按钮: `Calculate Universal Button` (按下才存储"已计算装药数", 药包杆最多允许拉到该数 - **拉杆前必须锁内重算**)
+- 按钮: `Calculate Universal Button` — 按下后**刷新"已计算装药数"缓存** (Selected Charges 里程表的读数源), 药包杆最多允许拉到该数; 玩家不 Calculate 也能手动拉杆, 但 mod 按里程表读数决策必须先 Calculate 刷新 (开火/推药后缓存与物理分配器脱节 ~16s 才自同步, 详见 §2 行为特性)
 - 输出: `Odomiter Output Elivation` (真实解算仰角)
+- **副作用**: 每次 Calculate 会往游戏内道具"记事本"上多一张卡片 — mod 每任务至多 Calculate 一次 (CalcDone 去重)
 
 ### 1.7 击发确认台 (TriggerConsole)
 
@@ -133,7 +134,24 @@
 - **射表公式** (用户射表, 与游戏计算器输出一致): 仰角(度) = 距离(km) x 12 / 药包; 每段末端正好 60° (5km@1包 ... 30km@6包)
 - **飞行时间公式** (探针实测拟合, 各药包全中): 飞行时间(s) = 距离(km) x 10/7 / 速度倍率. 等价: 仰角系数 D(c) = 1.4 x mult(c) x 6/c (实测 c1 2.52 / c2 1.57 / c3 1.53 / c4 1.58 / c5 1.56 / c6 1.40). 6 包时退化为 距离 x 10/7 (60°→42.86s 实测全段线性). 注意: 游戏 PredictedImpactTime 是活变量, 手动玩不重算时读数可能来自旧解
 - **杀伤半径**: 直接用游戏 `ShellDefinition.ImpactRadius` (km, 半径), 见 1.10 表; 未知弹种回落 0.625 (ShellData.KillRadiusKm)
-- **游戏弹道计算器仍需保留 Calculate 步骤**: 游戏只在按 Calculate 时存储"已计算装药数", 药包杆最多允许拉到该数 (推药杆解锁依赖), 仰角/飞行时间由 mod 公式直算, 不再读计算台输出
+- **游戏弹道计算器的 Calculate 步骤**: 刷新"已计算装药数"缓存 (Selected Charges 读数源), 药包杆最多允许拉到该数 — mod 每任务至多一次 (装填期 2-2 并行/2-3 兜底, CalcDone 去重, 见 Architecture.md §4.3); 仰角/飞行时间由 mod 公式直算, 不再读计算台输出
+
+---
+
+## 2.5 游戏行为特性 (探针实测, 设计依赖)
+
+- **炮表倒计时三态失效** (CountdownRemainingSeconds):
+  - 倒计时最后 ~2s 卡住不降 (游戏计时器自身行为);
+  - 飞行中给同炮切任务 → 炮表被新任务瞄准流程抢占, 读数冻结 (帧间降速 <0.05 可检测);
+  - 无下一任务时发射流程收尾 (REST/Idle) 炮表清成 NaN — 飞行中即发生, **NaN ≠ 落地**。
+  - 处置见 Architecture.md §4.1 Flight 统一口径 (显示 min(gc, 本地外推), 落地只认本地)。
+- **炮表倒计时启动滞后**: 出膛 (pendingReload 沿) 后 ~1s 炮表才启动 (触发核心储能出膛的延迟); 按钮按下 → 出膛也 ~1s (fireDelay)。三时刻: 按钮 −1s / 出膛 0 / 炮表 +1s。FC 收尾与完成队列时刻一律用出膛基准 (Flight.FiredAtMission)。
+- **分配器读数 (Selected Charges 里程表) 是计算台缓存**: 开火/推药后与物理分配器脱节, 实测 ~16s 后才自同步 (读数虚高 → mod 判满不拉杆 → 推药按钮不激活死循环); Calculate 立即刷新。分配器 6 包满, 满了拉不动 (重复拉杆无副作用)。
+- **装药变量语义**: 2-3 阶段 `SelectedPowderCharges` = 分配器"实际拉了几包" (里程表, P3 可见); 2-4 推药确认后 `LoadedPowderCharges` (GunController.PowderCharges) = "膛内实际几包"。拉几包按 mod 解算 (DesiredCharge), 游戏读数只做参考。
+- **按钮激活依赖机构就绪**: Button Dispencer (拉药杆)/Charge Rammer (推药钮) 在装填机构未停稳时不激活 (isActive=false, 9s 白等) — 状态码已是 SelectPowderCharge 不代表按钮可点; 直装路径必须等 WaitForReloadReady (机构停+炮闩解锁+仰角静止)。
+- **记事本卡片副作用**: 每次 Calculate 在游戏道具"记事本"上多一张卡 — Calculate 次数最小化 (每任务一次)。
+- **CanFire 不含保险**: 装填完成 (弹+药+炮闩锁) 即 True, 未开保险也 True — 只是"俯仰手柄解锁"综合信号, 不能当击发信号 (击发用 pendingReload 沿)。
+- **装填状态码序列** (ReloadStateKey 完整序): GuideDeploy → BreechOpen → ShellRamming (推弹中, 膛内读数不可信) → SelectPowderCharge (P3 拉杆窗口) → RamCharges (P4 推药) → CloseShellGuide → FinalSequence → BreachLocked (封膛完成, 一闪而过) → Done。ReloadStateAtOrAfter 按此序判定"码已过时不盲等"。
 
 ---
 

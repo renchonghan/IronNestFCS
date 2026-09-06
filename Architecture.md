@@ -1,368 +1,297 @@
-# 当前调度架构 (旧架构回顾)
+# ArchitectureNote — IronNestFCS 架构与开发手册
 
-> 重构前现状的记录, 供对照. 只讲大局, 细节在代码里. 新架构见下方 FastNote.
+> 2.0 架构权威文档。章法: 先谈架构 → 后说实现 → 前后向接口 → 坑与注意事项 → 开发流程。
+> 新人上手路径: 本文件通读 → [GameInternals.md](GameInternals.md)(游戏逆向笔记, 组件/数值/踩坑) → 代码。
+> 本文已合并 2026-09-05 全量 review 的结论(一致性清单与修复记录见 §5)。
 
 ---
 
-## 一句话概括
+## 1. 总体架构
 
-**每炮一条串行状态机, 从装填到开火按顺序走完; 两门炮通过两把锁 + 一个药包池共享硬件.**
+### 1.1 一句话
 
-## 怎么跑起来的
+**五模块数据链 RD→DC_U→FC→GC→DC_D: 雷达找目标, 显控台建表跟踪, 火控解算决策, 炮执行装填追踪, 渲染线程画沙盘。**
 
-- 任务进队列 → 派给空闲炮管 → 该炮启动一条协程, 一个相位一个相位往下走:
+### 1.2 数据链与节拍
 
-```
-CALL (看现场定路线) → 装弹/装药 (跳过的就跳过) → 解算 → TRAK (E/H 持续追踪) → 套上 → 确认+开保险 → 开火 → 回位 → 下一发
-```
+| 模块 | 循环 | 节拍 | 干什么 |
+| --- | --- | --- | --- |
+| [RD] Radar | 协程 | 扫描 1~3s + 粗跟 25fps | 纯传感器: 找实体/敌我分类/存活检测 → SRC 列表 |
+| [DC_U] DisplayControl | 协程 | 25fps (0.04s) | SRC → 目标参数表 (位置+TWS 轨迹参数); 交互请求; 令牌管理 |
+| [FC] FireControl | 协程 | 25fps | 队列/派发/诸元解算/统一火控/HUD 数据 |
+| [GC] GunControl ×2 + SalvoDirector | 协程 | 每炮 25fps | 装填链/追踪稳定/击发自检/Flight 更新 |
+| [DC_D] SandboxRenderer | 协程 | 每帧 (yield null) | 3D 沙盘渲染 (恒定实体, 只动端点) |
+| [DC] FcsHud | IMGUI | 每帧 | 64 字符面板直出 (不经 DisplayControl) |
+| [DC] ScenePanel + ClickRaycaster | 帧驱动 | 每帧 | 3D 按钮/右键点击盒 |
 
-- 齐射 = 一条协程同时带两门炮, 每步两炮都到位才走下一步.
-- 全部跑在 Unity 主线程的协程上, 没有真线程.
+- 全部跑在 Unity 主线程协程上 (IL2CPP 只能主线程碰对象), 没有真线程。
+- **线程常驻原则**: Stop/Pause/Manual 只改指令内容 (清队列/断输出/不碰硬件), 从不杀线程——飞行计时和落点指示靠 GC 常驻循环持续更新, 线程死了天上炮弹的显示就断。
 
-## 共享资源 (阻塞的根源)
+### 1.3 程序集分工与热重载
 
-| 资源 | 谁占多久 |
+| 程序集 | 角色 | 部署 | 重载 |
+| --- | --- | --- | --- |
+| IronNestFCS | 宿主 Mod (FcsHostMod/LogicReloader) | Mods/ | 永不 |
+| IronNestFCS.Abstractions | IFcsModule 契约 | UserLibs/ | 永不 |
+| IronNestFCS.Logic | 全部火控逻辑 | **UserData/IronNestFCS/** | **F9 热重载** |
+| IronNestFCS.CustomRecords | 自定义唱片机 (独立 Mod) | Mods/ | 永不 |
+
+**热重载链**: build 后 Logic.dll 落入 `UserData\IronNestFCS\`(csproj OutputPath 直指), 游戏内 F9 → Shutdown(全模块 Stop+清端口) → 卸载旧 ALC → 重新加载。注意:
+- Mods/ 里的两个 dll (宿主壳+CustomRecords) 只在游戏启动头几秒被 MelonLoader 短暂持有锁, **游戏运行中 build 正常**(复制成功); 避开启动窗口即可。
+- 运行时创建的 3D 物件不随 F9 销毁, 必须按名字清理旧实例 (SandboxRenderer.ClearAll)。
+- Logic 代码禁止注册新 IL2CPP 类型。
+
+### 1.4 旧架构 (历史对照)
+
+每炮一条串行状态机 (FSC.cs 旧调度层, `LegacyDisabled=true` 已停), 毛病: 一条龙串到底 (一步卡住整发卡住)、炮塔锁太粗 (独占一整发)、卡住靠 20s 超时误杀排队。2.0 的核心变化: **执行 (操炮) 与决策 (打谁) 分层**, FC 持续输出两炮完整诸元, 炮自己追稳; 锁只包一次硬件操作。
+
+---
+
+## 2. 模块实现
+
+### 2.1 [RD] Radar (`RD/Radar.cs`)
+
+纯传感器。两速扫描:
+- **扫描** (1~3s): Fire Mission Root 子节点 + 根层 Enemy/Tgt_ 名字兜底; EntityLocation 分类 (敌/友/中立三态, 类型 FDC/炮兵/装甲/AA/参考点, 装甲值), 阵亡排除 (EnemyKillTokens 击杀令牌不报)。
+- **粗跟** (25fps): 已知目标位置刷新 + 每 10 帧存活快查。
+
+输出 `SrcContact` 列表: Entity 句柄/WorldPos/Side/Kind/Armour。分类静态方法复用旧 TacticalRadar (待收编)。
+
+### 2.2 [DC_U] DisplayControl (`DC/DisplayControl.cs`)
+
+- **目标参数表** `_targetMap`(Dictionary<GameObject, DcTarget> 对象复用, **FC 直读无回调**): 位置 (世界坐标, 每帧刷) + TWS 轨迹参数 + 敌我/类型/装甲。实体与令牌虚拟目标混列; 目标失效 (阵亡/离图) 出表 → FC 读不到 → 撤任务。
+- **TWS 运动估计** (`TrackMotion`): 定速模型 — 75 帧环 (3s) 一阶最小二乘线性滤波, 位置先 `InverseTransformPoint` 转板面局部再差分, 斜率 ×25fps×`GeoMap.KmPerLocal` = km/s; a/j 不估 (恒 0)。窗口愈长噪声愈低 (LS 斜率噪声 ∝ 1/√N); 变速目标天然滞后 1.5s — 定速模型既定取舍。不足 5 帧返回零 (无跟踪)。
+- **铁巢棋子吸附** (`SyncNestToken`): turretBase 网格坐标 → NestRef 棋子位置 (棋子摆偏不导致打飞)。
+- 交互: 右键 toggle (入队→升级齐射→取消)、令牌拖放 (1s 批量发现 T1-10 标记令牌, 上地图注册虚拟目标/拖离撤任务; 击杀/侦察/参考点令牌不注册)、扫荡 (敌对目标按优先级 FDC>炮兵>装甲>其他 持续发请求, `_swept` 去重)。
+- 实体图标差集 (`UpdateIcons`): 在列表→画, 不在→删 (阵亡/离图自动清退)。
+- 开关: AutoFire/AutoTask/TWS。TWS 关 = 速度矢量全零 → 火控自然无预瞄 (直瞄); 关时清位置历史。
+- 对账探针: `trak` (上炮目标速度, 每 8 帧) / `tgt` (目标板面位置, 每秒) 留生产路径降频跑。
+
+### 2.3 [FC] FireControl (`FC/FireControl.cs`)
+
+循环 25fps: 收请求 → 队列 (乱序重排一次) → 解算 → 持续输出 GC 指令 → 统一火控 (确认/保险/击发) → 收尾。
+
+- **诸元解算** (`ComputeGunSolutions`): 相对方位/距离 (`RelToTarget`) → 提前量 (`LeadSolve`, 见 §4.2) → 装药 (`ChargeOf`: T 最少 / N 仰角≤30° 尽量 / X 强制 6) → 仰角 (射表直算 `ShellData.ElevationDeg`)。
+- **装药冻结 LockedCharge**: 派发帧锁存一次 (实装匹配 → 锁膛内实际药数; 否则锁解析值), 之后不重解析 — 目标运动不改变装填计划 (装填链中途换药 COFM 报错/打飞); TRAK 后按 GC 活读膛内药数为准。
+- **动目标强制 N**: T 模式随距离变, 目标一动锁存装药就失裕量 — 入队时点 TWS 速度矢量非零 → 改 Normal。
+- **智能派发** (只队首): 空闲炮三态 — 空膛派队首; 弹对且药够 → 按膛内药解析打; 弹不对/药不够 → **DUMP 占位** (同膛内弹 1 包药 0° 平射)。FALL 炮不派发。
+- **乱序重排** (`SortQueueOnce`, Start 时一次): 非空膛炮膛内弹匹配后续任务且方位差 ≤45° → 提前到队首后。
+- **统一火控** (`FireArbiter`): 进 TRAK → 五步确认 (前置, 不等稳定; **不再动计算台** — 装填期已 Calculate) → 首次 AllReady → Arm (一次性) → AutoFire/预定时间 → 击发; PreAiming 等玩家击发。
+- **收尾** (`FinishRoutine`): 击发确认判据 = **GC `Fired` 沿** (不用 FlyRemaining — 装填期炮表残留值会骗早, 见 §5.1) → Finished 入队 + 槽位释放。哑炮防护: 5s 无沿 → 重按保险+拉绳 ×3。
+- **DUMP 占位**: 跳过火控卡/五步确认, AllReady → Arm → 强制击发; 全哑 → `_dumpStuck` 挂起该炮 (Manual/Stop 复位)。
+- **预定打击时间**: 任务带时间戳时开火条件 = 当前任务时钟 + FlyTime ≥ 预定 (炮弹按点抵达); -1 = 就绪即打。
+- **CBC 反炮兵**: 游戏 CounterBatteryTimer 只读显示 (打 FDC 暂停/延长是游戏自身行为)。
+- 齐射: 双炮同任务 + SyncCommand, 独立仲裁 (`SalvoArbiter`) — 双炮 TRAK → 一次确认 → 双炮同时 Arm → 一击发 (击发钮全局一个, 天然齐射)。
+
+### 2.4 [GC] GunControl (`GC/GunControl.cs`) + SalvoDirector
+
+每炮一条 25fps 常驻循环:
+- **装填链** (`TaskChain`): DecidePrepStep 逐步决策 (SELC/SHRD/SHLD/PWDR/LOAD) → TRAK (持续追踪到击发) → REST → IDLE。每步 Exec 带看门狗 (超时/异常 → FALL 自报, 等 FC 换策略); 单发步间 0.5s 死区。
+- **齐射** (`SalvoDirector`): 一条协程带双炮, 预处理区 (1-x) 独立推进, 同步区 (2-1 起) 每步并行+汇合+0.75s 死区; 任一 FALL/撤任务全停。
+- **1-3 DUMP 停手等接管**: 膛内弹不对/齐射多药 → 进 1-3 + DumpWaitActive, FC 撤任务改派 DUMP 占位 (GC 不自行平射)。
+- **TRAK 追踪** (`TrackOnce`): E 恒追 (TrackAxis 天顶星伺服 + EWMA 斜率外推 3 帧, α=0.3), H 仅被 AzimuthSelect 选中时追 (外推 4 帧, α=0.5); 齐射右炮直接设左炮设定值。双轴稳定 (死区动态口径: 落点偏移 ≤ DRIL 杀伤半径/5) + 弹药活读确认 → AllReady (不稳回退)。锁定死区 0.05° 起, 按距离动态收紧。
+- **击发自检** (常驻循环, 手动/自动通用): `HasFired()` (pendingReload) 上升沿 + 膛空 (CanFire 已掉) → 锁存炮表真值 (StopwatchLatch, 未启动用瞄准期预测兜底) → **新建 Flight** (出膛时刻/FlyTime/任务时钟) → `OnImpactFired` 通知 DC 画线。DUMP 平射不建 Flight。CanFire 上升沿 (装填完成) 复位击发沿与 Fired (手动连打每发都是新事件)。
+- **实时弹道指示器** (`PushBallistic`, 每帧): 游戏落点标记 (网格→板面) + 弹种 (CanFire 门控 — 装填完成信号, 不含保险) + AllReady + 飞时。
+- **采购** (SelcRoutine/PwdrRoutine): 采购台短锁 (两炮共享) 内查+买。
+
+### 2.5 [DC_D] 渲染与交互
+
+- **SandboxRenderer** (`DC/SandboxRenderer.cs`): 恒定实体原则 — 绿十字/预瞄线/落点指示/轨迹线等固定套件建一次, 不用 SetActive 隐藏, 每帧只动端点; 动态的只有目标标记和杀伤圈 (节流重画)。渲染分层见 §4.6。
+- **FcsHud** (`FC/FcsHud.cs`): 64 字符定宽面板直出 (FC 数据直读, 不经 DC): 两炮块 (相位/膛内/仰角/方位/装药/飞时 + 火控解行) + 任务队列 (8 行) + 完成队列 (8 行, **倒序: 最新在最上**) + CBC + 任务时钟。完成行剩余倒计时直读 `Flight.Remain`。
+- **ScenePanel** (`DC/ScenePanel.cs`): 3D 按钮列 (AutoFire/AutoTask/TWS/T-N-X 装药模式 + Start/Pause/Stop 三态), 点击盒每帧世界归正 (0.26×0.26×0.1, 挂实体下, RaycastAll 不穿透)。
+
+### 2.6 Shared 工具 (`Shared/`)
+
+| 类 | 职责 |
 | --- | --- |
-| 操作台 (解算台/确认台/采购台) | 秒级, 用完就放 |
-| 炮塔方向角 | **独占一整发**, 从瞄准到击发才放 |
-| 药包池 | 两炮共用, 不够自动买 |
-
-谁先抢到谁用, 另一炮只能排队等.
-
-## 现在的毛病
-
-1. **一条龙串到底**: 一步卡住整发卡住, 另一炮排队也卡 (最典型: 操作台被长流程占着).
-2. **炮塔锁太粗**: 第二炮 E 都好了也只能干等第一炮击发.
-3. **卡住靠超时**: 20 秒不动就强制重置, 经常误杀排队等锁的正常流程.
-4. **状态机太肥**: 一个进度枚举同时管显示、超时、分支, 越加越绕.
-
-## 想改成什么样 (你的思路)
-
-**分几条独立循环各干各的: 弹种、装药、E、H、开火, 互不挡路; 各自就位了, 开火条件齐了就打.** 锁只包"一次硬件操作", 不包"一整段流程".
+| GeoMap | 坐标换算唯一入口: `KmPerLocal=3.8164` / `MapCellSize` / `MapBottomLeft` / `GridToLocal` / `LocalToKm` / `RelToTarget` / `IsOnBoard` |
+| ShellData | 射表: `ElevationDeg`=12d/c, `FlightTime`=d×(10/7)/SpeedMult(c), `KillRadiusKm` (ShellDefinition 扫描) |
+| Flight | 飞行状态统一口径 (§4.1) |
+| TrackAxis | 单轴追踪稳定器 (变积分+两帧差分+卡死检测) |
+| CoroutineLock | 协程级互斥 (主线程协作调度, bool 即可; 配 try/finally) |
+| MissionClock | 任务时钟 (MissionWatch GenericTimerSceneSync, 10:00:00 起累计) |
+| Glyph16Font | 十六段米字数码 (Il2CppShapes.Line 画字符) |
 
 ---
 
-(原详细版归档在 git 历史, 本文件保持简版.)
+## 3. 前后向接口总表
 
-## FastNote (新架构草稿)
+### 3.1 GC 指令端口 (FC 持续写)
 
-### 原则
-- 彻底分开: 执行 (操炮) 与决策 (打谁) 分层
-- "线程" = 独立协程 (真线程不可行: IL2CPP 只能主线程碰), 各循环互不阻塞
-- **线程常驻**: Stop / Pause / Manual 都只是改指令内容 (清队列/断输出/不碰硬件), 从不杀线程 — 因为飞行计时和落点指示靠 GC 常驻循环持续传导给 DC (击发后 GC 每帧读游戏倒计时 push), 线程死了天上炮弹的显示就断了 (豁免 = 常驻线程的基础福利)
-- **实际线程循环**: RD-DC_U-FC-GC-DC_D 数据链 (RD 雷达 → DC 数据循环 → FC 决策 → GC 操炮 → DC 渲染线程); 节拍: RD 扫描 1~3s + 粗跟 25fps, DC 数据循环 25fps, FC 决策 25fps, GC 每炮一条 25fps, DC 渲染线程每帧
-- **本质: FC 持续输出两炮各自完整诸元 (DesiredElevation + DesiredAzimuth), 炮自己追踪, 追稳 + 弹药确认 → AllReady; 方位追踪不受装弹影响, 任务期间全程跟随; 炮塔只有一个, 跟谁由 AzimuthSelect 定 (执行顺序含乱序)** (变化: 现在只有 TRAK 段追方位, 新架构从派发起就追)
+| 端口 | 语义 |
+| --- | --- |
+| ManualControl | 手动: FC 停机, GC 立即停手不碰硬件 (线程照跑) |
+| SyncCommand | 齐射锁定: 右炮按左炮数据走 (DesiredX 输入忽略, E 直接设左炮设定值) |
+| AzimuthSelect | 本炮被选中执行水平追踪 (共享炮塔只跟一门) |
+| DesiredShell / DesiredCharge | 弹种 / 装药 (-1 = 无任务) |
+| DesiredElevation / DesiredAzimuth | 目标俯仰/方位 (FC 持续输出, 提前量已算进) |
+| DesiredDistance | 目标距离 km (锁定死区动态口径) |
+| DesiredDump | DUMP 占位标志 (击发自检不画落点) |
 
-### [GC] GunControl (执行器, 每炮一条)
-- **实时弹道指示器数据 (GC 每帧 push 给 DC, GC 全权)**: 开火前的绿色瞄准十字/LR 那套 — 瞄准点 = 游戏实时落点标记 (跟炮实际仰角/方位走), 杀伤圈 = DesiredShell, 弹种 = **CanFire 门控** (实测不含保险: 装填完成 — 弹+药+炮闩锁 — 未开保险即 True, 就是"俯仰手柄解锁"的游戏综合信号, 1.x 同口径), AllReady 折角 + 飞时 (炮给的) 一并 push; 无任务/手动 = -1
-- **炮弹飞行指示传导 (GC → DC)**: GC 常驻循环自检击发 (pendingReload 上升沿, 手动/自动通用 — 不依赖 FC, 手动开火同样出轨迹) → 锁存炮表真值 (倒计时未启动时用瞄准期预测值兜底) → 一次性通知 DC 画落点线 (弹种 + 锁存总飞时; 落点不传 — DC 侧每帧瞄准点缓存即落弹点); 飞行期间每帧传导游戏倒计时剩余 (与游戏指示器逐帧同步), 落地传 0 → DC 隐藏; 3s 没见倒计时兜底停
-- **不控制开火 — 有统一火控**
-- 前向端口: 收指令 (弹/药/瞄准/DUMP 标志) → 出状态报告 (当前在执行什么动作)
-- 自行完成 维护弹巢 (膛内+弹仓) / 采购 等动作, 接管本炮硬件与采购台; **DUMP 开火归 FC** (1-3 相位停手等接管, 不再自行平射)
-- [GUN-L] / [GUN-R] 两行 HUD 的数据源 — 但显示不归它, PHASE 也不完全是它的状态
-- F9 重载清理支持
+### 3.2 GC 状态端口 (FC 读)
 
-#### 前向接口 (指令端口)
-- ManualControl: 手动 (FC 停机 — 整个自动火控关掉交还玩家, 不是"手动击发"); 切换瞬间立即全停 (不碰任何炮控硬件, 线程照跑), 在途动作不收尾, 残局交玩家
-- SyncCommand: 齐射锁定, 按左炮数据走 (右炮 DesiredX 输入忽略; 右炮 E 不单独控制 PID — 直接设左炮的设定值, 跟随左炮, 锁定判定 = 实际仰角跟上目标死区内); 相位级同步 — 每步两炮都完成才一起走下一步 (不许一个还在补药另一个已推弹进膛)
-- AzimuthSelect: 选择水平追踪对象 (0/L 1/R)
-- DesiredShell(L/R): 弹种
-- DesiredCharge(L/R): 装药
-- DesiredElevation(L/R): 俯仰
-- DesiredAzimuth(L/R): 旋转 (目标方位, FC 持续输出; 只给最终目标值, 不含 TRAK 修正 — 跟稳是执行器自己的事, 提前量由 FC 算进目标值)
-- DesiredDump(L/R): 本轮 DUMP 占位标志 — 击发自检据此不画落点/不传导倒计时 (平射无落点指示)
+Chamber/Charges (实装快照, 动作边界刷新) / **ChamberLive/ChargesLive (活读, 玩家介入处用)** / Elevation/Azimuth (每帧传感器) / Action (10 态) / FlyTime (瞄准期活读, 击发锁存) / FlyRemaining (击发后炮表倒计时) / AllReady / DumpWaitActive / Fired (击发沿) / CanFire (装填完成信号) / CurrentFlight (击发时建, 落地后保留引用) / CalcDone (装填期 Calculate 完成信号).
 
-#### 状态端口
-- Chamber|Charges|Cylinder(L/R): 膛内弹种、实装药数、弹仓内容 (实装快照)
-- Elevation(L/R): 俯仰
-- Azimuth: 实际方位回读 (全局一个; 与 FC 给的目标方位不是一回事)
-- Action(L/R): 当前动作 — IDLE 空闲 / SELC 采购 (保证弹巢至少有一个相应的弹) / DUMP 退弹 / SHRD 选弹 / SHLD 推弹 / PWDR 给药 / LOAD 装填 / TRAK 追踪 (火控会一直给诸元, 这是最后的状态, 炮塔负责跟稳了) / REST 复位 / FALL 错误
-- FlyTime(L/R): 实际飞行时间, 这是从游戏里读出来的
-- FlyRemaining(L/R): 击发后游戏炮表倒计时剩余 (瞄准期 NaN) — **FC 的击发确认信号** (炮表倒计时启动 = 已击发)
-- AllReady(L/R): 弹药确认且追踪稳定后置位, 一旦追踪不稳定就回退
-- Fired(L/R): GC 内部击发防重标志, 不对外
-- KernelMode(L/R): "内核态" 动作执行中置位 (原子操作保证) — 期间 FC 指令只记录不生效, FC 见置位就等不打断; 动作边界解除时按最新指令切换 (ManualControl/FALL 例外: 立即全停不碰硬件, 线程照跑)
+### 3.3 GC → DC push
 
-#### 内部处理
-- 跟踪稳定器
-- 硬件读数缓存: 只在动作边界 (机构稳定期) 刷新实装快照 (Chamber/Charges/Cylinder), 内核态期间不读游戏活值 (转弹仓延迟刷新/推弹机动作中读数不可信), 状态端口一律出自缓存 — 尊重临界区
-- **1-3 DUMP 相位 (停手等接管, 不再自行开火)**: 膛内弹种 ≠ DesiredShell (或齐射多药, `==` 判定) → 进 1-3 DUMP 相位 + DumpWaitActive 置位, 停手等 FC 发现 (Action==Dump && DumpWaitActive) → 撤任务改派 DUMP 占位 (同膛内弹 1 包药 0° 平射, FC 统一火控击发); 退出条件 = 任务被撤 (DesiredCharge<0); 正常流程 FC 派发三态提前规避, 1-3 只在玩家干涉/竞态下触达; 装药异常分两段: PWDR 段 (未推药) 少药还能补 (PwdrLoadStep), LOAD 后 (已推药) 改不了 → 多药走 1-3
-- 给药完全独立: 药包杆与计算台无关 (有一关计算台是坏的照常能打; 拉杆下"需装"表只是显示, "实装"另算), 只受共享药包池约束
-- 采购台归 GC (SELC 买弹 / PWDR 前查池买药): 查+买在同一个短锁内, 两炮共用采购台互不重买
-- FALL 错误: 操作失败 (采购/机构动作重试后仍不成) / 看门狗超时 → 显式自报, 不静默空转; 等 FC 换策略 (换炮/重试/换弹种) 或 ManualControl 复位退出
-- 看门狗在 GC 内部: 每个动作设期限 (按时间轴表的段耗时 + 裕量), 超时自报 FALL; 齐射相位同步时对炮报 FALL → 自己停止等并报 FALL (防陪死); FC 只汇总 FALL 做决策
-
-### [RD] Radar (雷达)
-- **纯传感器**, 活着的都在列表里, 只报"是什么/在哪"
-- 战场态势/实体发现/敌我分类/存活检测, 输出 SRC 目标列表
-- 两速扫描
-  - 扫描 (1~3s): 全场景扫实体 (Fire Mission Root 子节点 + 名字兜底)
-  - 粗跟 (25fps): 已知目标的实时位置刷新
-- SRC 列表输出 (端口)
-  - 输出信息
-    - 实体句柄
-    - 世界位置
-    - 敌我 (敌/友/中立三态, 参考点算中立)
-    - 类型
-    - 装甲信息
-  - 排除项: 阵亡实体 (游戏留尸并挂 EnemyKillTokens 击杀令牌, 名字兜底扫描会误抓, 两者都不报)
-- F9 重载清理支持
-
-### [DC] DisplayControl (显控台)
-- **3D 沙盘: 实体图标/火控框** (实时弹道数据由 GC push 进来, 渲染线程画)
-- 职责: 3D 沙盘显示 + TWS (扫描并跟踪) 控制 + 用户输入 (转给 FC) + 显示条目自动删除
-- 扫荡模式: 只从敌对目标按优先级生成需求 → FC (敌我判断用 SRC 的敌我标志, 友军/参考点不打; 优先级用 SRC 类型/装甲字段); 优先顺序: FDC > 炮兵 > 装甲目标 > 其他
-- F9 重载清理支持
-
-#### 数据循环 (数据准备)
-- 读取分析当前铁巢位置 (炮塔标记)
-- 读取 Radar SRC 数据 → **目标参数表** (Dictionary 按实体复用更新, FC 直读不重建):
-  - 计算目标的相对位置 (方位 距离)
-  - TWS 运动估计 (轨迹参数: 速度 v / 加速度 a / 三次项 j, km/s·km/s²·km/s³):
-    - **粗跟** (所有目标): 5 帧位置环, 一阶最小二乘直出 (不足 5 帧 = 无跟踪)
-    - **精跟** (上炮任务目标, 活读 FC 槽位判定): 25 深度缓存 — 进入时压入粗跟记录接续, 缓存满 25 帧 (采样帧 1/9/17/25, 间隔 8 帧) 转**三次插值曲线** (牛顿后差端点导数: v=[11P₃-18P₂+9P₁-2P₀]/6h, a=[2P₃-5P₂+4P₁-P₀]/h², j=[P₃-3P₂+3P₁-P₀]/h³); 积累期继续一阶输出; 退出精跟降回粗跟
-    - 曲线延伸 P(d+T) = p + vT + ½aT² + ⅙jT³ — e' 预测点在弧上 (不是切线直线); 匀速直线 Δ²=Δ³=0 自动退化
-- 实体图标生命周期
-  - 对 SRC 列表做对比, 有实体不在列表(阵亡)-删除, 在列表没有实体(发现)-创建
-  - 自动按实体类型和敌我状态, 分配图标样式和颜色
-  - 显示层排除: Phantom Battery (演示幻影炮组, 待搬进新 Radar)
-- 操作响应: 用户交互指定某个任务 → 创建需求供 FC 取用
-
-#### 渲染线程 (独立循环)
-- 持续读各数据源画沙盘: GC push 的实时弹道数据 (弹种 -1 不渲染) / FC 的打击队列信息 (队列/齐射/杀伤圈/预瞄) / 炮弹落点指示器 (GC 击发确认 + 飞行期倒计时传导) / **目标轨迹线 (FC 解算 push)** / 实体图标
-- 恒定实体原则: 绿十字/预瞄线/落点指示 (虚线/实线/红点) 等固定套件建一次, 不用就 SetActive 隐藏, 只动端点不重建; 动态的只有目标标记 (数量随目标) 和杀伤圈 (半径随弹种, 节流重画)
-- **目标轨迹线 + 交汇点 (每炮两条, 绿色 = 火控解算内容; 双向奔赴可视化)**:
-  - **火控目标线** (粗粒度绿虚线, 周期 0.12): 开火前每帧随 FC 解算 push 更新 — 曲线 P(τ) = 目标位置 + V·τ + ½A·τ² + ⅙J·τ³, τ∈[0,T], 起点活读目标, 末端 = 交汇点 (绿点)
-  - **最终轨迹线** (细粒度绿虚线, 周期 0.06): 击发瞬间从火控线参数转移 (P₀,V,A,J,T₀) 并冻结 — 终点恒 = 开火瞬间交汇点, 沿冻结曲线缩短 (炮表倒计时驱动, 本地计时兜底), 缩没 = 落地; 火控线立即释放给下个任务解算
-  - dash 段数按曲线弧长/周期动态铺 (64 点弧长采样, 32 短线池每帧只动端点, 多余隐藏)
-  - 与红线合成完整图景: 红线 = 炮→落点 (游戏真值), 绿线终点 = 解算交汇点 (理论值), 两线终点分离 = 火控误差可视化
-#### 状态端口 (FC 从这里读, 持续刷新)
-- **目标参数表** (Dictionary<实体, DcTarget> 对象复用更新; FC 经 DcPort 直读, 无回调/lambda)
-  - 句柄 (实体引用 | 令牌引用)
-  - 名称 (令牌虚拟目标创建时有名称)
-  - 世界位置
-  - 轨迹参数 (TWS 开启时: 速度/加速度/三次项, 粗跟一阶或精跟三次插值; 关 = 全零)
-  - 敌我 (敌/友/中立三态, 参考点算中立)
-  - 类型
-  - 装甲信息
-  - 目标失效 (阵亡/离图出表) → FC 读不到 → 撤任务
-- 火控请求 (交互输出): 请求列表 { 类型 (入队/升级齐射/取消), 目标句柄, 弹种, 装药模式 (T/N/X, 右键时快照进请求), 预定打击时间 (时间戳, -1 = 不指定, 现在通通 -1), 优先级 } — 右键/令牌离图/扫荡都从这出; AutoTask 扫荡 = 显控台自己完成队列排布 (类似舰长席), 持续发请求即可, 不传开关
-- 模式状态: AutoFire + AutoTask 两个开关位 — FC 推导四档 (扫荡开 = Full-Auto 强制自动开火; 关+AF= Semi-Auto; 关+AF off = PreAiming; ManualControl = Manual); 其余都不传: TWS 关 = Target 速度矢量直接给空 (NaN 或 0°/0km/h), 火控自然无预瞄; 装药模式随请求携带
-#### 可用方法 (method)
-- 清空所有标记 (F9/STOP 等调用)
-- 实时弹道指示器 (GC 每帧调用, push 数据): 输入 { 炮位 L/R, 瞄准点, 杀伤圈, 弹种 (-1 = 未选/未就绪, 不渲染) }
-- 打击队列指示器 (绑定到实体目标): 队列位置 / 齐射指示 / 预瞄线 / 弹种 (杀伤圈); 显示内容 = 弹种标签 + 编号米字数码 (十六段, 与现在代码一致); 编号格式升级: 两位顺位 + 后置装药模式字母 — 00T / 01N / 02X (T=最省 Tight, N=默认效率 Normal, X=最大 Extra, 米字数码字形都画得出; 在炮上显示 L-N / R-X 风格)
-  - 绿色任务虚线从铁巢位置自动连到 L/R/S 目标
-  - FC 开火后移出队列 → 由炮弹落点指示器接替
-  - 输入参数:
-    - 实体引用 (绑定对象)
-    - 槽位 (Slot enum): Queue (排队中) / Left / Right / Salvo (在炮上; Salvo = 齐射双炮执行中)
-    - 队列位置 (int): 槽位=Queue 时有效, 1 起; -1 = 移出队列
-    - 齐射标志 (队列中未上炮的齐射对也要显示, 与槽位无关)
-    - 弹种
-    - 预瞄偏移
-- 炮弹落点指示器 (恒定实体 + MSG 传导链: FC → GC → DC)
-  - 红色落点 + 杀伤圈, 下面计时 上面弹种 (和现在代码一致, 只是没了火控编号/L/R)
-  - **恒定实体**: 每炮一套 6 个根 (虚线/实线/红点/圈/标签/计时), 击发时重画激活, 落地隐藏 — 不新建不销毁; 齐射两发 = 左右炮各激活一套
-  - **传导链** (炮弹飞行指示数据流, 无 MSG — GC 自检):
-    1. GC 常驻循环自检击发 (pendingReload 上升沿, 手动/自动通用): 锁存炮表真值 (`latchedTravelTime`, 倒计时未启动用瞄准期预测值兜底) → `OnImpactFired(side, 弹种=DesiredShell, 锁存总飞时)` 通知 DC 画线
-    2. GC 飞行期间每帧传导 `OnImpactRemain(side, 游戏倒计时剩余)` — 与游戏自身飞行指示器逐帧同步 (零检测误差); 落地 (见过倒计时后变 NaN) 传 0 → DC 隐藏; 3s 没见倒计时 (表没绑) 兜底停
-  - 落点 = DC 侧每帧瞄准点缓存 (`_lastAim`, 绿十字 push 时更新): 开火瞬间的瞄准点即落弹点, 绿十字被清后缓存仍在 — 落点坐标不随 MSG 传
-  - 边界检查: 落点出地图 (向外扩一小格) 不显示
-  - 剩余时间: DC 优先吃 GC 传导值, GC 静默时本地计时兜底 (不吃炮表: 同一门炮新任务瞄准期炮表读的是新任务预测飞时, 旧指示器会被续命)
-  - 调用后自动从当前铁巢位置到落点画红线 (全红): 虚线固定 (全长弹道) + 实线逐渐缩短 (未飞段) + 实心红点 (弹头, 随剩余时长沿线移动)
-
-#### 目标输入 (用户操作 → FC, 统一"目标描述")
-- 地图实体右键 = 实体引用 (Radar 提供实体句柄)
-- 地图上拖放的令牌 → 右键 = 令牌引用 (虚拟目标, 火控框跟令牌走; 固定 T1-T10 标记物已取消, 原位置让给 3D 按钮列)
-- 扫荡 = Radar 自动生成
-- 目标描述 = { 位置源 (实体引用|令牌引用|世界坐标), 弹种, 优先级 }
-- 令牌目标生命周期: 创建 = 拖令牌上地图右键 (虚拟目标带名称); 追踪 = DC 每帧跟令牌位置 (TWS 开时 5 帧平均速度, 拖着走目标跟着跑); 删除 = 右键再点取消 / 令牌拖离地图自动取消 (位置源失效 → FC 撤任务) / 完成后火控框切炮弹落点指示器
-
-#### 开关与模式
-- 开关类输入: ManualControl / AutoFire / AutoTask (扫荡) / TWS / Start / Pause-Resume / Stop / 弹种选择 / 装药模式 (火控台右侧按钮列改为三个: Start 启动 / Pause-Resume 冻结恢复 / Stop 全停清队列); 弹种选择按钮列保持现状 (火控台右侧斜线列, 不动)
-- 3D 按钮列 (沙盘右侧第二列): AutoFire / AutoTask / TWS / TightCharge(T) / NormalCharge(N) / ExtraCharge(X)
-- 装药模式三档: T = 最少装药 (最省, TightCharge); N = 效率 (保证仰角 ≤ 30° 尽量, 达不到取 6; NormalCharge, 默认); X = 强制最大 (ExtraCharge)
-- TWS 语义 (要真实): TWS 关 = 没有预瞄, 动目标也直接锁目标位置 — 和机载雷达一样, 只有 TWS 才出跟踪数据 (速度) → 才有提前量
-
-#### 生命周期 (自动删除)
-- 实体死亡 → 图标/挂件/关联显示自动清; 任务完成或取消 → 打击队列指示器/火控框清退; F9 热重载 → 全部显示物件按名销毁
-
-### [FC] FireControl (大脑)
-- **控制 HUD 面板** (直显 = 内核直出, 渲染每帧): GUN-L/GUN-R 两行、任务/完成队列、CBC 反炮兵、任务时钟 — 不经 DisplayControl
-- 输入: DC 状态端口 (Target 列表 + 火控请求 + AutoFire) + GC 状态端口 (实装/Action/AllReady/Fired/FlyTime/Azimuth 回读) + 游戏 CBC 反炮兵计时 (只读显示; 打 FDC 暂停/打炮兵延长是游戏自身在目标击毁时做的, mod 不干预)
-- 输出: GC 指令端口 (7 条持续指令) + DC 方法 (打击队列指示器/清空; 炮弹落点指示器不归 FC — GC 自检击发后通知 DC)
-- 执行细节全在 GC, FC 只剩决策与统一火控
-- F9 重载清理支持
-
-#### HUD 面板格式 (直出, 定稿)
-- 行宽: 每行 64 字符 (行首缩进 1 + 内容 62 + 结尾空 1); 分隔线 64 个 `-`
-- 炮行: 相位显示代号+名 (如 3-1 TRAK); 膛内弹 4 字符方括号 [ AP ] / [NULL] / [----]
-- 队列行: 弹种后带装药模式字母 (如 ` AP  N` / ` HE  X`); 队头 `Task Queue(n)` 与 `|Finish Queue(n)` 紧贴竖线; 队列行前导 [--:--:--] = 预定打击时间 (后续内容, FC 计算, 暂占位); 完成行前导 = 抵达时刻 [HH:MM:SS] + T:- 倒计时; 齐射行保留 >>>[SALVO]
-- Action → 相位代号映射 (炮行 "PHASE x-x NAME"):
-
-| Action | 代号 | 说明 |
+| push | 时机 | 内容 |
 | --- | --- | --- |
-| IDLE | 0-0 | 空闲 (仅 Manual 模式显示) |
-| WAIT | 1-1 | 自动模式: 无任务等待派发 / 已指派未开工 |
-| SELC | 1-2 | 采购 (原 1-2 的一部分) |
-| DUMP | 1-3 | 退弹 |
-| SHRD | 2-1 | 选弹 (顶原 BLRD 位) |
-| SHLD | 2-2 | 推弹 (原 BLRD+BLLD 合并) |
-| PWDR | 2-3 | 给药 |
-| LOAD | 2-4 | 装填 (原 COFM 2-5 被 AllReady 内部吸收) |
-| TRAK | 3-1 | 追踪 |
-| REST | 3-3 | 复位 |
-| FALL | 0-0 红显 | 错误 |
+| OnBallisticPush | 每帧 | 瞄准点/杀伤圈/弹种 (-1 不渲染)/AllReady/飞时 |
+| OnImpactFired | 击发沿 | 落点 (冻结的开火前最后瞄准点) + 弹种 + 飞时 + **Flight 引用** |
 
-- 无 PEND/CALL 相位: PEND (待派发) 显示在 FC 队列行 (编号/槽位); CALL (读现场定路线) 被 FC 决策循环吸收 (读 GC 实装 → 算 DesiredX, 瞬时计算非硬件动作); FIRE (3-2) 为 FC 直出的击发瞬间态, GC Action 停在 TRAK
-- 相位代号对齐游戏相位灯 (SHRD 必须是 2-1); 1-1 填 WAIT (自动模式等待派发/已指派未开工); 0-0 IDLE 仅 Manual 模式显示
-``` 
- [IronNest FCS]  [Full-Auto]        [CBC:---]        [10:01:07] 
-----------------------------------------------------------------
- [GUN-L] PHASE 3-1 TRAK | [ AP ] E:34.49 A:123.4 C:6 | FT:24.61
- [--:--:--] 123.4 12.34 | [ AP ] E:34.49 A:123.4 C:6 | T:-24.61
-----------------------------------------------------------------
- [GUN-R] PHASE 1-1 WAIT | [NULL] E:--.-- A:---.- C:- | FT:--.--
- [--:--:--] ---.- --.-- | [----] E:--.-- A:---.- C:- | T:---.--
-----------------------------------------------------------------
- Task Queue(3)                 |Finish Queue(2)
- [--:--:--] 042.0 04.20  AP  N |[10:02:15] 042.0 04.20 T:-12.31
- [--:--:--] 123.4 12.34  HE  X |[10:05:41] 123.4 12.34 T:---.--
- >>>[SALVO] 180.0 10.00  HE  X |
-```
-Full-Auto(扫荡, 强制自动开火)
-Semi-Auto(半自动, AutoFire = ON)
-PreAiming(半自动, AutoFire = OFF)
-ManualSet(全手动)
+DC 侧持 Flight 引用后**直读字段** (Remain/Landed), 不逐帧传导 (统一口径, review C1 落地)。
 
-#### 循环任务 (25fps)
-- 接收火控请求 → 任务队列 (入队/升级齐射/取消; 请求里带 弹种+装药模式+优先级)
-- 目标位置/轨迹参数: 经 DcPort 从 DC 目标参数表直读 (无回调; 目标失效 → 撤任务)
-- 诸元计算: 相对方位/距离 → 装药 (模式 T/N/X: T 最少 / N 保证仰角≤30° 尽量 / X 最大) → 仰角 (射表直算) → 提前量 (三次轨迹曲线 × 飞时线性解析解; TWS 关 = 直瞄)
-- **装药冻结 (LockedCharge)**: 派发帧锁存一次, 之后不再重解析 — 实装匹配锁膛内实际药数 (仰角按实际打), 重装锁 FC 解析; 目标运动不改变装填计划 (否则装填链中途换药 COFM 报错 / 膛内药数与仰角脱节打飞); 装填完成 (TRAK) 后仰角装药参数改用 GC 活读膛内药数 (唯一真值); COFM 火控卡读锁存值; 完成/撤销清零
-- **动目标强制 N 入队**: T 模式 (最少装药) 随距离变, 目标一动锁存装药就失裕量 — 入队时点 TWS 速度矢量非零 → 改 Normal
-- 持续输出: DesiredElevation(L/R) + DesiredAzimuth(L/R) (提前量算进目标值) + AzimuthSelect (执行顺序含乱序) + DesiredDump
-- **解算 push (DC 渲染目标轨迹线)**: OnFireSolution(side, 目标, 交汇点, V/A/J, T) 每帧 — 交汇点 = 三次曲线 × 飞时不动点解, 渲染与解算同源
-- 就绪判定: GC 的 AllReady + 本炮被 AzimuthSelect 选中 (H 就绪含在内) → 进统一火控
-- 收尾: 击发确认 = 炮表倒计时启动 (FlyRemaining 从 NaN 变有效, 齐射等两炮) → 完成队列 + 槽位释放 (落点指示由 GC 自检接管, FC 不插手); 目标阵亡 (参数表出表) → 撤任务; GC 报 FALL → 撤任务重派
-- Pause 冻结语义: 冻结火控派发与炮塔控制, 显控 (DC) 不冻结; 在途动作继续执行完; 冻结后自动跟踪停止, 但**豁免** (基础福利, 任何状态都不冻结): GC 的炮弹飞行传导 (击发后每帧读游戏倒计时 push DC, 落点指示/计时照跑) 与解算 push
+### 3.4 DC 状态端口 (FC 读)
 
-#### 统一火控 (硬件临界区, 短)
-- 五步确认 + Arm (解保险) + 击发, 全部 FC 执行 (确认台/击发钮全局唯一, 短锁内一次操作); 保险 (Arm) 也是 FC 的事, GC 不碰
-- **DUMP 占位任务例外**: 跳过火控卡/五步确认, AllReady → 解保险 → 强制击发 (不看 AutoFire/PreAiming/预定时间); 哑炮防护同常规 (5s 无倒计时重按保险+拉绳 ×3); 全哑 → 挂起该炮 (`_dumpStuck`) 防 DUMP 死循环, Manual/Stop 复位
-- 开火时机 (预定打击时间归 FC 管): 请求带时间戳时, 开火条件 = 当前任务时钟 + FlyTime (GC 回报) ≥ 预定时间 (炮弹按点抵达, 不早不晚); -1 = 就绪即打
-- AutoFire on = 解保险后自击发; off = 解保险后等玩家扣扳机, Fired 置位后 FC 收尾
-- AllReady 回退 (追踪不稳) → 不开火; 已 Arm 不自动回保险
-- 齐射: 两炮 AllReady 齐 → 一次确认 + 双炮 Arm + 一击发 (击发钮全局一个, 天然齐射)
+目标参数表 (`DcTarget`: 句柄/名称/WorldPos/Velocity/Accel/Jerk/敌我/类型/装甲/虚拟标志) + 火控请求列表 (入队/升级齐射/取消) + AutoFire/AutoTask 开关位。TWS 状态不传 — 关 = 速度矢量零。
 
-#### 智能派发 (只队首; 乱序在 Start 时排一次)
-- **派发前查膛内三态** (活读, 玩家可介入处不依赖快照):
-  - 空膛 → 派队首 (GC 装填)
-  - 有弹 (对弹种) 且 (没药 → 装药打 / 药够 ≥ 最小装药 → 按膛内药解析弹道) → 派队首
-  - 弹不对 / 药不够 → **FC 强制 DUMP 占位** (同膛内弹 1 包药, 仰角 0 方位不动, 平射)
-- **DUMP 收归 FC**: GC 不再自行平射 — 膛内弹不对/齐射多药 → GC 进 1-3 DUMP 相位**停手等接管** (DumpWaitActive 置位), FC 发现 (Action==Dump && DumpWaitActive) → 撤任务改派 DUMP 占位; DUMP 不进队列/Finished, HUD 炮行 `>>>>[DUMP]`, GC 击发自检不画落点 (DesiredDump); 正常流程 FC 派发三态提前发现, 1-3 只在玩家干涉/竞态下兜底
-- 齐射: 两炮都空膛 (槽+Idle+膛空) 才挂双槽 (同时装弹); 膛内有弹先单炮 DUMP 清空; 多药 (`==` 判定) 走 1-3 接管
-- **乱序重排 (SortQueueOnce, Start 时排一次)**: 非空膛炮的膛内弹匹配后续任务且与队首目标方位差 ≤45° → 该后续任务提前到队首后 (超线程, 物尽其用, 45° 一刀切不估算代价); 之后不再排, 派发只队首
-- 两炮都不匹配时"比改造成本 vs 等空闲"、就绪时间轴估算: **未实现** (45° 一刀切替代); 膛内弹保留 (前瞻保装药) 由三态匹配 + 乱序重排覆盖
+### 3.5 FC → DC push
 
-| 段耗时参考 (时间轴估算未实现, 表保留备用) |
-| --- | --- |
-| REST 复位 | 当前仰角 / 3°/s + 装填机构复位 6s |
-| SELC | 3s |
-| SHRD | 0 (不算) |
-| SHLD | 6s |
-| PWDR | 0 (不算) |
-| LOAD | 12s |
-| 抬炮 | \|Δ仰角\| / 3°/s |
-| 水平旋转 | \|Δ方位\| / 4°/s (最大) |
-
-#### 齐射对管理
-- 齐射请求 → 两炮任务对: DesiredX 相同 + SyncCommand 置位; 相位级同步由 GC 自己互相等 (FC 不管过程)
-- 取消/失败 → 双任务一起撤, SyncCommand 复位
-
-#### 火控台硬件 (解算台)
-- Calculate 保留: 按一下出张火控卡 (仪式感, 尊重原作; 非功能必需 — 药包杆/五步确认/怀表都不依赖它)
-
-#### 开关与模式 (四档, 标题 [Mode] 位显示当前档)
-- Full-Auto = 扫荡 + 强制自动开火; Semi-Auto = 自动到击发 (AutoFire ON); PreAiming = 自动到解保险, 等玩家扣扳机; ManualSet = FC 停机 (全手动交玩家, GC 停手)
-- 按钮 → 模式切换: 初始 = Paused (冻结待命, 模块同步 Fc.Paused); Start 默认进 PreAiming, AutoFire 已开则进 Semi-Auto; 只有 Start 之后才能点 AutoTask, AutoTask 自动把 AutoFire 拉起 (→ Full-Auto); Stop 回 Manual + 清队列; Pause 任何状态可拉 (Stopped/Running → Paused, 同时解除 Manual; Paused → Running), 冻结当前档
-
-#### 炮塔方位
-- FC 给两门炮各自完整诸元 (DesiredElevation + DesiredAzimuth, 提前量算进目标值); 炮塔只有一个, AzimuthSelect 决定跟哪门炮的方位 (执行顺序含乱序, 由 FC 定); 跟稳/修正 (TRAK 稳定器) 是执行器的事 — E 在各自 GunControl, H 在被 AzimuthSelect 选中的那门炮; 实际方位从 GC 状态端口回读
-
+`OnQueueChanged` (队列指示器批量同步) / `OnFireSolution` (目标轨迹线+交汇点: 目标引用/交汇点板面/轨迹参数板面/飞时; 无预瞄 → 目标引用 null)。
 
 ---
 
-## 迁移清单 (开工前盘点)
+## 4. 关键机制详解
 
-### 直接复用 (搬进新模块, 不改逻辑)
+### 4.1 Flight — 飞行状态统一口径 (review C1)
 
-| 旧件 | 去向 |
+一发炮弹一个 `Flight` 对象 (GC 击发时创建, 每帧由 GC 唯一更新; DC/HUD 只读字段):
+
+- `FlyTime` 锁存总飞时 / `FiredAtLocal` 出膛时刻 (Time.time) / `FiredAtMission` 出膛时刻任务时钟 / `Remain` 剩余秒 / `Landed` 落地封存 / `GcRaw` 原始炮表值 (诊断)。
+- **Update 每帧**: 本地 `local = FlyTime − (now − FiredAtLocal)`; 炮表活读正常降速 → 锁基准差 `GcLag = local − gc`; 显示 `Remain = min(gc, local − GcLag)` (与游戏指示器同步, 冻结/清表自动落回本地外推); **落地判据 = local ≤ 0** (唯一口径 — 炮表冻结/清表/未启动都不影响); Remain 钳 ≥0。
+- 消费方: DC 红线/红点进度 (`UpdateImpacts` 读 Remain/Landed)、最终线缩短 (`UpdateTracks`)、HUD 完成队列倒计时 (`FinishRow` 读 Remain, Landed → `--.--`)、落地对账日志 (LogLanding)。
+- **切任务不碰 Flight** (ResetForTask 不清): 出膛后膛空, 新任务立即起链装填 (20-40s), 上一发飞时 ~13s 还在天上 — 传导不因新任务断 (旧版此处断流, 全靠 FixRemain 外推兜底)。
+
+### 4.2 LeadSolve — 提前量解析解
+
+预测点 = p + v·T (T = k·r, 飞时线性, k = FlightTime(1km, 6 包) — **满装药斜率, 与装药弱相关**)。匀速 (a=j≈0) 闭式一元二次: (1−k²v²)r² − 2k(p·v)r − p² = 0, **b = −2kpv** (符号反了 = 提前量被反向扣除, 炮弹落在目标身后 — 历史事故)。变速走数值不动点 8 次。**无 fireDelay 补偿**: 解算每帧滑动, 出膛瞬间炮指向的就是最新解算; 按钮→出膛延迟 Δ 只是把双方同步平移, 加补偿反而打远。
+
+### 4.3 装填链计算台体系 (Calculate 收口)
+
+**药包杆读数是计算台缓存** — 开火/推药后与物理分配器脱节 (~16s 才同步), **Calculate 后立即是真值** (玩家可不计算直接拉杆, 但 mod 读的缓存要 Calculate 刷新)。每次 Calculate 会往记事本多一张卡 → **每任务至多一次** (`CalcDone` 去重):
+
+- **2-2 时机**: 推弹按钮按下后立即**子协程并行** Calculate (锁内 SetDistance/Direction/Charge/ShellType + Calculate, ~3s 被推弹动画覆盖, 不白等)。
+- **2-3 前兜底**: 膛内弹直装路径无 2-2, PWDR 开头串行补 (CalcDone 已置则跳过)。
+- **齐射**: 只左炮拉一次 (计算台共享), 右炮 2-3 等 `SyncPeer.CalcDone` (0.1s 轮询, 10s 兜底) — 不能抢先按解算推药。
+- **五步确认不再动计算台** (ConfirmRoutine/SalvoConfirmRoutine 只按按钮, 按 mod 缓存值走)。
+- **`_forceFullPowder` 兜底**: LOAD 推药 COFM 超时 (药没推进膛) → 置位 → 下轮 PWDR 无视读数按空拉满 (残留读数虚高的自愈; 真药包满时拉不动只是 9s 白等, 不超量)。
+- **变量语义**: 2-3 阶段 `SelectedPowderCharges` = 分配器"实际拉了几包"里程表 (有滞后); 2-4 之后 `LoadedPowderCharges` = "膛内实际几包" (推药确认后才有值)。拉几包看 mod 解算 (DesiredCharge), 读数只是参考。
+- 分配器 6 包满, 满了拉不动 (重复拉杆无害)。
+
+### 4.4 传导时间问题 (三时刻, 两个 1s)
+
+| 时刻 | 来源 | 与出膛差 |
+| --- | --- | --- |
+| 按钮按下 | FC FIRE pressed | −1s (fireDelay, 触发核心储能) |
+| **出膛** | `HasFired` 沿 (pendingReload) | 0 — Flight 本地基准 |
+| 炮表倒计时启动 | CountdownRemainingSeconds 首个有效值 | +1s |
+
+处置: **飞时只有锁存一个真值**; 炮表是显示值 (晚 1s 启动/会冻结/会清表); 本地是判据 (出膛起算)。FC 收尾/完成队列 FireMission 用 GC 记的出膛时刻任务时钟 (`Flight.FiredAtMission`), 不用"倒计时启动时刻"(系统性偏晚 1s 的根源)。
+
+### 4.5 装填链细节 (直装 vs 空膛路径)
+
+- **空膛路径**: SHRD (转弹仓, 含 WaitForReloadReady) → SHLD (推弹) → PWDR (拉药, 2-2 已并行 Calculate) → LOAD (推药 + COFM 实装确认 25s) → TRAK。
+- **直装路径** (膛内弹对只缺药): 起链即 PWDR — 没有 SHLD 的机构等待, 所以 PWDR 开头有 `WaitForReloadReady` (机构停稳, 否则 Button Dispencer 不激活 9s 白等) + Calculate 兜底。
+- **死区**: 单发步间 0.5s; 齐射同步区每步 0.75s (双炮汇合后才走下一步, 防抢跑/共享分配器让出)。
+- **击发沿基线同步** (`ResetForTask` 里 `_lastHasFired = HasFired()`): 不能清 false — 上一发残留沿会被误判成新开火 (入队瞬间红线闪)。
+
+### 4.6 渲染分层 (画画模型)
+
+`renderQueue = 5000 − prio`, queue 大 = 后渲染 = 后画的笔迹盖上面; z = `ZStep × prio` 是同层次级排序:
+
+| prio | queue | z | 元素 |
+| --- | --- | --- | --- |
+| GreenPrio 0 | 5000 最后一笔 | 0 | GC 弹道 (绿十字/圈/飞时) + 轨迹点/最终线/交汇点 + A1 预瞄线 |
+| ImpactPrio 1 | 4999 | 0.001 | C1 红固定虚线 + 落点指示器全套 |
+| RedPrio 2 | 4998 | 0.002 | 队列标记 (圈/编号/弹种/菱形/齐射框) + 实体图标 (参考点绿十字留此层 — 地图元素) |
+
+常量在 SandboxRenderer 顶部, 微调只动 prio 数字/ZStep。所有图元 (`Line`/`FillDot`/`RebuildCircle`/`DrawIcon`/`CreateDashedLine`) 带 prio 参数默认值。
+
+### 4.7 线型定稿 (2026-09-05)
+
+- **A1 预瞄线**: 游戏 Dashed 材质单线 (恒定实体), 炮上有任务即显示 (TWS 无关); 终点 = 交汇点 (有预瞄) / 目标本身 (直瞄)。
+- **A2 目标轨迹线**: 点式虚线 — 点直径 = 线宽 0.006, 点线段长 0.0015 (胶囊帽相接≈圆), 最小点距 0.0075, 最多 32 点, 点沿切线摆; 轨迹长 ∝ 目标速度, 点疏密直观。
+- **A3 最终线**: 细实线 (0.004), 击发冻结缩短, 终点 = 开火瞬间交汇点。
+- **C1 红固定虚线**: 游戏 Dashed 单线 (与 A1 同款), 落地保留到下一发。
+- 交汇点 = FillDot 单圆环 (环心半径/2, 线宽 = 半径), 半径 0.0067。
+
+### 4.8 其他
+
+- **HUD 完成队列**: 每任务一条, `FireMission` = 出膛时刻任务时钟, 剩余 = `Flight.Remain` 活读, `Landed` → `--.--`; 倒序显示 (最新在上)。
+- **排序**: 乱序重排只在 Start 时一次 (45° 一刀切); 派发只队首。
+- **Pause 豁免**: 飞行计时/落点指示在 GC/DC 常驻线程, 任何状态不冻结。
+- **扫荡**: DC 侧持续生成请求 (去重), FC 只接收; 优先 FDC>炮兵>装甲>其他。
+
+---
+
+## 5. 坑与注意事项 (开发陷阱全集)
+
+### 5.1 注意事项 (机制全景与最终处置)
+
+1. **炮表倒计时不可靠, 落地/剩余判定收口 Flight (见 §4.1)**。游戏炮表 (CountdownRemainingSeconds) 有三种失效形态: (a) 倒计时最后 ~2s 卡住不降; (b) 飞行中给同炮切任务, 炮表被新瞄准流程抢占而冻结 (帧间降速 <0.05); (c) 无下一任务时发射流程收尾 (REST/Idle) 把炮表清成 NaN (这不是落地信号 — 飞行中就会发生)。**最终处置**: Flight 每帧锁 `GcLag = local − gc` 基准差, 显示 `Remain = min(gc, local − GcLag)` (炮表正常时与游戏指示器逐帧同步, 冻结/清表自动落回本地外推); **落地判据唯一 = 本地 `local ≤ 0`** (出膛时刻起算), 炮表只做显示同步、不参与判定。消费方 (红线/最终线/HUD 完成队列) 全部直读 Flight 字段, 不再各自解读炮表。
+2. **km↔板面换算**: 一律经 `GeoMap.KmPerLocal` (=3.8164, 乘不是除)。写反 → 速度小 14.5 倍, 轨迹极短; 方向角必须在板面局部系算 (SignedAngle(v, Vector3.up), 0=北顺时针 — 网格画布空间朝向不同, 用错会打飞)。
+3. **LeadSolve 二次项系数**: b = −2kpv (提前量正向)。系数写反 = 提前量被反向扣除, 落点偏后。k 用满装药斜率 (与装药弱相关, 待精化)。
+4. **分配器读数是计算台缓存, 刷新靠装填期 Calculate (见 §4.3)**。`SelectedPowderCharges` 里程表读的是计算台缓存 — 开火/推药后与物理分配器脱节 (~16s 才同步), 只有 Calculate 后立即是真值 (玩家手动拉杆不需要 Calculate, 但 mod 按读数决策就必须刷新)。**最终处置**: 每任务至多一次 Calculate (`CalcDone` 去重, 记事本卡片副作用): 2-2 推弹按钮按下后**子协程并行** (计算被推弹动画覆盖, 不白等), 膛内弹直装路径在 2-3 前串行兜底; 齐射只左炮拉一次, 右炮等 `CalcDone` 信号 (不能抢先按解算推药); TRAK 后五步确认不再动计算台; LOAD 推药 COFM 超时 → 置 `_forceFullPowder`, 下轮 PWDR 无视读数按空拉满 (分配器 6 包满, 重复拉杆只是 9s 白等不超量)。
+5. **FC 收尾判据**: 用 GC `Fired` 沿 (真出膛), 不用 FlyRemaining — 装填期炮表残留值会让收尾早于出膛 1s, 完成队列绑到旧 Flight (HUD 恒 --.--)。完成队列的 `FireMission` 取 `Flight.FiredAtMission` (GC 记的出膛时刻任务时钟), 与红线/HUD 同一基准。
+6. **拉杆/推药按钮需机构就绪**: 膛内弹直装路径 (起链 2ms 即进 PWDR) 在 PWDR 前 `WaitForReloadReady` (装填机构停 + 炮闩解锁 + 仰角静止), 否则 Button Dispencer 不激活 (9s 白等); 空膛路径的 SHRD 自带此等待。
+7. **击发沿基线**: ResetForTask 里 `_lastHasFired` 同步到当前值, 不能清 false — 上一发残留沿会被误判成新开火 (入队瞬间红线闪)。
+8. **游戏 Dashed 按整条线排周期**: 短线显不出虚线 — A1/C1 用游戏 Dashed 单线 (长线无碍), 轨迹线用自建点式, 杀伤圈手排短弧。
+9. **Il2Cpp.MissionClock 同名歧义**: 游戏新增同名类, Logic 命名空间外裸用会 CS0104 — 全限定 (FCS 命名空间内靠命名空间优先, 属隐式依赖, 移出即炸)。
+10. **build 与游戏进程**: Mods/ 宿主 dll 只在启动头几秒被 MelonLoader 短暂持锁, 避开启动窗口即可正常复制; Logic.dll 走 UserData 不锁, 游戏运行中 build 无碍。
+11. **C# 细节**: `virtual` 是保留字 (参数用 isVirtual); `System.Array.Sort` 需显式泛型 (`System.Array.Sort<RaycastHit>(hits, ...)`); 换电脑注意根目录游离副本 (CS0101 重复定义)。
+
+### 5.2 一致性清单 (2026-09-05 全量 review)
+
+**已解决**: C1 落地判定四套 → Flight 统一; C2 击发双判据 → GC Fired 沿; C3 换算散落 → GeoMap.KmPerLocal; C6 手建线 → CreateDashedLine; C7 边界两份 → GeoMap.IsOnBoard; 渲染权重 → prio 分层; 倒计时分裂 → Flight 直读。
+
+**待办 (纯重构, 行为不变)**:
+- **C4**: `UpdateQueueSolutions` 与 `ComputeGunSolutions` 解算代码两份 → 抽 `SolveOne`。
+- **C5**: 解算存储双副本 (task.Angle/Distance/AimBoard vs `_solXxxL/R` 快照) → 合并。
+- **C8**: FC 内 L/R 成对字段手写 (6 对 sol + armed/confirmed/fire/dumpStuck) → PerGun struct。
+- **未实现项**: Priority 派发 (字段存在但派发不排序); 旧代码清退 (FSC.cs/MapTable/FcsWindow/TacticalRadar/FcsSceneInteractor — FcsSceneInteractor.WaitAndClick 仍被活跃代码用, TacticalRadar 静态方法被 Radar 复用; 等 2.0 全流程跑稳再清)。
+- **探针残留**: UserData/IronNestFCS/ 下 clock_probe*.txt + radar_log.txt (~100MB) 可删。
+
+### 5.3 已知局限 (设计取舍)
+
+- LeadSolve 的 k 用满装药斜率 (与装药弱相关) — 装药档不同提前量有微差, 待精化。
+- TWS 定速模型: 变速目标滞后 1.5s (75 帧窗口), 游戏内全匀速直线目标, 无碍。
+- 游戏 PredictedImpactTime 是活变量, 手动玩不重算时读数可能来自旧解。
+- CoroutineLock 非 FIFO (主线程协作调度, 抢锁顺序不定)。
+- 渲染层每帧 vs 数据层 25fps: 渲染吃数据更新间隙的值, 可接受。
+
+---
+
+## 6. 开发流程
+
+### 6.1 日常循环
+
+1. 改 Logic 代码 → `dotnet build`(游戏可开着, 避开启动头几秒)。
+2. 游戏内 **F9** → Shutdown → 重载 UserData 里的 Logic.dll。
+3. 看 MelonLoader 控制台日志 (Latest.log / 游戏内控制台)。
+
+### 6.2 探针约定
+
+- 调试流程: 现象 → 加日志探针 → 复现 → 看数据 → 定位 → 修 → 清理临时探针。
+- 探针降频 (每 8 帧/每秒), 关键沿必打; 对账探针 (trak/tgt/impact src/landing/FIRE) 平时留生产路径降频运行。
+- 修完清理临时探针, 保留状态节点日志 (chain start/calculate done 一类)。
+
+### 6.3 Git 纪律
+
+- 分支 v2-refactor; 单人开发, 需要时 push -f 无所谓。
+- `.gitignore` 已含 bin/obj/logs.txt/IDE 杂项 — 不要用覆盖方式改它 (曾把 39 行规则覆写丢光, 130 个编译产物暴露)。
+- 测试日志 (logs.txt) 不入库。
+
+---
+
+## 7. 迁移清单 (旧层清退)
+
+| 旧件 | 状态 |
 | --- | --- |
-| TrackAxis (变积分+两帧差分跟踪器) | GC 跟踪稳定器 (E 各炮 / H 被选中炮), 原样搬 |
-| GunSystem 绑定/读数 (膛内弹/实装药/弹仓/CanFire/仰角速度) | GC 状态端口数据源 |
-| GunStopwatch 锁存 + PredictedImpactTime | GC FlyTime 端口 |
-| 坐标换算 (MapBottomLeft/MapCellSize/相对位置公式) | 抽成静态工具, DC 数据循环 + FC 共用 |
-| ShellData 射表 (ElevationDeg/FlightTime/KillRadiusKm/MinimumCharge) | FC 诸元计算; N 模式补"仰角≤30° 反查装药" |
-| 米字数码字形表 (Seg16/Glyph16/SetMarkLabel) | DC 渲染线程 (编号 00T/米字数码原样) |
-| 按钮操作封装 (WaitAndClick/SetColor/AddButton/AddText/ClickRaycaster) | DC (3D 按钮/右键/令牌交互) |
-| PurchaseDeck (BuyShell/BuyPowders) | GC 内部 (SELC 买弹 / PWDR 前查池买药) |
-| TriggerConsole (五步确认封装) | FC 统一火控 |
-| 实体分类 (IsHostile/GetIcon/GetArmour/IsUnitAlive) | RD 扫描 |
-| 任务时钟 (GenericTimerSceneSync) / CBC (CounterBatteryTimer) 读取 | FC HUD |
-| CoroutineLock | 保留, 短锁化 (锁只包一次硬件操作) |
+| FSC.cs (旧调度) | LegacyDisabled=true, 只留硬件绑定 — 待删 |
+| MapTable.cs | 仅被旧层引用 — 待删 (Glyph16Font/GeoMap 已抽出) |
+| FcsWindow.cs | 旧 IMGUI — 待删 (FcsHud 替代) |
+| TacticalRadar.cs | 静态分类方法被 Radar 复用 — 收编后删 |
+| FcsSceneInteractor.cs | WaitAndClick 被 TriggerConsole/GunSystem/PurchaseDeck 用 — 移到 Shared 后删 |
+| GunSystem.cs | **活跃硬件驱动** (GunControl 全量依赖), 非旧层 — 名字带 System 易误判, 注释已标 |
 
-### 重写
-
-| 旧件 | 新形态 |
-| --- | --- |
-| FSC 调度层 (队列/派发/RunTaskRoutine/RunSalvoRoutine/锁/超时监控) | 拆成 FC (队列/派发/统一火控/HUD) + GC (Action 状态机 + 看门狗) |
-| FcsWindow (IMGUI) | FC 直出, 64 字符新格式 |
-| MapTable mark 系统 | DC 打击队列指示器 / 炮弹落点指示器 (红线/弹头/杀伤圈重画, 字形复用) |
-| FcsSceneInteractor | 拆: 交互归 DC, 开关归 DC 状态端口 |
-| Progress 相位枚举 | Action 枚举 (10 态) + 相位代号映射表 |
-
-### 删除
-
-| 旧件 | 替代 |
-| --- | --- |
-| T1-T10 标记系统 (标记物挂件/AttachMarkerTask) | 令牌拖放机制 |
-| AutoReplenish 常驻补药循环 | GC PWDR 前查池买药 (锁内) |
-| ProgressTimeoutMonitor 20s 超时 | GC 看门狗 (动作期限) + FC 汇总 FALL |
-| 探针残留 (ProbeClock1-4) | 已无用 |
-
-### 实施顺序建议
-
-1. 抽共享静态工具 (射表/坐标/字形) — 无风险
-2. GC (GunSystem + TrackAxis 挂 Action 状态机)
-3. RD (TacticalRadar 改两速)
-4. DC (交互/渲染)
-5. FC 最后 (依赖所有端口)
-6. 删旧调度层
-
-
-### 2.0 目录规划 (按模块写文件, 每类 ≤300 行)
-
-```
-Logic/
-├─ FcsModule.cs             宿主装配 (保留, 只改模块初始化)
-├─ Shared/                  共享静态件
-│   ├─ GeoMap.cs / Glyph16Font.cs   (1a/1b 已抽)
-│   ├─ TrackAxis.cs / CoroutineLock.cs / ArtilleryTask.cs / ShellData.cs  (搬入)
-├─ GC/  GunControl (GunControl.cs 状态机 / GunSystem.cs / PurchaseDeck.cs)
-├─ RD/  Radar.cs (TacticalRadar 改造)
-├─ DC/  DisplayControl.cs / SandboxRenderer.cs / ClickRaycaster.cs
-└─ FC/  FireControl.cs / FcsHud.cs / BallisticCalculator.cs / TriggerConsole.cs
-```
-
-- 旧文件 (FSC.cs/MapTable.cs/FcsWindow.cs/TacticalRadar.cs) 四模块建完再整体清退, 每步可编译可 F9
-
----## 代码与设计差异 (2026-08-21 核对)
-
-设计在前、代码在后. 实现与设计的出入已直接并入正文 (按实现写成设计目标, 不再单列"偏离"); 本表只保留**未实现**项.
-
-### 未实现 (设计有, 代码没有)
-
-1. **旧代码清退 (C2)**: 迁移清单的删除/重写未执行 — FSC.cs (旧调度层) / MapTable.cs / FcsWindow.cs / TacticalRadar.cs / FcsSceneInteractor.cs 仍在编译并部分被引用 (FcsSceneInteractor.WaitAndClick 被 TriggerConsole/GunSystem 用; TacticalRadar 的分类/存活仍被旧 DC 路径用). 倾向: 等 2.0 全流程跑稳再清.
-2. **Priority 派发**: FireTask.Priority 字段存在但派发不使用 — 优先级只在扫荡生成请求时排序 (FDC > 炮兵 > 装甲 > 其他).
+清退顺序建议: FcsWindow → MapTable → FSC 壳 → FcsSceneInteractor (WaitAndClick 搬 Shared) → TacticalRadar (静态方法收编 Radar)。
