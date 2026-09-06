@@ -35,6 +35,9 @@ public class Radar {
 
     public IReadOnlyList<SrcContact> Contacts => _contacts;
 
+    /// <summary>雷达电源 (SAR RADAR 按钮): 关 = 不扫描不出目标 (Contacts 清空 — 下游目标全撤), 默认关 (开机先开雷达).</summary>
+    public bool Power;
+
     public void Start() {
         _disposed = false;
         _loopHandle = MelonCoroutines.Start(Loop());
@@ -52,6 +55,7 @@ public class Radar {
     private IEnumerator Loop() {
         while (!_disposed) {
             yield return new WaitForSeconds(0.04f);
+            if (!Power) { _contacts.Clear(); continue; } // 雷达关: 无扫描无目标 (下游 DC 目标表随之清空, FC 撤任务)
             if (Time.time - _lastScan > 2f) {
                 ScanOnce();
                 _lastScan = Time.time;

@@ -1,3 +1,4 @@
+using System.Collections;
 using System.Collections.Generic;
 using Il2Cpp;
 using Il2CppTMPro;
@@ -19,6 +20,8 @@ public class ScenePanel {
 
     private readonly ClickRaycaster _clicks = new();
     private readonly List<GameObject> _owned = new();
+    private readonly List<System.Action> _refreshColors = new(); // 每按钮注册: 按当前状态设置自己的颜色 (初始化统一着色 + RST 闪白后恢复)
+    private object? _flashHandle;
     private readonly HashSet<Collider> _entityColliders = new();
     private readonly HashSet<Collider> _tokenColliders = new();
     private float _lastRegister;
@@ -35,6 +38,7 @@ public class ScenePanel {
         BuildModeButtons();
         BuildControlButtons();
         BuildBulletButtons();
+        foreach (var refresh in _refreshColors) refresh(); // 初始统一着色 (按钮创建时全白, 这里切回各自颜色)
     }
 
     // ===== 弹种选择按钮列 (保持现状: 火控台右侧斜线列, 全弹种枚举) =====
@@ -45,7 +49,7 @@ public class ScenePanel {
         foreach (BulletType type in System.Enum.GetValues(typeof(BulletType))) {
             BulletType captured = type;
             GameObject button = null!;
-            button = Button(type.ToString(), Dc != null && Dc.SelectedShell == type ? Color.green : Color.white, () => {
+            button = Button(type.ToString(), Color.white, () => {
                 if (Dc == null) return;
                 Dc.SelectedShell = captured;
                 foreach (var (bt, go) in _bulletButtons) {
@@ -54,6 +58,7 @@ public class ScenePanel {
             });
             Place(button, x, y, z);
             _bulletButtons.Add((type, button));
+            _refreshColors.Add(() => SetColor(button, Dc != null && Dc.SelectedShell == captured ? Color.green : Color.white));
             x -= 0.05f;
             y -= 0.0045f;
         }
@@ -62,8 +67,11 @@ public class ScenePanel {
 
     public void ShutDown() {
         _clicks.Clear();
+        try { if (_flashHandle != null) MelonCoroutines.Stop(_flashHandle); } catch { }
+        _flashHandle = null;
         foreach (var go in _owned) UnityEngine.Object.Destroy(go);
         _owned.Clear();
+        _refreshColors.Clear();
         _entityColliders.Clear();
         _built = false;
     }
@@ -140,54 +148,66 @@ public class ScenePanel {
         }
     }
 
-    // ===== 沙盘右侧第二列: AutoFire / AutoTask / TWS / Tight / Normal / Extra (原 T1-T4 按钮位置) =====
+    // ===== 沙盘右侧第二列 (原 T1-T4 按钮位置): AUTO TASK / AUTO FIRE / (空) / SAR RADAR / TWS CGMTI / (空) / T/N/X =====
+    // 空行 = 面板上占一个按钮位置 (视觉分组); 全大写标签. SAR = 雷达电源: 默认关, 关时无雷达 (目标全无), TWS 灰按不动.
     private void BuildModeButtons() {
-        const float z = -18.5881f;
+        const float z = -18.6181f; // 与弹种列 (-18.4181) 间隔 0.2
         var x = 0.8f;
         var y = -0.65f;
+        void Step() { x -= 0.05f; y -= 0.0045f; }
 
         // 先声明再赋值: lambda 要捕获按钮引用, 不能在其声明表达式内部引用它
-        GameObject autoFire = null!;
-        autoFire = Button("Auto Fire", Color.white, () => {
-            if (Dc == null) return;
-            Dc.AutoFire = !Dc.AutoFire;
-            SetColor(autoFire, Dc.AutoFire ? Color.red : Color.white);
-        });
-        Place(autoFire, x, y, z); x -= 0.05f; y -= 0.0045f;
+        GameObject autoTask = null!, autoFire = null!, sar = null!, tws = null!, tight = null!, normal = null!, extra = null!;
 
-        GameObject autoTask = null!;
-        autoTask = Button("Auto Task", Color.white, () => {
+        autoTask = Button("AUTO TASK", Color.white, () => {
             if (Dc == null) return;
             Dc.SetAutoTask(!Dc.AutoTask);
-            if (Dc.AutoTask) { Dc.AutoFire = true; SetColor(autoFire, Color.red); }
-            SetColor(autoTask, Dc.AutoTask ? Color.red : Color.white);
+            if (Dc.AutoTask) { Dc.AutoFire = true; SetColor(autoFire, Color.green); }
+            SetColor(autoTask, Dc.AutoTask ? Color.green : Color.white);
         });
-        Place(autoTask, x, y, z); x -= 0.05f; y -= 0.0045f;
+        Place(autoTask, x, y, z); Step();
 
-        GameObject tws = null!;
-        tws = Button("TWS", Color.white, () => {
+        autoFire = Button("AUTO FIRE", Color.white, () => {
             if (Dc == null) return;
-            Dc.SetTws(!Dc.Tws);
-            SetColor(tws, Dc.Tws ? Color.cyan : Color.white);
+            Dc.AutoFire = !Dc.AutoFire;
+            SetColor(autoFire, Dc.AutoFire ? Color.green : Color.white);
         });
-        Place(tws, x, y, z); x -= 0.05f; y -= 0.0045f;
+        Place(autoFire, x, y, z); Step();
 
-        GameObject tight = null!, normal = null!, extra = null!;
-        tight = Button("Tight(T)", Color.white, () => {
+        Step(); // 空行 (占一个按钮位置)
+
+        sar = Button("SAR RADAR", Color.white, () => {
+            if (RadarPort == null) return;
+            RadarPort.Power = !RadarPort.Power;
+            SetColor(sar, RadarPort.Power ? Color.green : Color.white);
+            SetColor(tws, !RadarPort.Power ? Color.gray : (Dc != null && Dc.Tws ? Color.green : Color.white)); // 雷达关 → TWS 灰
+        });
+        Place(sar, x, y, z); Step();
+
+        tws = Button("TWS CGMTI", Color.white, () => { // 雷达默认关时灰按不动 (统一着色时设灰)
+            if (Dc == null || RadarPort == null || !RadarPort.Power) return; // SAR 没开: 按不动
+            Dc.SetTws(!Dc.Tws);
+            SetColor(tws, Dc.Tws ? Color.green : Color.white);
+        });
+        Place(tws, x, y, z); Step();
+
+        Step(); // 空行 (占一个按钮位置)
+
+        tight = Button("T - TIGHT", Color.white, () => {
             if (Dc == null) return;
             Dc.ChargeModeSelection = ChargeMode.Tight;
             SetChargeColors(tight);
         });
-        Place(tight, x, y, z); x -= 0.05f; y -= 0.0045f;
+        Place(tight, x, y, z); Step();
 
-        normal = Button("Normal(N)", Color.green, () => {
+        normal = Button("N - NORML", Color.white, () => {
             if (Dc == null) return;
             Dc.ChargeModeSelection = ChargeMode.Normal;
             SetChargeColors(normal);
         });
-        Place(normal, x, y, z); x -= 0.05f; y -= 0.0045f;
+        Place(normal, x, y, z); Step();
 
-        extra = Button("Extra(X)", Color.white, () => {
+        extra = Button("X - EXTRA", Color.white, () => {
             if (Dc == null) return;
             Dc.ChargeModeSelection = ChargeMode.Extra;
             SetChargeColors(extra);
@@ -199,17 +219,23 @@ public class ScenePanel {
             SetColor(normal, active == normal ? Color.green : Color.white);
             SetColor(extra, active == extra ? Color.green : Color.white);
         }
+        // 统一着色注册 (RST 闪白后按当前状态恢复)
+        _refreshColors.Add(() => SetColor(autoTask, Dc != null && Dc.AutoTask ? Color.green : Color.white));
+        _refreshColors.Add(() => SetColor(autoFire, Dc != null && Dc.AutoFire ? Color.green : Color.white));
+        _refreshColors.Add(() => SetColor(sar, RadarPort != null && RadarPort.Power ? Color.green : Color.white));
+        _refreshColors.Add(() => SetColor(tws, RadarPort == null || !RadarPort.Power ? Color.gray : (Dc != null && Dc.Tws ? Color.green : Color.white)));
+        _refreshColors.Add(() => SetColor(tight, Dc != null && Dc.ChargeModeSelection == ChargeMode.Tight ? Color.green : Color.white));
+        _refreshColors.Add(() => SetColor(normal, Dc != null && Dc.ChargeModeSelection == ChargeMode.Normal ? Color.green : Color.white));
+        _refreshColors.Add(() => SetColor(extra, Dc != null && Dc.ChargeModeSelection == ChargeMode.Extra ? Color.green : Color.white));
     }
 
-    // ===== 火控台右侧: Start / Pause-Resume / Stop (三按钮在弹种列延长线上方一格起, 避免压到 AP) =====
+    // ===== 火控台右侧: START / PAUSE / ST/CL (START 占原 PAUSE 位; PAUSE 在 START 右侧, 上下对齐第二列 AUTO TASK; ST/CL 原位) =====
     private void BuildControlButtons() {
         const float z = -18.4181f;
-        var x = 0.95f;      // 比旧版 (0.9) 再上一格: 三按钮多占一格, 不能再往下伸
-        var y = -0.6365f;
 
-        GameObject start = null!, pause = null!, stop = null!;
-        // 三态指示: 停止 (白/白/红) → 运行 (绿/白/白) → 暂停 (白/黄/白); 当前状态亮在对应按钮, 其余白
-        start = Button("Start", Color.white, () => {
+        GameObject start = null!, pause = null!, stop = null!, rst = null!;
+        // 三态指示: 停止 (白/白/红) → 运行 (绿/白/白) → 暂停 (白/橙/白); 当前状态亮在对应按钮, 其余白
+        start = Button("RUN", Color.white, () => {
             _state = PanelState.Running;
             if (Fc != null) {
                 Fc.Paused = false;
@@ -218,9 +244,9 @@ public class ScenePanel {
             }
             ApplyState(start, pause, stop);
         });
-        Place(start, x, y, z); x -= 0.05f; y -= 0.0045f;
+        Place(start, 0.9f, -0.641f, z); // RUN: 最前层 (弹种列平面 -18.4181)
 
-        pause = Button("Pause", Color.white, () => {
+        pause = Button("HLD", Color.white, () => {
             if (_state == PanelState.Paused) {
                 _state = PanelState.Running;
                 if (Fc != null) { Fc.Paused = false; Fc.SetManual(false); }
@@ -233,16 +259,26 @@ public class ScenePanel {
             }
             ApplyState(start, pause, stop);
         });
-        Place(pause, x, y, z); x -= 0.05f; y -= 0.0045f;
+        Place(pause, 0.9f, -0.641f, -18.5181f); // HLD: 同 x/y, z 步进 0.1
 
-        stop = Button("Stop", Color.white, () => {
+        stop = Button("STP", Color.white, () => {
             _state = PanelState.Stopped;
             Fc?.StopTasks();  // 清队列 + 撤任务 (线程常驻不死)
             Fc?.SetManual(true); // Stop 回 Manual
             if (Fc != null) Fc.Paused = false;
             ApplyState(start, pause, stop);
         });
-        Place(stop, x, y, z);
+        Place(stop, 0.9f, -0.641f, -18.6181f); // STP: 同 x/y, 再深一层 (z 步进 0.1, 与第二列同平面)
+
+        rst = Button("RST", Color.white, () => { // 手动重置: 停火 + 全部按钮闪白再切回各自颜色
+            _state = PanelState.Stopped;
+            Fc?.StopTasks();
+            Fc?.SetManual(true);
+            if (Fc != null) Fc.Paused = false;
+            try { if (_flashHandle != null) MelonCoroutines.Stop(_flashHandle); } catch { }
+            _flashHandle = MelonCoroutines.Start(FlashRst());
+        });
+        Place(rst, 0.9f, -0.641f, -18.7181f); // RST: 队尾, 再深一层
 
         void ApplyState(GameObject s, GameObject p, GameObject t) {
             switch (_state) {
@@ -257,8 +293,18 @@ public class ScenePanel {
                     break;
             }
         }
-        ApplyState(start, pause, stop); // 默认态 = 暂停 (白/黄/白)
+        // 统一着色注册: 三态 + RST 青 (Build 末尾统一着色, RST 闪白后恢复)
+        _refreshColors.Add(() => ApplyState(start, pause, stop));
+        _refreshColors.Add(() => SetColor(rst, Color.cyan));
         if (Fc != null) { Fc.Paused = true; Fc.SetManual(true); } // 模块同步: 初始 = Manual+Paused (冻结待命), 与 FC 默认 Mode 对齐 — GC.ManualControl 一并置位
+    }
+
+    /// <summary>RST 手动重置: 所有按钮闪白 0.15s → 切回各自当前状态颜色.</summary>
+    private IEnumerator FlashRst() {
+        foreach (var go in _owned) SetColor(go, Color.white);
+        yield return new WaitForSeconds(0.15f);
+        foreach (var refresh in _refreshColors) refresh();
+        _flashHandle = null;
     }
 
     private GameObject Button(string label, Color color, System.Action onClick) {
@@ -293,8 +339,10 @@ public class ScenePanel {
         return go;
     }
 
-    /// <summary>URP Unlit 材质换色 (同旧 FcsSceneInteractor.SetColor).</summary>
+    /// <summary>URP Unlit 材质换色 (同旧 FcsSceneInteractor.SetColor).
+    /// 跳过 TMP 文字: 换材质会丢字体 atlas → 字符全变方块 (RST 闪白遍历 _owned 时踩过).</summary>
     private static void SetColor(GameObject go, Color color) {
+        if (go.GetComponent<TextMeshPro>() != null) return; // 文字不换材质
         var renderer = go.GetComponent<Renderer>();
         if (renderer == null) return;
         var shader = Shader.Find("Universal Render Pipeline/Unlit") ?? Shader.Find("Universal Render Pipeline/Lit");
