@@ -52,16 +52,14 @@ public class FireControl {
     // ===== 请求入口 (DC 调用; 显控台舰长席自己排布, FC 只接收) =====
     private readonly List<FireTask> _requests = new();   // 待处理请求 (入队/取消)
     private readonly List<FireTask> _queue = new();      // 任务队列
-    private FireTask? _taskL;
-    private FireTask? _taskR;
     private int _fcCounter;
 
     // ===== 状态 =====
     public FireMode Mode { get; private set; } = FireMode.Manual;
     public int QueueCount => _queue.Count;
     public IReadOnlyList<FireTask> Queue => _queue;
-    public FireTask? LeftTask => _taskL;
-    public FireTask? RightTask => _taskR;
+    public FireTask? LeftTask => _gL.Task;
+    public FireTask? RightTask => _gR.Task;
     private bool _autoFire;
     private bool _autoTask;
     private bool _manual;
@@ -84,9 +82,6 @@ public class FireControl {
     }
     /// <summary>Pause: 冻结火控派发与炮塔控制输出 (豁免: 飞行计时/落点指示在 GC/DC 常驻线程, 不受影响); 在途动作 GC 自行跑完.</summary>
     public bool Paused { get; set; }
-    private bool _armedL;
-    private bool _armedR;
-    private bool _fireL, _fireR; // 击发已按 (触发核心有 fireDelay, Fired latch 前防连点)
     private object? _loopHandle;
     private bool _disposed;
 
@@ -113,9 +108,9 @@ public class FireControl {
         _loopHandle = null;
         _queue.Clear();
         _requests.Clear();
-        _taskL = _taskR = null;
-        _armedL = _armedR = false;
-        _confirmedL = _confirmedR = _salvoConfirmed = false;
+        _gL.Task = _gR.Task = null;
+        _gL.Armed = _gR.Armed = false;
+        _gL.Confirmed = _gR.Confirmed = _salvoConfirmed = false;
         Mode = FireMode.Manual;
     }
 
@@ -123,36 +118,36 @@ public class FireControl {
     public void RequestTask(FireTask task) { task.Id = ++_fcCounter; _requests.Add(task); }
 
     /// <summary>任务是否已上炮 (上炮任务右键 = 取消, 不许改计划, 1.x 口径).</summary>
-    public bool IsOnGun(FireTask task) => task == _taskL || task == _taskR;
+    public bool IsOnGun(FireTask task) => task == _gL.Task || task == _gR.Task;
 
     /// <summary>按实体找任务 (队列 + 在炮).</summary>
     public FireTask? FindEntityTask(GameObject entity) {
         foreach (var t in _queue) if (t.Entity == entity) return t;
-        if (_taskL?.Entity == entity) return _taskL;
-        if (_taskR?.Entity == entity) return _taskR;
+        if (_gL.Task?.Entity == entity) return _gL.Task;
+        if (_gR.Task?.Entity == entity) return _gR.Task;
         return null;
     }
     public void RequestCancel(FireTask task) {
         _requests.Remove(task);
         _queue.Remove(task);
         task.LockedCharge = -1; // 装药冻结随任务生命周期走
-        if (_taskL == task) { _taskL = null; _armedL = false; _confirmedL = false; _fireL = false; if (GunL != null) { GunL.DesiredShell = (BulletType)(-1); GunL.DesiredCharge = -1; } }
-        if (_taskR == task) { _taskR = null; _armedR = false; _confirmedR = false; _fireR = false; if (GunR != null) { GunR.DesiredShell = (BulletType)(-1); GunR.DesiredCharge = -1; } }
-        if (_taskL == null && _taskR == null) _salvoConfirmed = false;
+        if (_gL.Task == task) { _gL.Task = null; _gL.Armed = false; _gL.Confirmed = false; _gL.Fire = false; if (GunL != null) { GunL.DesiredShell = (BulletType)(-1); GunL.DesiredCharge = -1; } }
+        if (_gR.Task == task) { _gR.Task = null; _gR.Armed = false; _gR.Confirmed = false; _gR.Fire = false; if (GunR != null) { GunR.DesiredShell = (BulletType)(-1); GunR.DesiredCharge = -1; } }
+        if (_gL.Task == null && _gR.Task == null) _salvoConfirmed = false;
         ClearSyncIfAlone();
     }
 
     /// <summary>Stop: 清队列 + 撤任务 (线程常驻不死, 只是改指令内容).</summary>
     public void StopTasks() {
         foreach (var t in _queue) t.LockedCharge = -1; // 装药冻结随任务生命周期走
-        _dumpStuckL = _dumpStuckR = false; // 挂起复位 (玩家手动接管处理哑弹)
+        _gL.DumpStuck = _gR.DumpStuck = false; // 挂起复位 (玩家手动接管处理哑弹)
         _queue.Clear();
         _requests.Clear();
         _finished.Clear();
-        _taskL = _taskR = null;
-        _armedL = _armedR = false;
-        _confirmedL = _confirmedR = _salvoConfirmed = false;
-        _fireL = _fireR = false;
+        _gL.Task = _gR.Task = null;
+        _gL.Armed = _gR.Armed = false;
+        _gL.Confirmed = _gR.Confirmed = _salvoConfirmed = false;
+        _gL.Fire = _gR.Fire = false;
         if (GunL != null) { GunL.DesiredShell = (BulletType)(-1); GunL.DesiredCharge = -1; }
         if (GunR != null) { GunR.DesiredShell = (BulletType)(-1); GunR.DesiredCharge = -1; }
         ClearSyncIfAlone();
@@ -162,7 +157,7 @@ public class FireControl {
     public void SetManual(bool manual) {
         _manual = manual;
         RederiveMode();
-        if (manual) _dumpStuckL = _dumpStuckR = false; // 挂起复位 (玩家手动接管处理哑弹)
+        if (manual) _gL.DumpStuck = _gR.DumpStuck = false; // 挂起复位 (玩家手动接管处理哑弹)
         if (GunL != null) GunL.ManualControl = manual;
         if (GunR != null) GunR.ManualControl = manual;
     }
@@ -187,29 +182,14 @@ public class FireControl {
         }
     }
 
-    /// <summary>队列任务坐标解算 (显示用): 相对方位/距离 + 提前量, 不碰硬件不派发.</summary>
+    /// <summary>队列任务坐标解算 (显示用): 与在炮真解算同源 SolveOne (C4), 不碰硬件不派发.</summary>
     private void UpdateQueueSolutions() {
         foreach (var t in _queue) {
-            if (t == _taskL || t == _taskR) continue; // 在炮任务由 ComputeGunSolutions 解
+            if (t == _gL.Task || t == _gR.Task) continue; // 在炮任务由 ComputeGunSolutions 解
             var target = DcPort?.GetTarget(t.Entity!);
             if (target == null) continue;
-            var (dist, angle) = RelToTarget(target.WorldPos);
-            Vector2 dir = new(Mathf.Sin(angle * Mathf.Deg2Rad), Mathf.Cos(angle * Mathf.Deg2Rad));
-            Vector2 aimKm = dir * dist; // 直瞄: 交汇点 = 目标位置
-            if (target.Velocity.magnitude > 0.0001f) {
-                int charge = ChargeOf(t, dist); // 队列显示解算: 按当前距离解析装药 (派发时重解, 提前量 k 按装药)
-                var (ld, la, aim) = LeadSolve(dist, angle, target.Velocity, target.Accel, target.Jerk, charge);
-                dist = ld;
-                angle = la;
-                aimKm = aim;
-            }
-            Vector2 nestBoard = MapSurfaceRef != null && NestRef != null ? (Vector2)MapSurfaceRef.InverseTransformPoint(NestRef.position) : Vector2.zero;
-            // SRC 模式 (TWS 关, 无预瞄) → 预瞄线/交汇点不显示 (NaN 哨兵)
-            t.AimBoard = target.Velocity.magnitude > 0.0001f
-                ? nestBoard + aimKm * GeoMap.MapCellSize
-                : new Vector2(float.NaN, float.NaN);
-            t.Angle = angle;
-            t.Distance = dist;
+            var (rawDist, _) = RelToTarget(target.WorldPos);
+            SolveOne(t, target, ChargeOf(t, rawDist)); // 队列显示: 按当前距离解析装药 (派发时重解)
         }
     }
 
@@ -239,21 +219,21 @@ public class FireControl {
         while (_queue.Count > 0) {
             var head = _queue[0];
             if (head.SalvoPair) { // 齐射: 等两炮都回 WAIT 且空膛才挂双槽 (同任务 + SyncCommand, 同时装弹)
-                if (_taskL != null || _taskR != null || GunL == null || GunR == null) break;
+                if (_gL.Task != null || _gR.Task != null || GunL == null || GunR == null) break;
                 if (GunL.Action != GunAction.Idle || GunR.Action != GunAction.Idle) break;
-                if (_dumpStuckL || _dumpStuckR) break; // 挂起炮不参与齐射 (哑弹需人工处理)
+                if (_gL.DumpStuck || _gR.DumpStuck) break; // 挂起炮不参与齐射 (哑弹需人工处理)
                 if (GunL.ChamberLive.Length > 0 || GunR.ChamberLive.Length > 0) {
                     AttachDump(GunL.ChamberLive.Length > 0 ? GunL : GunR); // 膛内有弹: 先 DUMP 清膛 (占位), 下轮再查
                     break;
                 }
                 _queue.RemoveAt(0);
-                _taskL = _taskR = head;
+                _gL.Task = _gR.Task = head;
                 ClearSyncIfAlone();
                 MelonLogger.Msg($"[FC] dispatch SALVO fc#{head.Id} {head.Shell}");
                 continue;
             }
-            GunControl? freeL = GunL != null && _taskL == null && !_dumpStuckL && GunL.Action != GunAction.Fall ? GunL : null;
-            GunControl? freeR = GunR != null && _taskR == null && !_dumpStuckR && GunR.Action != GunAction.Fall ? GunR : null;
+            GunControl? freeL = GunL != null && _gL.Task == null && !_gL.DumpStuck && GunL.Action != GunAction.Fall ? GunL : null;
+            GunControl? freeR = GunR != null && _gR.Task == null && !_gR.DumpStuck && GunR.Action != GunAction.Fall ? GunR : null;
             if (freeL == null && freeR == null) break;
             // 空闲炮挑选: 弹种匹配队首者优先 (都匹配/都不匹配 → L)
             GunControl pick;
@@ -267,7 +247,7 @@ public class FireControl {
             bool serve = ch.Length == 0 || (ch == head.Shell.ToString() && (charges == 0 || charges >= ChargeOf(head, 0f)));
             if (serve) {
                 _queue.RemoveAt(0);
-                if (pick == freeL) _taskL = head; else _taskR = head;
+                if (pick == freeL) _gL.Task = head; else _gR.Task = head;
                 ClearSyncIfAlone();
                 MelonLogger.Msg($"[FC] dispatch fc#{head.Id} {head.Shell} → {(pick == GunL ? "L" : "R")} (chamber '{ch}' charges {charges})");
             }
@@ -289,7 +269,7 @@ public class FireControl {
             Dump = true,
             LockedCharge = 1,
         };
-        if (gun == GunL) _taskL = dump; else _taskR = dump;
+        if (gun == GunL) _gL.Task = dump; else _gR.Task = dump;
         ClearSyncIfAlone();
         MelonLogger.Msg($"[FC] {(gun == GunL ? "L" : "R")}: DUMP placeholder (chamber '{gun.ChamberLive}' charges {gun.ChargesLive})");
     }
@@ -317,7 +297,7 @@ public class FireControl {
 
     /// <summary>SyncCommand 随齐射对置位/复位 (GC 相位级同步).</summary>
     private void ClearSyncIfAlone() {
-        bool salvo = (_taskL?.SalvoPair ?? false) || (_taskR?.SalvoPair ?? false);
+        bool salvo = (_gL.Task?.SalvoPair ?? false) || (_gR.Task?.SalvoPair ?? false);
         if (GunL != null) GunL.SyncCommand = salvo;
         if (GunR != null) GunR.SyncCommand = salvo;
     }
@@ -339,47 +319,69 @@ public class FireControl {
         }
     }
 
-    private float _solChargeL, _solChargeR, _solElevL, _solElevR, _solAngleL, _solAngleR, _solDistL, _solDistR;
-    private FireTask? _solTaskL, _solTaskR; // 解算快照对应的任务 (派发当帧解算未刷, 应用层据此跳过)
-    private Vector2 _solAimL, _solAimR, _solVL, _solVR, _solAL, _solAR, _solJL, _solJR; // 解算快照: 交汇点矢量 (km 局部) / 轨迹参数 (km/s, km/s², km/s³)
-    private float _solTL, _solTR;   // 解算飞时 (交汇点渲染/T 显示同源)
+    /// <summary>单任务解算 (C4 统一口径 — 队列显示与在炮真解算同源): 相对方位/距离 → LeadSolve 提前量 (k 按装药) → 交汇点.
+    /// 回写 task.Angle/Distance/AimBoard (无预瞄时 AimBoard=NaN 哨兵); 返回 (dist, angle, aimKm, vKm, aKm, jKm) 供快照/下发.</summary>
+    private (float dist, float angle, Vector2 aimKm, Vector2 vKm, Vector2 aKm, Vector2 jKm) SolveOne(FireTask task, DcTarget target, int charge) {
+        var (dist, angle) = RelToTarget(target.WorldPos);
+        Vector2 dir = new(Mathf.Sin(angle * Mathf.Deg2Rad), Mathf.Cos(angle * Mathf.Deg2Rad));
+        Vector2 aimKm = dir * dist; // 直瞄: 交汇点 = 目标位置
+        var vKm = target.Velocity; var aKm = target.Accel; var jKm = target.Jerk;
+        if (vKm.magnitude > 0.0001f) {
+            var (ld, la, aim) = LeadSolve(dist, angle, vKm, aKm, jKm, charge);
+            dist = ld; angle = la; aimKm = aim;
+        }
+        task.Angle = angle;
+        task.Distance = dist;
+        Vector2 nestBoard = MapSurfaceRef != null && NestRef != null ? (Vector2)MapSurfaceRef.InverseTransformPoint(NestRef.position) : Vector2.zero;
+        task.AimBoard = vKm.magnitude > 0.0001f ? nestBoard + aimKm * GeoMap.MapCellSize : new Vector2(float.NaN, float.NaN);
+        return (dist, angle, aimKm, vKm, aKm, jKm);
+    }
+
+    /// <summary>单炮火控状态 (C8: L/R 成对字段统一为两个实例).</summary>
+    private struct PerGun {
+        public FireTask? Task;       // 在炮任务
+        public bool Armed;           // 保险已解除
+        public bool Confirmed;       // 五步确认已完成
+        public bool Confirming;      // 五步确认进行中
+        public bool Fire;            // 击发已按 (Fired latch 前防连点)
+        public bool DumpStuck;       // DUMP 全哑挂起 (Manual/Stop 复位)
+        public FireTask? SolTask;    // 解算快照对应任务 (派发当帧解算未刷, 应用层据此跳过)
+        public float SolCharge, SolElev, SolT;                       // 解算快照: 装药/仰角/飞时 (HUD 显示 + GC 下发同源)
+        public Vector2 SolAim, SolV, SolA, SolJ;                     // 解算快照: 交汇点矢量 (km 局部) / 轨迹参数 (km/s, km/s², km/s³)
+    }
+    private PerGun _gL, _gR;
     /// <summary>火控解算 push (DC 渲染目标轨迹线+交汇点): (side, 目标引用, 交汇点板面, 轨迹速度板面/s, 加速度板面/s², 三次项板面/s³, 飞时秒).
     /// 无任务/DUMP/解算无效 → 目标引用 null (DC 隐藏). 开火后 DC 侧冻结 (GC 击发通知), push 被忽略.</summary>
     public System.Action<LeftRight, Transform?, Vector2, Vector2, Vector2, Vector2, float>? OnFireSolution;
     /// <summary>解算快照 (HUD 第二行显示用): 仰角/装药, 无任务 NaN/-1.</summary>
-    public float SolElevL => _taskL != null ? _solElevL : float.NaN;
-    public float SolElevR => _taskR != null ? _solElevR : float.NaN;
-    public int SolChargeL => _taskL != null ? (int)_solChargeL : -1;
-    public int SolChargeR => _taskR != null ? (int)_solChargeR : -1;
+    public float SolElevL => _gL.Task != null ? _gL.SolElev : float.NaN;
+    public float SolElevR => _gR.Task != null ? _gR.SolElev : float.NaN;
+    public int SolChargeL => _gL.Task != null ? (int)_gL.SolCharge : -1;
+    public int SolChargeR => _gR.Task != null ? (int)_gR.SolCharge : -1;
 
     /// <summary>火控解析 (与炮无关, 任何状态持续刷新): 位置源 → 方位/距离 (含提前量) → 装药/仰角. 只写任务缓存与本地变量, 不碰 GC.</summary>
     private void ComputeGunSolutions() {
-        foreach (var (gun, task) in new[] { (GunL, _taskL), (GunR, _taskR) }) {
+        foreach (var (gun, task) in new[] { (GunL, _gL.Task), (GunR, _gR.Task) }) {
             if (gun == null) continue;
             bool isL = gun == GunL;
             if (task == null) {
-                if (isL) { _solDistL = 0f; _solChargeL = -1; _solElevL = float.NaN; _solAngleL = float.NaN; _solTaskL = null; _solAimL = Vector2.zero; _solVL = Vector2.zero; _solAL = Vector2.zero; _solJL = Vector2.zero; _solTL = float.NaN; }
-                else { _solDistR = 0f; _solChargeR = -1; _solElevR = float.NaN; _solAngleR = float.NaN; _solTaskR = null; _solAimR = Vector2.zero; _solVR = Vector2.zero; _solAR = Vector2.zero; _solJR = Vector2.zero; _solTR = float.NaN; }
+                if (isL) { _gL.SolCharge = -1; _gL.SolElev = float.NaN; _gL.SolTask = null; _gL.SolAim = Vector2.zero; _gL.SolV = Vector2.zero; _gL.SolA = Vector2.zero; _gL.SolJ = Vector2.zero; _gL.SolT = float.NaN; }
+                else { _gR.SolCharge = -1; _gR.SolElev = float.NaN; _gR.SolTask = null; _gR.SolAim = Vector2.zero; _gR.SolV = Vector2.zero; _gR.SolA = Vector2.zero; _gR.SolJ = Vector2.zero; _gR.SolT = float.NaN; }
                 continue;
             }
             if (task.Dump) {
                 // DUMP 占位: 无目标无弹道 — 仰角 0 平射, 方位 = 当前炮方位 (不转炮塔), 装药 1 (膛内同弹种)
-                if (isL) { _solChargeL = 1; _solElevL = 0f; _solAngleL = gun.Azimuth; _solDistL = 0f; _solTaskL = task; _solAimL = Vector2.zero; _solVL = Vector2.zero; _solAL = Vector2.zero; _solJL = Vector2.zero; _solTL = float.NaN; }
-                else { _solChargeR = 1; _solElevR = 0f; _solAngleR = gun.Azimuth; _solDistR = 0f; _solTaskR = task; _solAimR = Vector2.zero; _solVR = Vector2.zero; _solAR = Vector2.zero; _solJR = Vector2.zero; _solTR = float.NaN; }
+                if (isL) { _gL.SolCharge = 1; _gL.SolElev = 0f; task.Angle = gun.Azimuth; task.Distance = 0f; _gL.SolTask = task; _gL.SolAim = Vector2.zero; _gL.SolV = Vector2.zero; _gL.SolA = Vector2.zero; _gL.SolJ = Vector2.zero; _gL.SolT = float.NaN; }
+                else { _gR.SolCharge = 1; _gR.SolElev = 0f; task.Angle = gun.Azimuth; task.Distance = 0f; _gR.SolTask = task; _gR.SolAim = Vector2.zero; _gR.SolV = Vector2.zero; _gR.SolA = Vector2.zero; _gR.SolJ = Vector2.zero; _gR.SolT = float.NaN; }
                 continue;
             }
             var target = DcPort?.GetTarget(task.Entity!);
             if (target == null) { RequestCancel(task); continue; } // 目标失效 (阵亡/令牌离图) → 撤任务
-            var (dist, angle) = RelToTarget(target.WorldPos);
-            // 交汇点矢量: 直瞄 = 目标方位矢量 (km 局部); 有轨迹参数时 LeadSolve 覆盖 (提前量)
-            Vector2 dir = new(Mathf.Sin(angle * Mathf.Deg2Rad), Mathf.Cos(angle * Mathf.Deg2Rad));
-            Vector2 p0 = dir * dist;
-            Vector2 aimKm = p0;
+            var (rawDist, rawAngle) = RelToTarget(target.WorldPos);
             Vector2 vKm = target.Velocity, aKm = target.Accel, jKm = target.Jerk; // TWS 轨迹参数直读 (TWS 关 = 零, 自然直瞄)
-            float origDist = dist, origAngle = angle;
             // 装药冻结: 派发帧锁存一次 (初始解析), 之后不再重解析 — 目标运动/距离变化不改变装填计划
             // (每帧重解析会让 DesiredCharge 中途变卦: 装填链换药 COFM 报错 / 膛内药数与仰角解算脱节打飞)
-            // 锁定先于 LeadSolve: 提前量的 k (飞时斜率) 按实际装药 — 满装药近似会让提前量按最短飞时算,
+            // 锁定先于 SolveOne: 提前量的 k (飞时斜率) 按实际装药 — 满装药近似会让提前量按最短飞时算,
             // 低装药实弹飞时长 → 提前量不足 → 炮弹落在移动目标身后 (N 装药落点滞后事故)
             bool liveMatches = false;
             if (task.LockedCharge < 0) {
@@ -389,25 +391,18 @@ public class FireControl {
                 if (!liveMatches && task.SalvoPair && GunL != null && GunR != null
                     && LoadoutMatches(GunL, task) && LoadoutMatches(GunR, task)
                     && GunL.ChargesLive == GunR.ChargesLive && GunL.ChargesLive > 0) liveMatches = true;
-                task.LockedCharge = liveMatches ? gun.ChargesLive : ChargeOf(task, dist);
+                task.LockedCharge = liveMatches ? gun.ChargesLive : ChargeOf(task, rawDist);
                 MelonLogger.Msg($"[FC] {(isL ? "L" : "R")}: fc#{task.Id} charge locked = {task.LockedCharge}");
-                // 锁定帧精化一次: 按预瞄距离跨装药档重锁. 只此一次 — 后续帧只 LeadSolve, 装药不再动
+                // 锁定帧精化一次: 按预瞄距离跨装药档重锁. 只此一次 — 后续帧只 SolveOne, 装药不再动
                 // (精化放锁定块外会被目标运动反复触发: LockedCharge 每帧改写 → k 跳变 → TRAK 中提前量突变)
                 if (!liveMatches && vKm.magnitude > 0.0001f) {
-                    var (ld, _, _) = LeadSolve(origDist, origAngle, vKm, aKm, jKm, task.LockedCharge);
+                    var (ld, _, _) = LeadSolve(rawDist, rawAngle, vKm, aKm, jKm, task.LockedCharge);
                     int refined = ChargeOf(task, ld);
                     if (refined != task.LockedCharge) task.LockedCharge = refined;
                 }
             }
-            if (vKm.magnitude > 0.0001f) {
-                var (ld, la, aim) = LeadSolve(origDist, origAngle, vKm, aKm, jKm, task.LockedCharge); // 提前量解析解 (三次轨迹曲线, k 按锁定装药)
-                dist = ld; angle = la; aimKm = aim;
-            }
-            Vector2 nestBoard = MapSurfaceRef != null && NestRef != null ? (Vector2)MapSurfaceRef.InverseTransformPoint(NestRef.position) : Vector2.zero;
-            // SRC 模式 (TWS 关, 无预瞄) → 预瞄线/交汇点不显示 (NaN 哨兵); 有预瞄 = 交汇点 (板面, 与轨迹线终点同点)
-            task.AimBoard = vKm.magnitude > 0.0001f
-                ? nestBoard + aimKm * GeoMap.MapCellSize
-                : new Vector2(float.NaN, float.NaN);
+            // 解算统一口径 (C4): 相对方位/距离 + 提前量 (k 按锁定装药) + 交汇点, 回写 task 缓存
+            var (dist, angle, aimKm, _, _, _) = SolveOne(task, target, task.LockedCharge);
             // 后续弹道用 GC 回报数据: 装填完成 (TRAK) 后膛内实际药数是唯一真值 (计划与实际不符时按实际打);
             // 装填中 ChargesLive 还是旧膛内值, 用锁存 (与 DesiredCharge 一致)
             int charge = gun.Action == GunAction.Trak && gun.ChargesLive > 0 ? gun.ChargesLive : task.LockedCharge;
@@ -416,29 +411,27 @@ public class FireControl {
             // 原任务回队首重派 (锁定装药提升到 MinimumCharge 能打到), 膛内平射退掉 — 旧锁定重装 = 再超界死循环.
             // 齐射: 双炮同装药同距离, 超界必双炮同时 — 双炮一起退弹, 任务 (单 task 双槽) 回队首, 双空闲后自动重挂齐射.
             // 槽位比较挡住 foreach 元组里的旧 task 引用 (首炮触发后第二炮迭代再触发的重复 DUMP)
-            if (!task.Dump && (isL ? _taskL == task : _taskR == task) && gun.Action == GunAction.Trak && charge > 0 && elev > 60f) {
+            if (!task.Dump && (isL ? _gL.Task == task : _gR.Task == task) && gun.Action == GunAction.Trak && charge > 0 && elev > 60f) {
                 int need = BallisticCalculator.MinimumCharge(dist);
                 if (need > charge) {
                     task.LockedCharge = need;
                     _queue.Insert(0, task);
                     if (task.SalvoPair) {
-                        _taskL = _taskR = null;
+                        _gL.Task = _gR.Task = null;
                         AttachDump(GunL!);
                         AttachDump(GunR!);
                     }
                     else {
-                        if (isL) _taskL = null; else _taskR = null;
+                        if (isL) _gL.Task = null; else _gR.Task = null;
                         AttachDump(gun);
                     }
                     MelonLogger.Msg($"[FC] {(isL ? "L" : "R")}: fc#{task.Id}{(task.SalvoPair ? " SALVO" : "")} TRAK charge {charge} elev {elev:F1}° > 60 → DUMP, re-lock {need}");
                     continue;
                 }
             }
-            task.Angle = angle;
-            task.Distance = dist;
             float T = ShellData.FlightTime(dist, charge); // 解算飞时按实际装药 (与 LeadSolve 同 k — 渲染 T 显示与提前量同源)
-            if (isL) { _solChargeL = charge; _solElevL = elev; _solAngleL = angle; _solDistL = dist; _solTaskL = task; _solAimL = aimKm; _solVL = vKm; _solAL = aKm; _solJL = jKm; _solTL = T; }
-            else { _solChargeR = charge; _solElevR = elev; _solAngleR = angle; _solDistR = dist; _solTaskR = task; _solAimR = aimKm; _solVR = vKm; _solAR = aKm; _solJR = jKm; _solTR = T; }
+            if (isL) { _gL.SolCharge = charge; _gL.SolElev = elev; _gL.SolTask = task; _gL.SolAim = aimKm; _gL.SolV = vKm; _gL.SolA = aKm; _gL.SolJ = jKm; _gL.SolT = T; }
+            else { _gR.SolCharge = charge; _gR.SolElev = elev; _gR.SolTask = task; _gR.SolAim = aimKm; _gR.SolV = vKm; _gR.SolA = aKm; _gR.SolJ = jKm; _gR.SolT = T; }
         }
     }
 
@@ -448,17 +441,17 @@ public class FireControl {
         if (OnFireSolution == null || MapSurfaceRef == null || NestRef == null) return;
         var nestBoard = (Vector2)MapSurfaceRef.InverseTransformPoint(NestRef.position);
         float cell = GeoMap.MapCellSize;
-        foreach (var (gun, task) in new[] { (GunL, _taskL), (GunR, _taskR) }) {
+        foreach (var (gun, task) in new[] { (GunL, _gL.Task), (GunR, _gR.Task) }) {
             if (gun == null) continue;
             bool isL = gun == GunL;
-            var aimKm = isL ? _solAimL : _solAimR;
-            var vKm = isL ? _solVL : _solVR;
-            var aKm = isL ? _solAL : _solAR;
-            var jKm = isL ? _solJL : _solJR;
-            float T = isL ? _solTL : _solTR;
-            bool valid = task != null && !task.Dump && (isL ? _solTaskL : _solTaskR) == task && !float.IsNaN(T)
+            var aimKm = isL ? _gL.SolAim : _gR.SolAim;
+            var vKm = isL ? _gL.SolV : _gR.SolV;
+            var aKm = isL ? _gL.SolA : _gR.SolA;
+            var jKm = isL ? _gL.SolJ : _gR.SolJ;
+            float T = isL ? _gL.SolT : _gR.SolT;
+            bool valid = task != null && !task.Dump && (isL ? _gL.SolTask : _gR.SolTask) == task && !float.IsNaN(T)
                 && vKm.magnitude > 0.0001f   // SRC 模式 (无预瞄): 目标轨迹线/交汇点不 push (DC 隐藏)
-                && !(isL ? _fireL : _fireR); // 击发后冻结: 解算点停住 (继续 push 会前移, 红线终点 = 击发瞬间瞄准点 → 相对滞后)
+                && !(isL ? _gL.Fire : _gR.Fire); // 击发后冻结: 解算点停住 (继续 push 会前移, 红线终点 = 击发瞬间瞄准点 → 相对滞后)
             OnFireSolution(isL ? LeftRight.Left : LeftRight.Right,
                 valid ? task!.Entity?.transform : null,
                 nestBoard + aimKm * cell, // 交汇点 (板面)
@@ -472,7 +465,7 @@ public class FireControl {
     /// <summary>解算 → GC 指令 (受 Manual/Pause 门控): DesiredX 持续输出 + AzimuthSelect; 无任务清 Desired.
     /// 绿十字不归 FC — GC 全权 push (瞄准点/杀伤圈/弹种/AllReady/飞时).</summary>
     private void ApplySolutions() {
-        foreach (var (gun, task) in new[] { (GunL, _taskL), (GunR, _taskR) }) {
+        foreach (var (gun, task) in new[] { (GunL, _gL.Task), (GunR, _gR.Task) }) {
             if (gun == null) continue;
             bool isL = gun == GunL;
             if (task == null) {
@@ -482,26 +475,25 @@ public class FireControl {
             }
             // 派发当帧: 解算快照还是派发前旧任务的 → 跳过本帧, 下一帧 ComputeGunSolutions 刷完再下发
             // (否则旧 charge=0 下发, GC 装 0 包药卡死)
-            if ((isL ? _solTaskL : _solTaskR) != task) continue;
-            int charge = isL ? (int)_solChargeL : (int)_solChargeR;
-            float elev = isL ? _solElevL : _solElevR;
-            float angle = isL ? _solAngleL : _solAngleR;
+            if ((isL ? _gL.SolTask : _gR.SolTask) != task) continue;
+            int charge = isL ? (int)_gL.SolCharge : (int)_gR.SolCharge;
+            float elev = isL ? _gL.SolElev : _gR.SolElev;
             gun.DesiredShell = task.Shell;
             gun.DesiredCharge = charge;
             gun.DesiredElevation = elev;
-            gun.DesiredAzimuth = angle;
-            gun.DesiredDistance = isL ? _solDistL : _solDistR; // 锁定死区动态口径数据源
+            gun.DesiredAzimuth = task.Angle;     // C5: 方位/距离单副本 (task 缓存, SolveOne 回写)
+            gun.DesiredDistance = task.Distance; // 锁定死区动态口径数据源
             gun.DesiredDump = task.Dump; // DUMP 标志: GC 击发自检据此不画落点 (平射)
         }
         // AzimuthSelect: 共享炮塔只能一门炮追 H — 两炮各打各时编号小者优先 (公平轮转);
         // 齐射同目标时双炮都追 (SameTarget 双选)
         GunControl? selected;
-        if (_taskL == null) selected = _taskR != null ? GunR : null;
-        else if (_taskR == null) selected = GunL;
-        else if (SameTarget(_taskL, _taskR)) selected = null; // 双选走 SameTarget 分支
-        else selected = _taskL.Id <= _taskR.Id ? GunL : GunR; // 编号小者优先 (乱序执行 = 重分配编号, 转向权随之走)
-        if (GunL != null) GunL.AzimuthSelect = GunL == selected || (_taskL != null && _taskR != null && SameTarget(_taskL, _taskR));
-        if (GunR != null) GunR.AzimuthSelect = GunR == selected || (_taskL != null && _taskR != null && SameTarget(_taskL, _taskR));
+        if (_gL.Task == null) selected = _gR.Task != null ? GunR : null;
+        else if (_gR.Task == null) selected = GunL;
+        else if (SameTarget(_gL.Task, _gR.Task)) selected = null; // 双选走 SameTarget 分支
+        else selected = _gL.Task.Id <= _gR.Task.Id ? GunL : GunR; // 编号小者优先 (乱序执行 = 重分配编号, 转向权随之走)
+        if (GunL != null) GunL.AzimuthSelect = GunL == selected || (_gL.Task != null && _gR.Task != null && SameTarget(_gL.Task, _gR.Task));
+        if (GunR != null) GunR.AzimuthSelect = GunR == selected || (_gL.Task != null && _gR.Task != null && SameTarget(_gL.Task, _gR.Task));
     }
 
     private static bool SameTarget(FireTask a, FireTask b) => a.Entity == b.Entity;
@@ -554,15 +546,15 @@ public class FireControl {
     /// 齐射走独立仲裁; AutoFire/预定时间 → 击发; PreAiming → 玩家击发后 Fired 收尾.</summary>
     private void FireArbiter() {
         // 齐射: 双炮同任务, 单独仲裁 (两炮都跟稳才确认, 同时解保险, 一次开火)
-        if (_taskL != null && _taskR != null && _taskL == _taskR && _taskL.SalvoPair) {
+        if (_gL.Task != null && _gR.Task != null && _gL.Task == _gR.Task && _gL.Task.SalvoPair) {
             SalvoArbiter();
             return;
         }
         foreach (var (gun, task, armed, side) in new[] {
-                     (GunL, _taskL, _armedL, LeftRight.Left),
-                     (GunR, _taskR, _armedR, LeftRight.Right) }) {
+                     (GunL, _gL.Task, _gL.Armed, LeftRight.Left),
+                     (GunR, _gR.Task, _gR.Armed, LeftRight.Right) }) {
             if (gun == null || task == null) {
-                if (side == LeftRight.Left) { _armedL = false; _confirmedL = false; } else { _armedR = false; _confirmedR = false; }
+                if (side == LeftRight.Left) { _gL.Armed = false; _gL.Confirmed = false; } else { _gR.Armed = false; _gR.Confirmed = false; }
                 continue;
             }
             if (gun.Action == GunAction.Fall) { // GC 自报故障: 撤任务 (骨架; 换炮策略后续)
@@ -579,33 +571,33 @@ public class FireControl {
             if (task.Dump) { // DUMP 占位: 跳过火控卡/五步确认 — AllReady (仰角 0 平射稳定) → 解保险 → 强制击发 (不看 AutoFire/PreAiming)
                 if (!armed && gun.AllReady && gun.Action == GunAction.Trak) {
                     StartCoroutineHost(ArmRoutine(gun, side));
-                    if (side == LeftRight.Left) _armedL = true; else _armedR = true;
+                    if (side == LeftRight.Left) _gL.Armed = true; else _gR.Armed = true;
                     continue;
                 }
                 if (!armed || !gun.AllReady || gun.Action != GunAction.Trak) continue;
-                if (side == LeftRight.Left ? _fireL : _fireR) continue;
+                if (side == LeftRight.Left ? _gL.Fire : _gR.Fire) continue;
                 StartCoroutineHost(FireRoutine(gun, side, task));
-                if (side == LeftRight.Left) _fireL = true; else _fireR = true;
+                if (side == LeftRight.Left) _gL.Fire = true; else _gR.Fire = true;
                 return;
             }
             // 确认前置: 进 TRAK (弹药已装好, 瞄准开始) 即出火控卡+五步确认 — 不等稳定,
             // AllReady 后只剩解保险+击发; 完成才置位 (不靠锁排队), 保证 确认 → 保险 → 击发 顺序
-            bool confirmed = side == LeftRight.Left ? _confirmedL : _confirmedR;
-            bool confirming = side == LeftRight.Left ? _confirmingL : _confirmingR;
+            bool confirmed = side == LeftRight.Left ? _gL.Confirmed : _gR.Confirmed;
+            bool confirming = side == LeftRight.Left ? _gL.Confirming : _gR.Confirming;
             if (!confirmed && !confirming && gun.Action == GunAction.Trak) {
-                if (side == LeftRight.Left) _confirmingL = true; else _confirmingR = true;
+                if (side == LeftRight.Left) _gL.Confirming = true; else _gR.Confirming = true;
                 StartCoroutineHost(ConfirmRoutine(gun, side, task));
             }
             if (!armed && confirmed && gun.AllReady && gun.AzimuthSelect && gun.Action == GunAction.Trak) {
                 StartCoroutineHost(ArmRoutine(gun, side)); // 套上即解保险 (一次性; 卡+确认已前置)
-                if (side == LeftRight.Left) _armedL = true; else _armedR = true;
+                if (side == LeftRight.Left) _gL.Armed = true; else _gR.Armed = true;
                 continue;
             }
             if (!armed || !gun.AllReady || !gun.AzimuthSelect) continue; // 不稳回退: 不开火 (已 Arm 不自动回保险; 已击发由 _fire 锁拦)
-            if (side == LeftRight.Left ? _fireL : _fireR) continue; // 击发已按 (等触发核心击发 + 收尾)
+            if (side == LeftRight.Left ? _gL.Fire : _gR.Fire) continue; // 击发已按 (等触发核心击发 + 收尾)
             if (Mode == FireMode.PreAiming) {
                 if (gun.Fired) { // 玩家击发 (GC HasFired 沿 — 真出膛; 不用 FlyRemaining: 装填期炮表残留值会骗过早收尾) → 收尾; 置位冻结解算 push (见 PushFireSolutions)
-                    if (side == LeftRight.Left) _fireL = true; else _fireR = true;
+                    if (side == LeftRight.Left) _gL.Fire = true; else _gR.Fire = true;
                     StartCoroutineHost(FinishRoutine(gun, side, task));
                 }
                 continue;
@@ -616,20 +608,17 @@ public class FireControl {
                 if (float.IsNaN(now) || now + gun.FlyTime < task.PlannedStrikeTime) continue;
             }
             StartCoroutineHost(FireRoutine(gun, side, task));
-            if (side == LeftRight.Left) _fireL = true; else _fireR = true;
+            if (side == LeftRight.Left) _gL.Fire = true; else _gR.Fire = true;
             return; // 一击发后本帧不再仲裁另一炮
         }
     }
 
-    private bool _dumpStuckL, _dumpStuckR; // DUMP 占位全哑 (膛内哑弹打不掉): 挂起该炮不再派发, Manual/Stop 复位
     private bool _salvoArming; // 齐射解保险进行中 (只启动一次)
     private bool _salvoConfirming, _salvoConfirmed; // 齐射火控卡+五步确认前置: 进行中/已完成
-    private bool _confirmingL, _confirmedL;          // 左炮确认前置
-    private bool _confirmingR, _confirmedR;          // 右炮确认前置
 
     /// <summary>齐射仲裁: 双炮进 TRAK → 卡+五步确认 (前置); 双炮都 AllReady → 同时解保险 → 一次开火; 任一不稳/已击发 → 不动.</summary>
     private void SalvoArbiter() {
-        var task = _taskL!;
+        var task = _gL.Task!;
         if (GunL == null || GunR == null) return;
         if (GunL.Action == GunAction.Fall || GunR.Action == GunAction.Fall) {
             MelonLogger.Error($"[FC] salvo: gun FALL, cancel fc#{task.Id}");
@@ -650,13 +639,13 @@ public class FireControl {
             _salvoConfirming = true;
             StartCoroutineHost(SalvoConfirmRoutine(task));
         }
-        if (!_armedL || !_armedR) {
+        if (!_gL.Armed || !_gR.Armed) {
             if (!bothReady || _salvoArming || !_salvoConfirmed) return; // 等两个都跟稳 (不能等一个); 确认没跑完不解保险 (防抢锁乱序)
             _salvoArming = true;
             StartCoroutineHost(SalvoArmRoutine(task));
             return;
         }
-        if (!bothReady || _fireL || _fireR) return; // armed 后不稳/已按 → 等收尾 (已击发由 _fire 锁拦)
+        if (!bothReady || _gL.Fire || _gR.Fire) return; // armed 后不稳/已按 → 等收尾 (已击发由 _fire 锁拦)
         if (Mode == FireMode.PreAiming) {
             if ((GunL != null && GunL.Fired) || (GunR != null && GunR.Fired))
                 StartCoroutineHost(FinishRoutine(GunL!, LeftRight.Left, task)); // 玩家击发 (任一炮 GC HasFired 沿 — 真出膛) → 收尾
@@ -668,7 +657,7 @@ public class FireControl {
             if (float.IsNaN(now) || now + GunL.FlyTime < task.PlannedStrikeTime) return;
         }
         StartCoroutineHost(FireRoutine(GunL, LeftRight.Left, task));
-        _fireL = _fireR = true; // 齐射一击发锁双炮 (触发核心击发前防连点)
+        _gL.Fire = _gR.Fire = true; // 齐射一击发锁双炮 (触发核心击发前防连点)
     }
 
     /// <summary>齐射确认前置: 双炮进 TRAK 即出火控卡+五步确认 (瞄准过程中, 不等稳定); 完成才置位, 解保险靠 _salvoConfirmed 门.</summary>
@@ -684,7 +673,7 @@ public class FireControl {
                 yield return ConsolePort.ConfirmElevation();
                 yield return ConsolePort.ReadyToFire();
                 // 任务可能在确认途中被撤 (RequestCancel 已清 confirmed): 只有任务还在炮上才置位, 防残留
-                if (_taskL == task || _taskR == task) {
+                if (_gL.Task == task || _gR.Task == task) {
                     _salvoConfirmed = true;
                     MelonLogger.Msg($"[FC] salvo: confirmed fc#{task.Id}");
                 }
@@ -701,8 +690,8 @@ public class FireControl {
             yield return FireLock.Acquire();
             try {
                 yield return ConsolePort.ArmBoth();
-                if (_taskL == task || _taskR == task) {
-                    _armedL = _armedR = true;
+                if (_gL.Task == task || _gR.Task == task) {
+                    _gL.Armed = _gR.Armed = true;
                     MelonLogger.Msg($"[FC] salvo: armed fc#{task.Id}");
                 }
             }
@@ -725,15 +714,15 @@ public class FireControl {
                 yield return ConsolePort.ConfirmElevation();
                 yield return ConsolePort.ReadyToFire();
                 // 任务可能在确认途中被撤 (RequestCancel 已清 confirmed): 只有任务还在炮上才置位, 防残留
-                if ((side == LeftRight.Left ? _taskL : _taskR) == task) {
-                    if (side == LeftRight.Left) _confirmedL = true; else _confirmedR = true;
+                if ((side == LeftRight.Left ? _gL.Task : _gR.Task) == task) {
+                    if (side == LeftRight.Left) _gL.Confirmed = true; else _gR.Confirmed = true;
                     MelonLogger.Msg($"[FC] {side}: confirmed fc#{task.Id}");
                 }
             }
             finally { FireLock?.Release(); }
         }
         finally {
-            if (side == LeftRight.Left) _confirmingL = false; else _confirmingR = false;
+            if (side == LeftRight.Left) _gL.Confirming = false; else _gR.Confirming = false;
         }
     }
 
@@ -743,7 +732,7 @@ public class FireControl {
         yield return FireLock.Acquire();
         try {
             yield return ConsolePort.Arm(side);
-            MelonLogger.Msg($"[FC] {side}: armed fc#{(side == LeftRight.Left ? _taskL : _taskR)?.Id}");
+            MelonLogger.Msg($"[FC] {side}: armed fc#{(side == LeftRight.Left ? _gL.Task : _gR.Task)?.Id}");
         }
         finally { FireLock?.Release(); }
     }
@@ -755,8 +744,8 @@ public class FireControl {
         try {
             // 开火对账 (定位"打歪"用): 设定值 vs 实际指向 + 解算交汇点/飞时 (落点与目标轨迹对账)
             bool isL = side == LeftRight.Left;
-            var aimKm = isL ? _solAimL : _solAimR;
-            float T = isL ? _solTL : _solTR;
+            var aimKm = isL ? _gL.SolAim : _gR.SolAim;
+            float T = isL ? _gL.SolT : _gR.SolT;
             MelonLogger.Msg($"[FC] {side}: FIRE pressed E: desired={gun.DesiredElevation:F2} actual={gun.Elevation:F2} | A: desired={gun.DesiredAzimuth:F1} actual={gun.Azimuth:F1} | aim=({aimKm.x:F2},{aimKm.y:F2})km T={T:F2}s");
             FcsBus.Fire?.Invoke(); // 击发钮全局一个: 齐射一按两炮齐
         }
@@ -801,7 +790,7 @@ public class FireControl {
         if (!confirmed) {
             MelonLogger.Error($"[FC] {side}: gun did not fire after 3 attempts, cancel fc#{task.Id}");
             if (task.Dump) { // DUMP 哑弹 (膛内弹打不掉): 挂起该炮防 DUMP 死循环, 交 Manual 人工处理
-                if (side == LeftRight.Left) _dumpStuckL = true; else _dumpStuckR = true;
+                if (side == LeftRight.Left) _gL.DumpStuck = true; else _gR.DumpStuck = true;
                 MelonLogger.Error($"[FC] {side}: DUMP misfire — gun suspended until Manual/Stop");
             }
             RequestCancel(task);
@@ -812,7 +801,7 @@ public class FireControl {
     }
 
     private void FinishTask(LeftRight side, FireTask task, GunControl? gun) {
-        if ((side == LeftRight.Left ? _taskL : _taskR) != task) return; // 已收尾过
+        if ((side == LeftRight.Left ? _gL.Task : _gR.Task) != task) return; // 已收尾过
         if (gun == null) return;
         task.LockedCharge = -1; // 装药冻结随任务生命周期走
         if (!task.Dump) { // DUMP 占位不进完成队列 (内部退弹不是打击任务)
@@ -823,12 +812,12 @@ public class FireControl {
             if (_finished.Count > 8) _finished.RemoveAt(0);
         }
         MelonLogger.Msg($"[FC] {side}: {(task.Dump ? "DUMP done (chamber cleared)" : $"finished fc#{task.Id} (fly={gun.FlyTime:F2}s)")}");
-        if (side == LeftRight.Left) _taskL = null; else _taskR = null;
-        _armedL = _armedR = false;
-        _confirmedL = _confirmedR = _salvoConfirmed = false;
-        _fireL = _fireR = false;
-        if (GunL != null && _taskL == null) { GunL.DesiredShell = (BulletType)(-1); GunL.DesiredCharge = -1; }
-        if (GunR != null && _taskR == null) { GunR.DesiredShell = (BulletType)(-1); GunR.DesiredCharge = -1; }
+        if (side == LeftRight.Left) _gL.Task = null; else _gR.Task = null;
+        _gL.Armed = _gR.Armed = false;
+        _gL.Confirmed = _gR.Confirmed = _salvoConfirmed = false;
+        _gL.Fire = _gR.Fire = false;
+        if (GunL != null && _gL.Task == null) { GunL.DesiredShell = (BulletType)(-1); GunL.DesiredCharge = -1; }
+        if (GunR != null && _gR.Task == null) { GunR.DesiredShell = (BulletType)(-1); GunR.DesiredCharge = -1; }
         ClearSyncIfAlone();
     }
 
