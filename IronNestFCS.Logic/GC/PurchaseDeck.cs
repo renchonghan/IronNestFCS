@@ -58,7 +58,7 @@ public class PurchaseDeck {
                 GetLeftRightDial().SetDialValue(1);
                 break;
         }
-        yield return FcsSceneInteractor.WaitAndClick(_buyButton);
+        yield return UiClick.WaitAndClick(_buyButton);
         yield return new WaitForSeconds(2f);
     }
 
@@ -71,7 +71,7 @@ public class PurchaseDeck {
         _powderCard.GetComponent<DraggableItem>().MoveToSlot();
         // 与 BuyShell 一致: 等卡牌入槽稳定后再点购买, 避免点击早于入槽导致本次采购无效
         yield return new WaitForSeconds(0.5f);
-        yield return FcsSceneInteractor.WaitAndClick(_buyButton);
+        yield return UiClick.WaitAndClick(_buyButton);
         yield return new WaitForSeconds(2f);
     }
     

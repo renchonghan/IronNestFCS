@@ -55,7 +55,7 @@
 - **扫描** (1~3s): Fire Mission Root 子节点 + 根层 Enemy/Tgt_ 名字兜底; EntityLocation 分类 (敌/友/中立三态, 类型 FDC/炮兵/装甲/AA/参考点, 装甲值), 阵亡排除 (EnemyKillTokens 击杀令牌不报)。
 - **粗跟** (25fps): 已知目标位置刷新 + 每 10 帧存活快查。
 
-输出 `SrcContact` 列表: Entity 句柄/WorldPos/Side/Kind/Armour。分类静态方法复用旧 TacticalRadar (待收编)。
+输出 `SrcContact` 列表: Entity 句柄/WorldPos/Side/Kind/Armour。实体分类工具 (IsUnitAlive/GetArmour/GetIcon) 收编自旧 TacticalRadar。
 
 ### 2.2 [DC_U] DisplayControl (`DC/DisplayControl.cs`)
 
@@ -248,7 +248,7 @@ DC 侧持 Flight 引用后**直读字段** (Remain/Landed), 不逐帧传导 (统
 - **C4**: `UpdateQueueSolutions` 与 `ComputeGunSolutions` 解算代码两份 → 抽 `SolveOne`。
 - **C5**: 解算存储双副本 (task.Angle/Distance/AimBoard vs `_solXxxL/R` 快照) → 合并。
 - **C8**: FC 内 L/R 成对字段手写 (6 对 sol + armed/confirmed/fire/dumpStuck) → PerGun struct。
-- **未实现项**: Priority 派发 (字段存在但派发不排序); 旧代码清退 (FSC.cs/MapTable/FcsWindow/TacticalRadar/FcsSceneInteractor — FcsSceneInteractor.WaitAndClick 仍被活跃代码用, TacticalRadar 静态方法被 Radar 复用; 等 2.0 全流程跑稳再清)。
+- **未实现项**: Priority 派发 (字段存在但派发不排序)。
 - **探针残留**: UserData/IronNestFCS/ 下 clock_probe*.txt + radar_log.txt (~100MB) 可删。
 
 ### 5.3 已知局限 (设计取舍)
@@ -283,15 +283,17 @@ DC 侧持 Flight 引用后**直读字段** (Remain/Landed), 不逐帧传导 (统
 
 ---
 
-## 7. 迁移清单 (旧层清退)
+## 7. 旧层清退 (已完成 2026-09-06)
 
-| 旧件 | 状态 |
+| 旧件 | 处置 |
 | --- | --- |
-| FSC.cs (旧调度) | LegacyDisabled=true, 只留硬件绑定 — 待删 |
-| MapTable.cs | 仅被旧层引用 — 待删 (Glyph16Font/GeoMap 已抽出) |
-| FcsWindow.cs | 旧 IMGUI — 待删 (FcsHud 替代) |
-| TacticalRadar.cs | 静态分类方法被 Radar 复用 — 收编后删 |
-| FcsSceneInteractor.cs | WaitAndClick 被 TriggerConsole/GunSystem/PurchaseDeck 用 — 移到 Shared 后删 |
+| FSC.cs (旧调度) | 重写为纯硬件绑定壳 (42 行: 炮/炮塔/击发台/计算台绑定, 调度/标记/交互/补药/超时监控全删) |
+| MapTable.cs | 已删 (Glyph16Font/GeoMap 已提前抽出) |
+| FcsWindow.cs | 已删 (FcsHud 替代) |
+| TacticalRadar.cs | 已删 (IsUnitAlive/GetArmour/GetIcon 收编进 Radar.cs) |
+| FcsSceneInteractor.cs | 已删 (WaitAndClick 移 Shared/UiClick.cs, TriggerConsole/GunSystem/PurchaseDeck 改接) |
+| ArtilleryTask.cs | 已删 (只被旧调度用) |
+| TrackAxis.cs | **保留** — GunControl 跟踪稳定器活跃依赖 (清退时误删, git 恢复) |
 | GunSystem.cs | **活跃硬件驱动** (GunControl 全量依赖), 非旧层 — 名字带 System 易误判, 注释已标 |
 
-清退顺序建议: FcsWindow → MapTable → FSC 壳 → FcsSceneInteractor (WaitAndClick 搬 Shared) → TacticalRadar (静态方法收编 Radar)。
+清退后全项目 build 0 错误 0 警告 (Logic.csproj PlatformTarget=x64 消 MSB3270)。

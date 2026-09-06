@@ -50,7 +50,7 @@ public class GunSystem {
     private OdometerDisplay? remainingCharges;
     private OdometerDisplay? selectedCharges;
 
-    private TextMeshPro shellId;
+    private TextMeshPro shellId = null!; // 绑定后非空 (TryBind 失败不读)
 
     public bool TryBind(string surfix) {
         this._surfix = surfix;
@@ -232,7 +232,7 @@ public class GunSystem {
     /// <summary>按推弹按钮把炮弹送上推弹架 (面板 2-1 DLRD 阶段).</summary>
     public IEnumerator PressRammer() {
         yield return WaitForReloadReady();
-        yield return FcsSceneInteractor.WaitAndClick(loadBulletButton!);
+        yield return UiClick.WaitAndClick(loadBulletButton!);
     }
 
     /// <summary>按完推弹按钮后等推弹机启动 (装填状态机进入 ShellRamming), 10 秒兜底.</summary>
@@ -257,7 +257,7 @@ public class GunSystem {
                     yield break;
                 }
             }
-            yield return FcsSceneInteractor.WaitAndClick(powderButtons[i]);
+            yield return UiClick.WaitAndClick(powderButtons[i]);
         }
     }
 
@@ -318,7 +318,7 @@ public class GunSystem {
                 yield break;
             }
         }
-        yield return FcsSceneInteractor.WaitAndClick(loadPowderButton);
+        yield return UiClick.WaitAndClick(loadPowderButton);
     }
 
     public bool HaveBulletInCylinder(BulletType type) {
@@ -359,7 +359,7 @@ public class GunSystem {
     }
     
     public int RemainingCharges() {
-        return (int)remainingCharges.CurrentNumber;
+        return remainingCharges != null ? (int)remainingCharges.CurrentNumber : 0;
     }
 
     /// <summary>实装药包数 (P4 推入确认后生效, 之前为 0). 弹种保护状态机的关键输入.</summary>

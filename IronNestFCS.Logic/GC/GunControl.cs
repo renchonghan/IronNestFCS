@@ -621,7 +621,6 @@ public class GunControl {
     public float LastElevationSet = float.NaN;
     private string _lastChamberLive = ""; // 最后非空膛内弹活读 (击发瞬间膛已空, 弹种用它 — 开火按最后一次落点指示走)
     private Vector2 _lastAimLive;         // CanFire 期间每帧更新的瞄准点 (板面坐标; 击发瞬间冻结 — 开火后游戏把落点标记拉回铁巢, 不能跟进)
-    private bool _hasAimLive;
 
     /// <summary>每帧 push 实时弹道指示器数据给 DC (GC 全权: 瞄准点/杀伤圈/弹种/AllReady/飞时).
     /// 瞄准点每帧都传真实值 (弹种 -1 只管绿十字显隐, DC 侧瞄准点缓存必须跟着炮走 —
@@ -642,7 +641,6 @@ public class GunControl {
         float by = GeoMap.MapBottomLeft.y + g.y * GeoMap.MapCellSize;
         if (CanFire) { // 只在装填完成期间跟进 — 击发后游戏把标记拉回铁巢, 冻结住开火前最后落点
             _lastAimLive = new Vector2(bx, by);
-            _hasAimLive = true;
         }
         OnBallisticPush?.Invoke(_side,
             bx, by,

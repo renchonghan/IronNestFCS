@@ -70,22 +70,22 @@ public class TriggerConsole {
     }
     
     public IEnumerator ConfirmTask() {
-        yield return FcsSceneInteractor.WaitAndClick(_taskCheck);
+        yield return UiClick.WaitAndClick(_taskCheck);
     }
 
     public IEnumerator ConfirmBullet() {
-        yield return FcsSceneInteractor.WaitAndClick(_bulletCheck);
+        yield return UiClick.WaitAndClick(_bulletCheck);
     }
 
     public IEnumerator ConfirmRotation() {
-        yield return FcsSceneInteractor.WaitAndClick(_rotationCheck);
+        yield return UiClick.WaitAndClick(_rotationCheck);
     }
 
     public IEnumerator ConfirmElevation() {
-        yield return FcsSceneInteractor.WaitAndClick(_elevationCheck);
+        yield return UiClick.WaitAndClick(_elevationCheck);
     }
 
     public IEnumerator ReadyToFire() {
-        yield return FcsSceneInteractor.WaitAndClick(_readyFire);
+        yield return UiClick.WaitAndClick(_readyFire);
     }
 }
