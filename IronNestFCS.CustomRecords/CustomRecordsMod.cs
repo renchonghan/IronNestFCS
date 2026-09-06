@@ -96,7 +96,7 @@ public class CustomRecordsMod : MelonMod
     ///    过早创建会被 Drag Surface 系统初始化时收编（inactive + 位置重置，导致盘"消失"）；
     /// 5) 宽限期后兜底：桌面盘优先（避免选到 Barbet/Delivery Guy 等位置的装饰竖盘）→ 任意命名盘。
     /// </summary>
-    private GameObject FindRecordDiskTemplate()
+    private GameObject? FindRecordDiskTemplate()
     {
         var exact = GameObject.Find("RecordDisk");
         if (exact != null)
@@ -120,7 +120,7 @@ public class CustomRecordsMod : MelonMod
             }
         }
 
-        GameObject surface = null, surfaceVisible = null, named = null, namedVisible = null, any = null;
+        GameObject? surface = null, surfaceVisible = null, named = null, namedVisible = null, any = null;
         foreach (var item in items)
         {
             var go = item.gameObject;

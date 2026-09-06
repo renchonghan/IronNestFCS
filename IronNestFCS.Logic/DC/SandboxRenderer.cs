@@ -407,8 +407,12 @@ public class SandboxRenderer {
         im.BulletRoot.SetActive(true);
         im.CircleRoot.SetActive(true);
         // 目标轨迹线: 击发 → 火控线参数转移给最终线 (冻结, 倒计时驱动缩短), 火控线立即释放 (下个任务解算接管).
-        // 不看 activeSelf: 击发后 FC push 冻结已把线隐藏, 数据仍在
-        if (_tracks.TryGetValue(side, out var tr) && tr.Root != null && tr.Target != null && MapSurfaceRef != null) {
+        // 不看 activeSelf: 击发后 FC push 冻结已把线隐藏, 数据仍在.
+        // 转移校验: ① LastValid 3s 窗口 — 静态目标无预瞄 (v=0) 不 push, tr 里是上一发 (假目标) 的旧参数, 超窗拒转移
+        // (真目标开火不再把假目标轨迹复活成最终线); ② 参数有效性 — 交汇点非 NaN 且飞时为正
+        if (_tracks.TryGetValue(side, out var tr) && tr.Root != null && tr.Target != null && MapSurfaceRef != null
+            && Time.time - tr.LastValid < 3f
+            && !float.IsNaN(tr.AimBoard.x) && tr.T0 > 0f) {
             var fin = EnsureTrack(_finals, side);
             fin.Target = tr.Target;
             fin.AimBoard = tr.AimBoard;
@@ -513,6 +517,7 @@ public class SandboxRenderer {
         tr.ABoard = aBoard;
         tr.JBoard = jBoard;
         tr.T0 = T;
+        tr.LastValid = Time.time; // 最后有效解算时间戳 (ImpactFired 转移校验: 旧任务残留参数不复活最终线)
         tr.Root.SetActive(true);
     }
 
@@ -639,25 +644,30 @@ public class SandboxRenderer {
         };
         // 尺寸归一: 板面单位 = 实体单位 × SurfScale (实体/令牌视觉同款大小)
         DrawIcon(root.transform, t.Kind, color, SurfScale, t.Armour);
-        // 速度矢量符 (战雷 TTS 同款): 目标中心往下 0.15 格 — 空心圆 (半径 SpeedR) + 速度方向线 (对数长度, 自圆周起) / 静止点
-        var speedRoot = new GameObject("FCS2_SpeedVec");
-        speedRoot.transform.SetParent(root.transform, false);
-        speedRoot.transform.localPosition = new Vector3(0f, -0.15f * GeoMap.MapCellSize, 0f);
-        var circleRoot = new GameObject("FCS2_SpeedCircle");
-        circleRoot.transform.SetParent(speedRoot.transform, false);
-        const float spdW = 0.005f / 3f; // 线宽 (用户定稿: 原 0.005 取 1/3)
-        const int spdSegs = 24;
-        for (int i = 0; i < spdSegs; i++) {
-            float a0 = i * 2f * Mathf.PI / spdSegs, a1 = (i + 1) * 2f * Mathf.PI / spdSegs;
-            Line(circleRoot.transform, new Vector2(Mathf.Cos(a0), Mathf.Sin(a0)) * SpeedR,
-                new Vector2(Mathf.Cos(a1), Mathf.Sin(a1)) * SpeedR, spdW, color, RedPrio);
+        // 速度矢量符 (战雷 TTS 同款): 目标中心往下 0.15 格 — 空心圆 (半径 SpeedR) + 速度方向线 (对数长度, 自圆周起) / 静止点.
+        // 参考点不画 (地图元素非目标, 无速度语义)
+        GameObject? speedRoot = null, circleRoot = null, dotRoot = null;
+        Il2CppShapes.Line? line = null;
+        if (t.Kind != EntityKind.Reference) {
+            speedRoot = new GameObject("FCS2_SpeedVec");
+            speedRoot.transform.SetParent(root.transform, false);
+            speedRoot.transform.localPosition = new Vector3(0f, -0.15f * GeoMap.MapCellSize, 0f);
+            circleRoot = new GameObject("FCS2_SpeedCircle");
+            circleRoot.transform.SetParent(speedRoot.transform, false);
+            const float spdW = 0.005f / 3f; // 线宽 (用户定稿: 原 0.005 取 1/3)
+            const int spdSegs = 24;
+            for (int i = 0; i < spdSegs; i++) {
+                float a0 = i * 2f * Mathf.PI / spdSegs, a1 = (i + 1) * 2f * Mathf.PI / spdSegs;
+                Line(circleRoot.transform, new Vector2(Mathf.Cos(a0), Mathf.Sin(a0)) * SpeedR,
+                    new Vector2(Mathf.Cos(a1), Mathf.Sin(a1)) * SpeedR, spdW, color, RedPrio);
+            }
+            dotRoot = new GameObject("FCS2_SpeedDot");
+            dotRoot.transform.SetParent(speedRoot.transform, false);
+            FillDot(dotRoot.transform, Vector2.zero, SpeedDotR, color, RedPrio);
+            line = Line(speedRoot.transform, Vector2.zero, new Vector2(SpeedR, 0f), spdW, color, RedPrio);
         }
-        var dotRoot = new GameObject("FCS2_SpeedDot");
-        dotRoot.transform.SetParent(speedRoot.transform, false);
-        FillDot(dotRoot.transform, Vector2.zero, SpeedDotR, color, RedPrio);
-        var line = Line(speedRoot.transform, Vector2.zero, new Vector2(SpeedR, 0f), spdW, color, RedPrio);
         _icons[t.Entity] = new IconEntry {
-            Root = root, Target = t, SpeedRoot = speedRoot, CircleRoot = circleRoot, DotRoot = dotRoot, SpeedLine = line,
+            Root = root, Target = t, SpeedRoot = speedRoot!, CircleRoot = circleRoot!, DotRoot = dotRoot!, SpeedLine = line!,
         };
     }
 
@@ -881,6 +891,7 @@ public class SandboxRenderer {
     /// 最终线 = 击发时参数转移冻结 (终点 = 交汇点), 沿冻结曲线缩短 (倒计时驱动), 缩没 = 落地 (细粒度虚线).
     /// dash 段数按曲线弧长/周期动态铺 (32 短线池每帧只动端点, 多余隐藏).</summary>
     private class TrackIndicator {
+        public float LastValid; // 最后有效解算时间戳 (转移校验: 旧任务残留不复活最终线)
         public GameObject Root = null!;
         public GameObject DashRoot = null!;
         public GameObject DotRoot = null!;
