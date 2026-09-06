@@ -197,7 +197,8 @@ public class FireControl {
             Vector2 dir = new(Mathf.Sin(angle * Mathf.Deg2Rad), Mathf.Cos(angle * Mathf.Deg2Rad));
             Vector2 aimKm = dir * dist; // 直瞄: 交汇点 = 目标位置
             if (target.Velocity.magnitude > 0.0001f) {
-                var (ld, la, aim) = LeadSolve(dist, angle, target.Velocity, target.Accel, target.Jerk);
+                int charge = ChargeOf(t, dist); // 队列显示解算: 按当前距离解析装药 (派发时重解, 提前量 k 按装药)
+                var (ld, la, aim) = LeadSolve(dist, angle, target.Velocity, target.Accel, target.Jerk, charge);
                 dist = ld;
                 angle = la;
                 aimKm = aim;
@@ -375,8 +376,31 @@ public class FireControl {
             Vector2 p0 = dir * dist;
             Vector2 aimKm = p0;
             Vector2 vKm = target.Velocity, aKm = target.Accel, jKm = target.Jerk; // TWS 轨迹参数直读 (TWS 关 = 零, 自然直瞄)
+            float origDist = dist, origAngle = angle;
+            // 装药冻结: 派发帧锁存一次 (初始解析), 之后不再重解析 — 目标运动/距离变化不改变装填计划
+            // (每帧重解析会让 DesiredCharge 中途变卦: 装填链换药 COFM 报错 / 膛内药数与仰角解算脱节打飞)
+            // 锁定先于 LeadSolve: 提前量的 k (飞时斜率) 按实际装药 — 满装药近似会让提前量按最短飞时算,
+            // 低装药实弹飞时长 → 提前量不足 → 炮弹落在移动目标身后 (N 装药落点滞后事故)
+            bool liveMatches = false;
+            if (task.LockedCharge < 0) {
+                // 实装匹配 (GC 见膛内对弹对药直接打, 不重装) → 锁膛内实际药数 (仰角必须按实际打); 否则锁 FC 解析 (GC 按它装)
+                liveMatches = !task.SalvoPair && LoadoutMatches(gun, task) && gun.ChargesLive > 0;
+                // 齐射: 双炮膛内都是对弹且药数相同才沿用膛内, 否则统一按解析重装 (相位同步按左炮数据走, 药数不同会打飞)
+                if (!liveMatches && task.SalvoPair && GunL != null && GunR != null
+                    && LoadoutMatches(GunL, task) && LoadoutMatches(GunR, task)
+                    && GunL.ChargesLive == GunR.ChargesLive && GunL.ChargesLive > 0) liveMatches = true;
+                task.LockedCharge = liveMatches ? gun.ChargesLive : ChargeOf(task, dist);
+                MelonLogger.Msg($"[FC] {(isL ? "L" : "R")}: fc#{task.Id} charge locked = {task.LockedCharge}");
+                // 锁定帧精化一次: 按预瞄距离跨装药档重锁. 只此一次 — 后续帧只 LeadSolve, 装药不再动
+                // (精化放锁定块外会被目标运动反复触发: LockedCharge 每帧改写 → k 跳变 → TRAK 中提前量突变)
+                if (!liveMatches && vKm.magnitude > 0.0001f) {
+                    var (ld, _, _) = LeadSolve(origDist, origAngle, vKm, aKm, jKm, task.LockedCharge);
+                    int refined = ChargeOf(task, ld);
+                    if (refined != task.LockedCharge) task.LockedCharge = refined;
+                }
+            }
             if (vKm.magnitude > 0.0001f) {
-                var (ld, la, aim) = LeadSolve(dist, angle, vKm, aKm, jKm); // 提前量解析解 (三次轨迹曲线)
+                var (ld, la, aim) = LeadSolve(origDist, origAngle, vKm, aKm, jKm, task.LockedCharge); // 提前量解析解 (三次轨迹曲线, k 按锁定装药)
                 dist = ld; angle = la; aimKm = aim;
             }
             Vector2 nestBoard = MapSurfaceRef != null && NestRef != null ? (Vector2)MapSurfaceRef.InverseTransformPoint(NestRef.position) : Vector2.zero;
@@ -384,26 +408,37 @@ public class FireControl {
             task.AimBoard = vKm.magnitude > 0.0001f
                 ? nestBoard + aimKm * GeoMap.MapCellSize
                 : new Vector2(float.NaN, float.NaN);
-            // 装药冻结: 派发帧锁存一次 (初始解析), 之后不再重解析 — 目标运动/距离变化不改变装填计划
-            // (每帧重解析会让 DesiredCharge 中途变卦: 装填链换药 COFM 报错 / 膛内药数与仰角解算脱节打飞)
-            if (task.LockedCharge < 0) {
-                // 实装匹配 (GC 见膛内对弹对药直接打, 不重装) → 锁膛内实际药数 (仰角必须按实际打); 否则锁 FC 解析 (GC 按它装)
-                bool liveMatches = !task.SalvoPair && LoadoutMatches(gun, task) && gun.ChargesLive > 0;
-                // 齐射: 双炮膛内都是对弹且药数相同才沿用膛内, 否则统一按解析重装 (相位同步按左炮数据走, 药数不同会打飞)
-                if (!liveMatches && task.SalvoPair && GunL != null && GunR != null
-                    && LoadoutMatches(GunL, task) && LoadoutMatches(GunR, task)
-                    && GunL.ChargesLive == GunR.ChargesLive && GunL.ChargesLive > 0) liveMatches = true;
-                task.LockedCharge = liveMatches ? gun.ChargesLive : ChargeOf(task, dist);
-                MelonLogger.Msg($"[FC] {(isL ? "L" : "R")}: fc#{task.Id} charge locked = {task.LockedCharge}");
-            }
             // 后续弹道用 GC 回报数据: 装填完成 (TRAK) 后膛内实际药数是唯一真值 (计划与实际不符时按实际打);
             // 装填中 ChargesLive 还是旧膛内值, 用锁存 (与 DesiredCharge 一致)
             int charge = gun.Action == GunAction.Trak && gun.ChargesLive > 0 ? gun.ChargesLive : task.LockedCharge;
+            float elev = ShellData.ElevationDeg(dist, charge);
+            // TRAK 按实际装药解算; 仰角超 60° (射表每段末端 = 射界上限) → 强制 DUMP:
+            // 原任务回队首重派 (锁定装药提升到 MinimumCharge 能打到), 膛内平射退掉 — 旧锁定重装 = 再超界死循环.
+            // 齐射: 双炮同装药同距离, 超界必双炮同时 — 双炮一起退弹, 任务 (单 task 双槽) 回队首, 双空闲后自动重挂齐射.
+            // 槽位比较挡住 foreach 元组里的旧 task 引用 (首炮触发后第二炮迭代再触发的重复 DUMP)
+            if (!task.Dump && (isL ? _taskL == task : _taskR == task) && gun.Action == GunAction.Trak && charge > 0 && elev > 60f) {
+                int need = BallisticCalculator.MinimumCharge(dist);
+                if (need > charge) {
+                    task.LockedCharge = need;
+                    _queue.Insert(0, task);
+                    if (task.SalvoPair) {
+                        _taskL = _taskR = null;
+                        AttachDump(GunL!);
+                        AttachDump(GunR!);
+                    }
+                    else {
+                        if (isL) _taskL = null; else _taskR = null;
+                        AttachDump(gun);
+                    }
+                    MelonLogger.Msg($"[FC] {(isL ? "L" : "R")}: fc#{task.Id}{(task.SalvoPair ? " SALVO" : "")} TRAK charge {charge} elev {elev:F1}° > 60 → DUMP, re-lock {need}");
+                    continue;
+                }
+            }
             task.Angle = angle;
             task.Distance = dist;
-            float T = ShellData.FlightTime(1f, 6) * dist; // 解算飞时 (与 LeadSolve 同 k)
-            if (isL) { _solChargeL = charge; _solElevL = ShellData.ElevationDeg(dist, charge); _solAngleL = angle; _solDistL = dist; _solTaskL = task; _solAimL = aimKm; _solVL = vKm; _solAL = aKm; _solJL = jKm; _solTL = T; }
-            else { _solChargeR = charge; _solElevR = ShellData.ElevationDeg(dist, charge); _solAngleR = angle; _solDistR = dist; _solTaskR = task; _solAimR = aimKm; _solVR = vKm; _solAR = aKm; _solJR = jKm; _solTR = T; }
+            float T = ShellData.FlightTime(dist, charge); // 解算飞时按实际装药 (与 LeadSolve 同 k — 渲染 T 显示与提前量同源)
+            if (isL) { _solChargeL = charge; _solElevL = elev; _solAngleL = angle; _solDistL = dist; _solTaskL = task; _solAimL = aimKm; _solVL = vKm; _solAL = aKm; _solJL = jKm; _solTL = T; }
+            else { _solChargeR = charge; _solElevR = elev; _solAngleR = angle; _solDistR = dist; _solTaskR = task; _solAimR = aimKm; _solVR = vKm; _solAR = aKm; _solJR = jKm; _solTR = T; }
         }
     }
 
@@ -486,8 +521,8 @@ public class FireControl {
     /// 无 fireDelay 补偿: 解算每帧滑动, 出膛瞬间炮指向的就是最新解算, 按钮→出膛延迟 Δ 只是把双方同步平移,
     /// 加补偿反而把 aim 前移 Δ·v 打远.
     /// a/j≈0 走闭式一元二次; 否则数值不动点 8 次. 返回 (瞄准距离 km, 瞄准方位, 瞄准矢量 km 局部系 — 交汇点渲染用).</summary>
-    private static (float dist, float angle, Vector2 aim) LeadSolve(float dist, float angle, Vector2 v, Vector2 a, Vector2 j) {
-        float k = ShellData.FlightTime(1f, 6); // 飞时斜率 (s/km) 与装药弱相关, 骨架先按满装药取
+    private static (float dist, float angle, Vector2 aim) LeadSolve(float dist, float angle, Vector2 v, Vector2 a, Vector2 j, int charge) {
+        float k = ShellData.FlightTime(1f, Mathf.Max(1, charge)); // 飞时斜率 (s/km) 按实际装药 — 满装药近似提前量不足, 移动目标落点滞后
         Vector2 dir = new(Mathf.Sin(angle * Mathf.Deg2Rad), Mathf.Cos(angle * Mathf.Deg2Rad)); // 方位 0°=+y (北) 顺时针
         Vector2 p = dir * dist;
         float r;
@@ -624,7 +659,7 @@ public class FireControl {
         if (!bothReady || _fireL || _fireR) return; // armed 后不稳/已按 → 等收尾 (已击发由 _fire 锁拦)
         if (Mode == FireMode.PreAiming) {
             if ((GunL != null && GunL.Fired) || (GunR != null && GunR.Fired))
-                StartCoroutineHost(FinishRoutine(GunL, LeftRight.Left, task)); // 玩家击发 (任一炮 GC HasFired 沿 — 真出膛) → 收尾
+                StartCoroutineHost(FinishRoutine(GunL!, LeftRight.Left, task)); // 玩家击发 (任一炮 GC HasFired 沿 — 真出膛) → 收尾
             return;
         }
         // 预定打击时间 (与单发同口径, 按主炮左炮飞时)
