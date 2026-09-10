@@ -42,8 +42,8 @@ public class Radar {
     // ===== 信号注入 (测试设施: 模拟 DBF/预处理机柜前端注入的信号源) =====
     // 假目标载体 = 雷达自建空壳 (无渲染, 名字避开扫描兜底与排除词), 信号从雷达输出端 (Contacts) 注入 —
     // 下游 DC 目标表 / TWS 滤波 / 实体图标 / 右键入队 / FC 解算全走正式流程, 与真实目标无差别 (可实际击打).
-    // 代码开关 (不进 UI): 调试完关掉, 避免玩家误触出假目标.
-    public bool SimInject = true;
+    // 代码开关 (不进 UI): 测试设施 — final debug 完成已退役, 再测时改回 true.
+    public bool SimInject = false;
     /// <summary>载体母体 (板面局部系; FcsModule 注入 "Draggable Surface").</summary>
     public Transform? MapSurfaceRef;
     private readonly List<(GameObject Shell, Vector3 VelLocal, Vector3 StartLocal, float StartTime)> _sims = new();
@@ -106,10 +106,13 @@ public class Radar {
         if (IsExcluded(name)) return;
         var loc = t.GetComponent<EntityLocation>();
         if (loc != null) {
+            Side3 side;
+            EntityKind kind;
+            int armour, immune;
             if (!IsUnitAlive(loc, t.gameObject)) return; // 死了不报
-            var side = ClassifySide(loc, name);
-            var kind = ClassifyKind(loc, name);
-            var (armour, immune) = GetArmour(loc);
+            side = ClassifySide(loc, name);
+            kind = ClassifyKind(loc, name);
+            (armour, immune) = GetArmour(loc);
             if (_logFirstScan) {
                 MelonLogger.Msg($"[RD] classify {name}: side={side} kind={kind} armour={armour} immune={immune} icon='{GetIcon(loc)}'");
             }

@@ -6,8 +6,8 @@ using MelonLoader.Utils;
 using UnityEngine;
 using Object = UnityEngine.Object;
 
-[assembly: MelonInfo(typeof(IronNestFCS.CustomRecords.CustomRecordsMod), 
-    "IronNestFCS.CustomRecords", "1.0.3", "svr2kos2")]
+[assembly: MelonInfo(typeof(IronNestFCS.CustomRecords.CustomRecordsMod),
+    "IronNestFCS.CustomRecords", "2.0.0", "svr2kos2, Lancelot_Holland & DeepSeek(TM) V4")]
 [assembly: MelonGame("Iron Nest", "Iron Nest Heavy Turret Simulator")]
 
 namespace IronNestFCS.CustomRecords;

@@ -85,15 +85,17 @@ public class SandboxRenderer {
     /// 数据源 = DC TWS 滤波速度 (板面局部系 km/s, 方向即板面方向); TWS 关 → 速度 0 → 全显示静止点.</summary>
     private static void UpdateSpeedVector(IconEntry e) {
         if (e.SpeedRoot == null) return;
-        var v = e.Target.Velocity;
+        Vector2 v = e.Target.Velocity;
+        Vector2 dir;
         float vMps = v.magnitude * 1000f; // km/s → m/s
+        float len;
         bool moving = vMps >= 1f;
         e.CircleRoot.SetActive(moving);
         e.DotRoot.SetActive(!moving);
         e.SpeedLine.gameObject.SetActive(moving);
         if (!moving) return;
-        float len = Mathf.Clamp(SpeedR * (0.5f + 0.5f * Mathf.Log10(vMps)), 0.5f * SpeedR, 2f * SpeedR);
-        var dir = v / v.magnitude;
+        len = Mathf.Clamp(SpeedR * (0.5f + 0.5f * Mathf.Log10(vMps)), 0.5f * SpeedR, 2f * SpeedR);
+        dir = v / v.magnitude;
         e.SpeedLine.Start = new Vector3(dir.x, dir.y, 0f) * SpeedR;         // 线从圆周起 (不是圆心)
         e.SpeedLine.End = new Vector3(dir.x, dir.y, 0f) * (SpeedR + len);
     }
@@ -649,13 +651,13 @@ public class SandboxRenderer {
         GameObject? speedRoot = null, circleRoot = null, dotRoot = null;
         Il2CppShapes.Line? line = null;
         if (t.Kind != EntityKind.Reference) {
+            const float spdW = 0.005f / 3f; // 线宽 (用户定稿: 原 0.005 取 1/3)
+            const int spdSegs = 24;
             speedRoot = new GameObject("FCS2_SpeedVec");
             speedRoot.transform.SetParent(root.transform, false);
             speedRoot.transform.localPosition = new Vector3(0f, -0.15f * GeoMap.MapCellSize, 0f);
             circleRoot = new GameObject("FCS2_SpeedCircle");
             circleRoot.transform.SetParent(speedRoot.transform, false);
-            const float spdW = 0.005f / 3f; // 线宽 (用户定稿: 原 0.005 取 1/3)
-            const int spdSegs = 24;
             for (int i = 0; i < spdSegs; i++) {
                 float a0 = i * 2f * Mathf.PI / spdSegs, a1 = (i + 1) * 2f * Mathf.PI / spdSegs;
                 Line(circleRoot.transform, new Vector2(Mathf.Cos(a0), Mathf.Sin(a0)) * SpeedR,
