@@ -322,17 +322,17 @@ public class FireControl {
     /// <summary>单任务解算 (C4 统一口径 — 队列显示与在炮真解算同源): 相对方位/距离 → LeadSolve 提前量 (k 按装药) → 交汇点.
     /// 回写 task.Angle/Distance/AimBoard (无预瞄时 AimBoard=NaN 哨兵); 返回 (dist, angle, aimKm, vKm, aKm, jKm) 供快照/下发.</summary>
     private (float dist, float angle, Vector2 aimKm, Vector2 vKm, Vector2 aKm, Vector2 jKm) SolveOne(FireTask task, DcTarget target, int charge) {
+        Vector2 nestBoard = MapSurfaceRef != null && NestRef != null ? (Vector2)MapSurfaceRef.InverseTransformPoint(NestRef.position) : Vector2.zero;
+        Vector2 vKm = target.Velocity, aKm = target.Accel, jKm = target.Jerk; // TWS 轨迹参数直读 (TWS 关 = 零, 自然直瞄)
         var (dist, angle) = RelToTarget(target.WorldPos);
         Vector2 dir = new(Mathf.Sin(angle * Mathf.Deg2Rad), Mathf.Cos(angle * Mathf.Deg2Rad));
         Vector2 aimKm = dir * dist; // 直瞄: 交汇点 = 目标位置
-        var vKm = target.Velocity; var aKm = target.Accel; var jKm = target.Jerk;
         if (vKm.magnitude > 0.0001f) {
             var (ld, la, aim) = LeadSolve(dist, angle, vKm, aKm, jKm, charge);
             dist = ld; angle = la; aimKm = aim;
         }
         task.Angle = angle;
         task.Distance = dist;
-        Vector2 nestBoard = MapSurfaceRef != null && NestRef != null ? (Vector2)MapSurfaceRef.InverseTransformPoint(NestRef.position) : Vector2.zero;
         task.AimBoard = vKm.magnitude > 0.0001f ? nestBoard + aimKm * GeoMap.MapCellSize : new Vector2(float.NaN, float.NaN);
         return (dist, angle, aimKm, vKm, aKm, jKm);
     }
@@ -346,8 +346,10 @@ public class FireControl {
         public bool Fire;            // 击发已按 (Fired latch 前防连点)
         public bool DumpStuck;       // DUMP 全哑挂起 (Manual/Stop 复位)
         public FireTask? SolTask;    // 解算快照对应任务 (派发当帧解算未刷, 应用层据此跳过)
-        public float SolCharge, SolElev, SolT;                       // 解算快照: 装药/仰角/飞时 (HUD 显示 + GC 下发同源)
+        public FireTask? FrozenTask; // 击发真空期锁存对应任务 (换任务自动重快照)
+        public float SolCharge, SolElev, SolT, FrozenT;              // 解算快照: 装药/仰角/飞时 (HUD 显示 + GC 下发同源)
         public Vector2 SolAim, SolV, SolA, SolJ;                     // 解算快照: 交汇点矢量 (km 局部) / 轨迹参数 (km/s, km/s², km/s³)
+        public Vector2 FrozenAim, FrozenV, FrozenA, FrozenJ;         // 击发瞬间解算锁存 (push 用 — 预瞄线/交汇点停住不跟滑)
     }
     private PerGun _gL, _gR;
     /// <summary>火控解算 push (DC 渲染目标轨迹线+交汇点): (side, 目标引用, 交汇点板面, 轨迹速度板面/s, 加速度板面/s², 三次项板面/s³, 飞时秒).
@@ -377,13 +379,13 @@ public class FireControl {
             }
             var target = DcPort?.GetTarget(task.Entity!);
             if (target == null) { RequestCancel(task); continue; } // 目标失效 (阵亡/令牌离图) → 撤任务
-            var (rawDist, rawAngle) = RelToTarget(target.WorldPos);
             Vector2 vKm = target.Velocity, aKm = target.Accel, jKm = target.Jerk; // TWS 轨迹参数直读 (TWS 关 = 零, 自然直瞄)
+            var (rawDist, rawAngle) = RelToTarget(target.WorldPos);
+            bool liveMatches = false;
             // 装药冻结: 派发帧锁存一次 (初始解析), 之后不再重解析 — 目标运动/距离变化不改变装填计划
             // (每帧重解析会让 DesiredCharge 中途变卦: 装填链换药 COFM 报错 / 膛内药数与仰角解算脱节打飞)
             // 锁定先于 SolveOne: 提前量的 k (飞时斜率) 按实际装药 — 满装药近似会让提前量按最短飞时算,
             // 低装药实弹飞时长 → 提前量不足 → 炮弹落在移动目标身后 (N 装药落点滞后事故)
-            bool liveMatches = false;
             if (task.LockedCharge < 0) {
                 // 实装匹配 (GC 见膛内对弹对药直接打, 不重装) → 锁膛内实际药数 (仰角必须按实际打); 否则锁 FC 解析 (GC 按它装)
                 liveMatches = !task.SalvoPair && LoadoutMatches(gun, task) && gun.ChargesLive > 0;
@@ -396,7 +398,7 @@ public class FireControl {
                 // 锁定帧精化一次: 按预瞄距离跨装药档重锁. 只此一次 — 后续帧只 SolveOne, 装药不再动
                 // (精化放锁定块外会被目标运动反复触发: LockedCharge 每帧改写 → k 跳变 → TRAK 中提前量突变)
                 if (!liveMatches && vKm.magnitude > 0.0001f) {
-                    var (ld, _, _) = LeadSolve(rawDist, rawAngle, vKm, aKm, jKm, task.LockedCharge);
+                    float ld = LeadSolve(rawDist, rawAngle, vKm, aKm, jKm, task.LockedCharge).dist;
                     int refined = ChargeOf(task, ld);
                     if (refined != task.LockedCharge) task.LockedCharge = refined;
                 }
@@ -444,14 +446,24 @@ public class FireControl {
         foreach (var (gun, task) in new[] { (GunL, _gL.Task), (GunR, _gR.Task) }) {
             if (gun == null) continue;
             bool isL = gun == GunL;
-            var aimKm = isL ? _gL.SolAim : _gR.SolAim;
-            var vKm = isL ? _gL.SolV : _gR.SolV;
-            var aKm = isL ? _gL.SolA : _gR.SolA;
-            var jKm = isL ? _gL.SolJ : _gR.SolJ;
-            float T = isL ? _gL.SolT : _gR.SolT;
-            bool valid = task != null && !task.Dump && (isL ? _gL.SolTask : _gR.SolTask) == task && !float.IsNaN(T)
-                && vKm.magnitude > 0.0001f   // SRC 模式 (无预瞄): 目标轨迹线/交汇点不 push (DC 隐藏)
-                && !(isL ? _gL.Fire : _gR.Fire); // 击发后冻结: 解算点停住 (继续 push 会前移, 红线终点 = 击发瞬间瞄准点 → 相对滞后)
+            ref var g = ref (isL ? ref _gL : ref _gR);
+            Vector2 aimKm, vKm, aKm, jKm;
+            float T;
+            bool frozen, valid;
+            // 击发真空期锁存: 第一次看到 _fire 置位 → 快照击发瞬间解算; 之后重发快照 —
+            // 预瞄虚线/交汇点停在击发瞬间画面, 不跟解算滑 (炮塔跟踪仍走 ApplySolutions 最新解算, 两路分离)
+            if (g.Fire && g.FrozenTask != task) {
+                g.FrozenTask = task;
+                g.FrozenAim = g.SolAim; g.FrozenV = g.SolV; g.FrozenA = g.SolA; g.FrozenJ = g.SolJ; g.FrozenT = g.SolT;
+            }
+            frozen = g.Fire && g.FrozenTask == task;
+            aimKm = frozen ? g.FrozenAim : g.SolAim;
+            vKm = frozen ? g.FrozenV : g.SolV;
+            aKm = frozen ? g.FrozenA : g.SolA;
+            jKm = frozen ? g.FrozenJ : g.SolJ;
+            T = frozen ? g.FrozenT : g.SolT;
+            valid = task != null && !task.Dump && (isL ? _gL.SolTask : _gR.SolTask) == task && !float.IsNaN(T)
+                && vKm.magnitude > 0.0001f; // SRC 模式 (无预瞄): 目标轨迹线/交汇点不 push (DC 隐藏)
             OnFireSolution(isL ? LeftRight.Left : LeftRight.Right,
                 valid ? task!.Entity?.transform : null,
                 nestBoard + aimKm * cell, // 交汇点 (板面)

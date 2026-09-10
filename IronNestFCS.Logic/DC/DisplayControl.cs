@@ -27,7 +27,8 @@ public class DisplayControl {
 
     // ===== 内部 =====
     private readonly Dictionary<GameObject, DcTarget> _targetMap = new();    // 目标参数表 (对象复用, FC 直读; Entity → 位置/轨迹参数)
-    private readonly Dictionary<GameObject, List<Vector3>> _posHist = new(); // TWS: 75 帧位置环 (所有目标, 定速模型线性滤波)
+    private readonly Dictionary<GameObject, List<(Vector3 pos, float t)>> _posHist = new(); // TWS: 75 帧环 (位置+时刻, 时间回归 — 采样率无关)
+    private readonly Dictionary<GameObject, Vector2> _velEma = new();                     // TWS: 速度输出 EMA 状态 (压静态棋子帧间微抖噪声)
     private readonly HashSet<GameObject> _icons = new();                     // 已挂图标 (差集用)
     private object? _loopHandle;
     private float _lastTick;
@@ -113,15 +114,15 @@ public class DisplayControl {
     }
 
     /// <summary>单目标参数更新/建表: TWS 轨迹参数 (定速模型, 75 帧线性滤波).</summary>
-    private int _trakFrame;
+    private float _lastTrakLog;
     private float _lastTargetLog;
     private void UpsertTarget(GameObject go, string name, Vector3 pos, Side3 side, EntityKind kind, int armour, bool isVirtual) {
         bool onGun = FcPort != null && (FcPort.LeftTask?.Entity == go || FcPort.RightTask?.Entity == go);
         Vector2 vel = Vector2.zero, acc = Vector2.zero, jerk = Vector2.zero;
         if (Tws) (vel, acc, jerk) = TrackMotion(go, pos);
-        // 追踪日志: 上炮目标每 8 帧一条 (探针降频, 本体追踪不动)
-        _trakFrame++;
-        if (onGun && _trakFrame % 8 == 0) {
+        // 追踪日志: 上炮目标 ~0.32s 一条 (时间门控 — 帧计数门控曾因共享计数+目标数奇偶永不命中, 见事故教训)
+        if (onGun && Time.time - _lastTrakLog >= 0.32f) {
+            _lastTrakLog = Time.time;
             MelonLogger.Msg($"[DC] trak {name}: v=({vel.x:F3},{vel.y:F3}) |v|={vel.magnitude:F3}km/s");
         }
         // 目标点对账日志: 上炮目标每秒一条板面位置 (与开火探针的 aim/T 对账: 落地时刻目标在哪 vs 落点在哪)
@@ -154,27 +155,39 @@ public class DisplayControl {
     /// 窗口 75 帧 (3s): 匀速直线拟合精确, 窗口愈长噪声愈低 (LS 斜率噪声 ∝ 1/√N) — 预瞄点 = 目标 + v×T, v 的帧间波动被飞时放大, 长窗口直接压预瞄抖动;
     /// 变速目标天然滞后 1.5s — 定速模型的既定取舍. FC 走 v-only 闭式解, 渲染退化直线.</summary>
     private (Vector2 v, Vector2 a, Vector2 j) TrackMotion(GameObject go, Vector3 pos) {
-        // 位置统一转板面局部系: 实体世界与板面有 ~2 倍缩放差 (surface TransformPoint 缩放),
-        // 差分必须在同尺度 — 3.8164 (km→板面) 是板面口径
-        if (MapSurfaceRef != null) pos = MapSurfaceRef.InverseTransformPoint(pos);
-        if (!_posHist.TryGetValue(go, out var hist)) _posHist[go] = hist = new List<Vector3>();
-        hist.Add(pos);
+        // 差分在世界系做: 板面局部系随 surface 拖动/缩放而变, 静态目标会被误判为移动 (拖地图后一片目标"动"起来);
+        // 世界系固定, 差分才反映目标真实运动. 回归出的世界速度经 InverseTransformDirection 转回板面口径 (下游语义不变)
+        if (!_posHist.TryGetValue(go, out var hist)) _posHist[go] = hist = new List<(Vector3, float)>();
+        hist.Add((pos, Time.time));
         if (hist.Count > 75) hist.RemoveAt(0);
         if (hist.Count < 5) return (Vector2.zero, Vector2.zero, Vector2.zero); // 不足 5 帧: 无跟踪
+        Vector3 slope = Vector3.zero;
+        float tsum = 0f, tbar, den = 0f;
         int n = hist.Count;
-        float tbar = (n - 1) / 2f;
-        float den = 0f;
-        for (int i = 0; i < n; i++) den += (i - tbar) * (i - tbar);
-        Vector2 slope = Vector2.zero;
-        for (int i = 0; i < n; i++) slope += (Vector2)hist[i] * (i - tbar);
+        // 时间回归 (采样率无关): 斜率 = Σ(p·(t−t̄)) / Σ(t−t̄)² — 硬编码 25fps 换算在游戏帧率 ≠25 时系统性高估速度
+        // (帧率 ~20fps → v 放大 1.25 倍 → 提前量同比例放大 → 落点超前 — final debug 事故, 见 dev-incident-log)
+        for (int i = 0; i < n; i++) tsum += hist[i].t;
+        tbar = tsum / n;
+        for (int i = 0; i < n; i++) {
+            float dt = hist[i].t - tbar;
+            den += dt * dt;
+        }
+        for (int i = 0; i < n; i++) slope += hist[i].pos * (hist[i].t - tbar);
         slope /= den;
-        return (slope * 25f * GeoMap.KmPerLocal, Vector2.zero, Vector2.zero); // 帧斜率 (板面/帧) × 25fps × KmPerLocal = km/s
+        Vector2 vLocal = MapSurfaceRef != null ? (Vector2)MapSurfaceRef.InverseTransformDirection(slope) : (Vector2)slope;
+        Vector2 vOut = vLocal * GeoMap.KmPerLocal; // 板面/s → km/s
+        // EMA 低通 (α=0.25, τ≈0.16s): 压游戏棋子 transform 帧间微抖 (~1.6mm → LS 输出 ~1-2 m/s 噪声),
+        // 静态目标矢量符在 1 m/s 阈值边缘点/线间抖; 真实移动信号 (恒定 v) 不受 EMA 影响
+        if (_velEma.TryGetValue(go, out var prev)) vOut = prev + (vOut - prev) * 0.25f;
+        _velEma[go] = vOut;
+        return (vOut, Vector2.zero, Vector2.zero);
     }
 
     private void PruneHistories(HashSet<GameObject> alive) {
         var dead = new List<GameObject>();
         foreach (var k in _posHist.Keys) if (!alive.Contains(k)) dead.Add(k);
         foreach (var k in dead) _posHist.Remove(k);
+        foreach (var k in dead) _velEma.Remove(k);
     }
 
     /// <summary>实体图标差集 (DC 自己的活): 在列表→画, 不在→删 (渲染线程执行 3D 挂件管理); 令牌虚拟目标不画.</summary>
