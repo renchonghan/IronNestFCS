@@ -29,6 +29,7 @@ public class DisplayControl {
     private readonly Dictionary<GameObject, DcTarget> _targetMap = new();    // 目标参数表 (对象复用, FC 直读; Entity → 位置/轨迹参数)
     private readonly Dictionary<GameObject, List<(Vector3 pos, float t)>> _posHist = new(); // TWS: 75 帧环 (位置+时刻, 时间回归 — 采样率无关)
     private readonly Dictionary<GameObject, Vector2> _velEma = new();                     // TWS: 速度输出 EMA 状态 (压静态棋子帧间微抖噪声)
+    private readonly Dictionary<GameObject, bool> _velMoving = new();                     // TWS: 静止死区迟滞状态
     private readonly HashSet<GameObject> _icons = new();                     // 已挂图标 (差集用)
     private object? _loopHandle;
     private float _lastTick;
@@ -50,6 +51,8 @@ public class DisplayControl {
         Requests.Clear();
         _targetMap.Clear();
         _posHist.Clear();
+        _velEma.Clear();
+        _velMoving.Clear();
         _icons.Clear();
     }
 
@@ -162,24 +165,32 @@ public class DisplayControl {
         if (hist.Count > 75) hist.RemoveAt(0);
         if (hist.Count < 5) return (Vector2.zero, Vector2.zero, Vector2.zero); // 不足 5 帧: 无跟踪
         Vector3 slope = Vector3.zero;
+        Vector3 psum = Vector3.zero, pbar;
         float tsum = 0f, tbar, den = 0f;
         int n = hist.Count;
-        // 时间回归 (采样率无关): 斜率 = Σ(p·(t−t̄)) / Σ(t−t̄)² — 硬编码 25fps 换算在游戏帧率 ≠25 时系统性高估速度
-        // (帧率 ~20fps → v 放大 1.25 倍 → 提前量同比例放大 → 落点超前 — final debug 事故, 见 dev-incident-log)
-        for (int i = 0; i < n; i++) tsum += hist[i].t;
+        // 时间回归 (采样率无关, 双中心化): 斜率 = Σ(p−p̄)(t−t̄) / Σ(t−t̄)² —
+        // 硬编码 25fps 换算在游戏帧率 ≠25 时系统性高估速度 (事故 #10);
+        // 不中心化则 p 大数 (~20) × Σ(t−t̄) 的 float 舍入残差 (t~300s 时 t̄ 舍入 ~2e-5 → 残差 ~3e-3) 造出假斜率
+        // → 位置纹丝不动也输出 0.5~1.6 m/s "速度" (事故: 静态目标矢量符抖); 双中心化后位置全同 ⇒ 斜率精确 0
+        for (int i = 0; i < n; i++) { psum += hist[i].pos; tsum += hist[i].t; }
+        pbar = psum / n;
         tbar = tsum / n;
         for (int i = 0; i < n; i++) {
             float dt = hist[i].t - tbar;
             den += dt * dt;
+            slope += (hist[i].pos - pbar) * dt;
         }
-        for (int i = 0; i < n; i++) slope += hist[i].pos * (hist[i].t - tbar);
         slope /= den;
         Vector2 vLocal = MapSurfaceRef != null ? (Vector2)MapSurfaceRef.InverseTransformDirection(slope) : (Vector2)slope;
         Vector2 vOut = vLocal * GeoMap.KmPerLocal; // 板面/s → km/s
-        // EMA 低通 (α=0.25, τ≈0.16s): 压游戏棋子 transform 帧间微抖 (~1.6mm → LS 输出 ~1-2 m/s 噪声),
-        // 静态目标矢量符在 1 m/s 阈值边缘点/线间抖; 真实移动信号 (恒定 v) 不受 EMA 影响
+        // EMA 低通 (α=0.25, τ≈0.16s): 压 LS 帧间噪声; 真实恒速移动 (DC 信号) 不受影响
         if (_velEma.TryGetValue(go, out var prev)) vOut = prev + (vOut - prev) * 0.25f;
         _velEma[go] = vOut;
+        // 静止判据 = 窗口净位移 (位置域): 假斜率/摆动/噪声的 net=0, 真移动 net = v×Δt (3.7s 窗口, 0.5 m/s → 1.85m)
+        // 阈值 1m (0.0002 world): 位移域判据对 slope 假象免疫 — 之前速度域死区压不干净 (位置全同仍出 0.5~1.6 m/s)
+        Vector3 drift = hist[n - 1].pos - hist[0].pos;
+        if (drift.magnitude < 0.0002f) { vOut = Vector2.zero; _velMoving[go] = false; }
+        else _velMoving[go] = true;
         return (vOut, Vector2.zero, Vector2.zero);
     }
 
@@ -188,6 +199,7 @@ public class DisplayControl {
         foreach (var k in _posHist.Keys) if (!alive.Contains(k)) dead.Add(k);
         foreach (var k in dead) _posHist.Remove(k);
         foreach (var k in dead) _velEma.Remove(k);
+        foreach (var k in dead) _velMoving.Remove(k);
     }
 
     /// <summary>实体图标差集 (DC 自己的活): 在列表→画, 不在→删 (渲染线程执行 3D 挂件管理); 令牌虚拟目标不画.</summary>
