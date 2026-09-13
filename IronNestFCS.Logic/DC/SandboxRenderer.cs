@@ -17,6 +17,8 @@ public class SandboxRenderer {
     public Transform? MapSurfaceRef; // "Draggable Surface" (板面局部系, 板面层挂件母体)
     public Transform? FireMissionRootRef; // "Fire Mission Root" (实体挂件母体 — 旧版菱形框同空间, 实体位置在此空间才是板面坐标)
     public Transform? NestRef;       // 铁巢/炮塔 (预瞄线/落点线起点)
+    /// <summary>TWS 开关活读 (FcsModule 注入): 关 → 速度矢量符整体不显示.</summary>
+    public System.Func<bool>? TwsActive;
 
     // ===== 3D 指示器状态 =====
     private readonly Dictionary<GameObject, QueueIndicator> _queueMarks = new();
@@ -82,9 +84,16 @@ public class SandboxRenderer {
 
     /// <summary>速度矢量符 (战雷 TTS 同款): 目标中心往下 0.15 格, 静止 = 点, 运动 = 空心圆 (半径 SpeedR) + 速度方向线 (自圆周伸出).
     /// 线长对数连续: 1-10 m/s → 0.5r, 10-100 → 1r, 100-1000 → 1.5r, 超 1000 封顶 2r (档内 log10 平滑, 无跳变).
-    /// 数据源 = DC TWS 滤波速度 (板面局部系 km/s, 方向即板面方向); TWS 关 → 速度 0 → 全显示静止点.</summary>
-    private static void UpdateSpeedVector(IconEntry e) {
+    /// 数据源 = DC TWS 滤波速度 (板面局部系 km/s, 方向即板面方向); TWS 关 → 矢量符整体不显示 (速度语义只在跟踪时存在).</summary>
+    private void UpdateSpeedVector(IconEntry e) {
         if (e.SpeedRoot == null) return;
+        // TWS 关: 矢量符整体不显示 (不是静止点 — 速度语义只在 TWS 跟踪时存在)
+        if (TwsActive != null && !TwsActive()) {
+            e.CircleRoot.SetActive(false);
+            e.DotRoot.SetActive(false);
+            e.SpeedLine.gameObject.SetActive(false);
+            return;
+        }
         Vector2 v = e.Target.Velocity;
         Vector2 dir;
         float vMps = v.magnitude * 1000f; // km/s → m/s

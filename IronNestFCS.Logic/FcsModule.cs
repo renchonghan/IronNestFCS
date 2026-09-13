@@ -77,6 +77,7 @@ public class FcsModule : IFcsModule
         };
         display.OnIconSpawn = t => renderer2.SpawnIcon(t);
         display.OnIconRemove = go => renderer2.RemoveIcon(go);
+        renderer2.TwsActive = () => display.Tws; // 矢量符显隐跟 TWS 开关
         display.Start();
         renderer2.Start();
 
@@ -109,8 +110,25 @@ public class FcsModule : IFcsModule
         scenePanel.Build();
     }
 
+    private float _lastAliveCheck;
+    private bool _shutdown;
+
     public void Update()
     {
+        if (_shutdown) return;
+        // 场景存活检测 (2s): 回主菜单/场景卸载时铁巢棋子消失 → 自清全部模块, NO SIGNAL 占位接管;
+        // 再进任务场景由 Host 的 OnSceneWasLoaded 自动重载 (3s 后 Reload → 重新 Initialize)
+        if (hud != null && Time.time - _lastAliveCheck > 2f) {
+            _lastAliveCheck = Time.time;
+            // 任务实体根 = 场景判据 (实测: 回主菜单时 Fire Mission Root 消失, 沙盘/铁巢棋子仍常驻)
+            bool fmr = GameObject.Find("Fire Mission Root") != null;
+            if (!fmr) {
+                _shutdown = true;
+                Shutdown();
+                MelonLogger.Msg("[FCS] scene unloaded, HUD → NO SIGNAL");
+                return;
+            }
+        }
         // DC → FC 火控请求桥接 (右键/扫荡/令牌离图)
         if (display != null && fireControl != null) {
             foreach (var req in display.DrainRequests()) fireControl.RequestTask(req);
@@ -136,7 +154,8 @@ public class FcsModule : IFcsModule
 
     public void OnGui()
     {
-        hud?.OnGui();
+        if (hud != null) { hud.OnGui(); return; }
+        FcsHud.DrawNoSignal(); // 实体未初始化 (1.0.7 的 "wait for ..." 位): 军航 HUD 风 NO SIGNAL 占位
     }
 
     public void Shutdown()

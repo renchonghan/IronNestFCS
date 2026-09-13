@@ -29,6 +29,50 @@ public class FcsHud {
         }
     }
 
+    /// <summary>实体未初始化占位 (1.0.7 的 "wait for ..." 位): 面板位置/尺寸与正常 HUD 一致 (左上角 20,20; 64 字符 × 17 行深色框),
+    /// 内容 = NO SIGNAL ASCII 大字 (5 行, 框内居中). 由 FcsModule 在 hud 未构建时调用.</summary>
+    public static void DrawNoSignal() {
+        var oldFont = GUI.skin.font;
+        var oldSize = GUI.skin.label.fontSize;
+        GUI.skin.font = UiFont.Mono;
+        GUI.skin.label.fontSize = 14;
+        try {
+            string[] art = {
+                "  _   _  ___    ____ ___ _   _  ____    _    _     ",
+                " | \\ | |/ _ \\  / ___|_ _| \\ | |/ ___|  / \\  | |    ",
+                " |  \\| | | | | \\___ \\| ||  \\| | |  _  / _ \\ | |    ",
+                " | |\\  | |_| |  ___) | || |\\  | |_| |/ ___ \\| |___ ",
+                " |_| \\_|\\___/  |____/___|_| \\_|\\____/_/   \\_\\_____|",
+            };
+            // 顶部分隔线 (64 '-') → 大字 5 行 (居中) → 底部小字行 (定稿文本, 恰好 64 列 — 版本与 FcsHostMod MelonInfo 同步)
+            const string header = "IronNest FireControlSystem 2.0.0 --- svr2kos2 & Lancelot_Holland";
+            float lh = GUI.skin.label.lineHeight + 4f;
+            float lineW = GUI.skin.label.CalcSize(new GUIContent(new string('-', LineWidth))).x;
+            float w = lineW + 8f;
+            float h = 4f + 17 * lh + 8f; // 与正常 HUD 同高 (17 行)
+            GUI.Box(new Rect(20, 20, w, h), "");
+            GUI.color = Color.green;
+            GUI.Label(new Rect(20 + 4f, 20 + 4f, lineW, lh), new string('-', LineWidth)); // 顶部分隔线 (64 '-', 面板同字号 14px)
+            // 统一宽 rect + 左对齐: 逐行 CalcSize 会裁剪行尾空格 (A 右下角/L 末行被截事故), 留 2 空格裕
+            float maxW = 0f;
+            foreach (var line in art) maxW = Mathf.Max(maxW, GUI.skin.label.CalcSize(new GUIContent(line)).x);
+            float padW = maxW + GUI.skin.label.CalcSize(new GUIContent("  ")).x;
+            float x = 20 + 4f + (w - 8f - padW) / 2f;
+            float y = 20 + 4f + lh + (h - 8f - 2 * lh - art.Length * lh) / 2f - lh; // 大字 5 行居中位再上移 1 行 (用户定稿)
+            foreach (var line in art) {
+                GUI.Label(new Rect(x, y, padW, lh), line);
+                y += lh;
+            }
+            GUI.Label(new Rect(20 + 4f, 20 + 4f + h - 8f - 2 * lh, lineW, lh), new string('-', LineWidth)); // 小字上方分隔线
+            GUI.Label(new Rect(20 + 4f, 20 + 4f + h - 8f - lh, lineW + 8f, lh), header); // 底部小字行 (最后一行, rect 与正常 HUD 行同款 +8 裕量 — 精确 64 宽会渲染裁尾)
+            GUI.color = Color.white;
+        }
+        finally {
+            GUI.skin.label.fontSize = oldSize;
+            GUI.skin.font = oldFont;
+        }
+    }
+
     private void Draw() {
         const float h = 22f, lh = 24f;
         // 面板尺寸按内容实测: 宽 = 64 字符实测宽 + 边距, 高 = 行数精确累计
@@ -62,7 +106,9 @@ public class FcsHud {
             if (t.SalvoPair) rows.Add(SalvoRow(t));
         }
         for (int i = 0; i < 8; i++) {
-            string left = i < rows.Count ? rows[i] : "";
+            string left;
+            if (rows.Count > 8 && i == 7) left = $"... ({rows.Count - 7} more)"; // 溢出: 末行省略提示 (Minecraft 服务器风格), 前 7 行显示任务
+            else left = i < rows.Count ? rows[i] : "";
             string right = i < finished.Count ? FinishRow(finished[finished.Count - 1 - i]) : ""; // 完成队列倒序: 最新在最上面
             GUI.Label(new Rect(x, y, _panelRect.width, h), $" {left,-30}|{right}");
             y += lh;
