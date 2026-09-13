@@ -54,7 +54,8 @@ public class FcsHostMod : MelonMod
     
     private IEnumerator ReloadCoroutine()
     {
-        yield return new WaitForSeconds(3f);
+        // 进任务 0.5s 后重载: 实体就绪等待已交给 Logic 开机自检 (System Init 重试绑定), 不再固定等 3s
+        yield return new WaitForSeconds(0.5f);
         reloader?.Reload();
     }
 

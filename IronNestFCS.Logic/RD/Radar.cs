@@ -36,6 +36,9 @@ public class Radar {
 
     public IReadOnlyList<SrcContact> Contacts => _contacts;
 
+    /// <summary>数据链实测间隔: 粗跟 tick 间隔 (ms) — 开机自检 Bench 读数 (25Hz 节流 ≈40ms, 随帧率抖).</summary>
+    public float LastIntervalMs { get; private set; }
+
     /// <summary>雷达电源 (SAR RADAR 按钮): 关 = 不扫描不出目标 (Contacts 清空 — 下游目标全撤), 默认关 (开机先开雷达).</summary>
     public bool Power;
 
@@ -68,6 +71,7 @@ public class Radar {
         while (!_disposed) {
             yield return null;
             if (Time.time - _lastTick < 0.04f) continue; // 硬节流 25Hz: 不依赖 WaitForSeconds (协程调度异常时照样锁频)
+            if (_lastTick > 0f) LastIntervalMs = (Time.time - _lastTick) * 1000f; // 实测间隔 (首 tick 跳过: _lastTick 初值 0)
             _lastTick = Time.time;
             if (!Power) { _contacts.Clear(); continue; } // 雷达关: 无扫描无目标 (下游 DC 目标表随之清空, FC 撤任务)
             if (Time.time - _lastScan > 2f) {

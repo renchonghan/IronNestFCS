@@ -73,6 +73,43 @@ public class FcsHud {
         }
     }
 
+    /// <summary>开机自检面板 (进任务自动): CMD 风黑框 — 分隔线先出, 日志从第二行逐行显现;
+    /// 框宽同 HUD (64 列), 高 = 分隔线 + 12 行日志; [FAIL] 行红显. 由 FcsModule 开机装配状态机驱动.</summary>
+    public static void DrawBoot(BootLog boot) {
+        var oldFont = GUI.skin.font;
+        var oldSize = GUI.skin.label.fontSize;
+        GUI.skin.font = UiFont.Mono;
+        GUI.skin.label.fontSize = 14;
+        try {
+            float lh = GUI.skin.label.lineHeight + 4f;
+            float lineW = GUI.skin.label.CalcSize(new GUIContent(new string('-', LineWidth))).x;
+            float w = lineW + 8f;
+            float h = 4f + (1 + boot.Lines.Length) * lh + 8f;
+            GUI.Box(new Rect(20, 20, w, h), "");
+            GUI.color = Color.green;
+            GUI.Label(new Rect(20 + 4f, 20 + 4f, lineW, lh), new string('-', LineWidth)); // 顶部分隔线 (64 '-')
+            float y = 20 + 4f + lh;
+            foreach (var line in boot.Lines) {
+                string? text = line.State switch {
+                    BootLineState.Active => line.ActiveText,
+                    BootLineState.Done => line.DoneText,
+                    BootLineState.Fail => line.FailText,
+                    _ => null,
+                };
+                if (text != null) {
+                    GUI.color = line.State == BootLineState.Fail ? Color.red : Color.green; // 失败行红显
+                    GUI.Label(new Rect(20 + 4f, y, lineW + 8f, lh), text); // rect 与正常 HUD 行同款 +8 裕量 (精确 64 宽渲染裁尾)
+                }
+                y += lh;
+            }
+            GUI.color = Color.white;
+        }
+        finally {
+            GUI.skin.label.fontSize = oldSize;
+            GUI.skin.font = oldFont;
+        }
+    }
+
     private void Draw() {
         const float h = 22f, lh = 24f;
         // 面板尺寸按内容实测: 宽 = 64 字符实测宽 + 边距, 高 = 行数精确累计

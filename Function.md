@@ -100,6 +100,35 @@ IronNestFCS 是自动化火控系统 (Fire Control System) Mod。玩家只需在
 
 相位代号: 1-1 WAIT (等派发) / 1-2 SELC (采购) / 1-3 DUMP (退弹) / 2-1 SHRD (选弹) / 2-2 SHLD (推弹) / 2-3 PWDR (给药) / 2-4 LOAD (装填) / 3-1 TRAK (追踪) / 3-3 REST (复位) / 0-0 FALL (故障红显, 等玩家手动处理或换炮)。
 
+### 开机自检 (进任务自动)
+
+进任务时左上角先播放开机自检面板 (CMD 风黑框, 逐行显现, 约 5 秒), 随后切换正常 HUD:
+
+```
+----------------------------------------------------------------
+14.23.05 [INFO] System Init ...
+14.23.06 [INFO] System Loaded For FCS 2.0.0
+14.23.06 [CORE] Self Test Start ...
+                |- Gun Control System ------------------- [DONE]
+                |- Data Process System ------------------ [DONE]
+                |- Fire Control System ------------------ [DONE]
+                |- Holography System -------------------- [DONE]
+14.23.08 [CORE] Self Test Complete
+14.23.08 [CORE] Connect To SAR DataLine ----------------- [DONE]
+14.23.08 [INFO] DataLine Bench ----------------- DL:41ms PL:0.0%
+14.23.09 [CORE] FINAL CHECK ...
+14.23.09 [INFO] Load Application ...
+```
+
+- 自检就是绑定过程: `System Init ...` 期间等待实体就绪 (重试绑定), 每行 `[DONE]` = 该模块真实装配完成; 行序 = 真实依赖序 (炮控 → 数据/显示 → 火控 → 全息渲染)。
+- 模块行两步揭示: 先出 `|- 名字` (停顿等启动), 再补横线 + `[DONE]`。
+- `DataLine Bench` 的 DL 为雷达 25Hz 粗跟循环的实测间隔 (约 40ms, 随游戏帧率抖动)。
+- 绑定失败: 该行红显 `[FAIL]` 并冻结面板; 按 **F9** 重试, 或回主菜单 (NO SIGNAL 接管)。
+
+### NO SIGNAL 占位
+
+主菜单 / 实体未初始化时显示 NO SIGNAL ASCII 大字占位 (同尺寸深色框); 进任务自检完成后由正常 HUD 接管。
+
 ---
 
 ## 5. 沙盘视觉元素

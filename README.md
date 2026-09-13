@@ -68,9 +68,9 @@ MelonLoader 是运行本 Mod 必需的前置工具（所有 MelonLoader Mod 都�
 
 1. 从 Steam 正常启动游戏
 2. 如果 MelonLoader 装好了，启动时屏幕上会**弹出一个黑色控制台窗口**——别关它，那是正常现象
-3. 进入有炮塔和地图桌的关卡
-4. 如果游戏画面**左上角出现火控状态面板**，说明安装成功 🎉
-   - 如果面板提示 `Dial 未绑定`，按键盘 **F9** 重新绑定即可
+3. 进入有炮塔和地图桌的关卡 — 左上角会先播放**开机自检画面**（CMD 风逐行自检，约 5 秒），随后切换为火控状态面板
+4. 如果最终出现**火控状态面板**，说明安装成功 🎉
+   - 如果自检卡在红字 `[FAIL]`，按键盘 **F9** 重试绑定即可
 5. 使用步骤见下文"使用"章节
 
 ## 功能
@@ -90,7 +90,7 @@ MelonLoader 是运行本 Mod 必需的前置工具（所有 MelonLoader Mod 都�
 
 | 项目 | 角色 | 说明 |
 | --- | --- | --- |
-| `IronNestFCS` | **宿主 Mod** | 稳定加载、永不重载。负责首次加载 Logic、监听 F9 触发热重载、转发生命周期回调。 |
+| `IronNestFCS` | **宿主 Mod** | 稳定加载、永不重载。负责首次加载 Logic、进任务/按 F9 触发热重载、转发生命周期回调。 |
 | `IronNestFCS.Abstractions` | **契约** | 仅含 `IFcsModule` 接口。只加载一份，是唯一能安全跨 `AssemblyLoadContext` 边界传递的类型。 |
 | `IronNestFCS.Logic` | **火控逻辑** | 所有高频改动的火控代码：弹道解算、任务调度、炮塔/炮管操控、UI。被装进可回收的 ALC，按 F9 卸载并重载。 |
 | `IronNestFCS.CustomRecords` | **独立 Mod** | 与火控无关的场景装饰，扫描 `UserData/CustomRecords/` 下的音频文件，为每个文件克隆一张 RecordDisk 并替换音轨与封面。 |
@@ -143,6 +143,31 @@ dotnet build IronNestFCS.sln -c Release
 ### 开发热重载
 
 修改 `IronNestFCS.Logic` 内的代码后，重新构建该项目（dll 会直接输出到游戏的 `UserData/IronNestFCS/`），切回游戏按 **F9** 即可加载新逻辑，无需重启游戏。
+
+## 开机自检
+
+进任务时左上角先播放开机自检面板（CMD 风黑框，逐行显现，约 5 秒），随后切换为火控状态面板：
+
+```text
+----------------------------------------------------------------
+14.23.05 [INFO] System Init ...
+14.23.06 [INFO] System Loaded For FCS 2.0.0
+14.23.06 [CORE] Self Test Start ...
+                |- Gun Control System ------------------- [DONE]
+                |- Data Process System ------------------ [DONE]
+                |- Fire Control System ------------------ [DONE]
+                |- Holography System -------------------- [DONE]
+14.23.08 [CORE] Self Test Complete
+14.23.08 [CORE] Connect To SAR DataLine ----------------- [DONE]
+14.23.08 [INFO] DataLine Bench ----------------- DL:41ms PL:0.0%
+14.23.09 [CORE] FINAL CHECK ...
+14.23.09 [INFO] Load Application ...
+```
+
+- 自检就是绑定过程：`System Init ...` 期间等待实体就绪（重试绑定），每行 `[DONE]` = 该模块真实装配完成；行序 = 真实依赖序（炮控 → 数据/显示 → 火控 → 全息渲染）。
+- `DataLine Bench` 的 DL 为雷达 25Hz 粗跟循环的实测间隔（约 40ms，随游戏帧率抖动）。
+- 绑定失败：该行红显 `[FAIL]` 并冻结面板；按 **F9** 重试，或回主菜单（NO SIGNAL 接管）。
+- 主菜单 / 实体未初始化时显示 NO SIGNAL ASCII 大字占位（同尺寸深色框）。
 
 ## 贡献
 

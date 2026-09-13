@@ -40,6 +40,8 @@
 - Mods/ 里的两个 dll (宿主壳+CustomRecords) 只在游戏启动头几秒被 MelonLoader 短暂持有锁, **游戏运行中 build 正常**(复制成功); 避开启动窗口即可。
 - 运行时创建的 3D 物件不随 F9 销毁, 必须按名字清理旧实例 (SandboxRenderer.ClearAll)。
 - Logic 代码禁止注册新 IL2CPP 类型。
+- 进任务场景由 Host 的 OnSceneWasLoaded 在 **0.5s 后**自动 Reload — 实体就绪等待交给 Logic 开机自检 (System Init 重试绑定), 不再固定等 3s。
+- **开机自检 = FcsModule 跨帧装配状态机** (Update 驱动, 不用协程 — 绕开 WaitForSeconds 调度异常): System Init (硬件绑定重试, 30s 上限) → 四模块按依赖序装配 (GC → DC_U → FC → DC_D, 每行 [DONE] = 真实装配完成, 原 WireModules 拆分) → SAR 验线/Bench 实测/FINAL CHECK → HUD 接管; 失败行 [FAIL] 红显冻结面板, FMR 消失 (回主菜单) → NO SIGNAL。装配面板 = FcsHud.DrawBoot + BootLog (行序即依赖序)。
 
 ### 1.4 旧架构 (历史对照)
 
