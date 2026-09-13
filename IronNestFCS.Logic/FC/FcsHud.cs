@@ -10,6 +10,9 @@ namespace IronNestFCS.Logic.FCS;
 public class FcsHud {
     private const int LineWidth = 64;
 
+    /// <summary>面板底部签名行 (NO SIGNAL/开机自检同款, 恰好 64 列 — 版本与 FcsHostMod MelonInfo 同步).</summary>
+    private const string PanelHeader = "IronNest FireControlSystem 2.0.0 --- svr2kos2 & Lancelot_Holland";
+
     public FireControl? Fc;
     public GunControl? GunL;
     public GunControl? GunR;
@@ -45,8 +48,7 @@ public class FcsHud {
                 " |_| \\_|\\___/  |____/___|_| \\_|\\____/_/   \\_\\_____|",
             };
             // 顶部分隔线 (64 '-') → 大字 5 行 (居中) → 底部小字行 (定稿文本, 恰好 64 列 — 版本与 FcsHostMod MelonInfo 同步)
-            const string header = "IronNest FireControlSystem 2.0.0 --- svr2kos2 & Lancelot_Holland";
-            float lh = GUI.skin.label.lineHeight + 4f;
+            const float lh = 24f; // 行距固定 24f 与正常 HUD 一致 (lineHeight+4 实测比 HUD 矮 ~60px)
             float lineW = GUI.skin.label.CalcSize(new GUIContent(new string('-', LineWidth))).x;
             float w = lineW + 8f;
             float h = 4f + 17 * lh + 8f; // 与正常 HUD 同高 (17 行)
@@ -63,8 +65,8 @@ public class FcsHud {
                 GUI.Label(new Rect(x, y, padW, lh), line);
                 y += lh;
             }
-            GUI.Label(new Rect(20 + 4f, 20 + 4f + h - 8f - 2 * lh, lineW, lh), new string('-', LineWidth)); // 小字上方分隔线
-            GUI.Label(new Rect(20 + 4f, 20 + 4f + h - 8f - lh, lineW + 8f, lh), header); // 底部小字行 (最后一行, rect 与正常 HUD 行同款 +8 裕量 — 精确 64 宽会渲染裁尾)
+            GUI.Label(new Rect(20 + 4f, 20 + 4f + 15 * lh, lineW, lh), new string('-', LineWidth)); // 小字上方分隔线 (第 15 行)
+            GUI.Label(new Rect(20 + 4f, 20 + 4f + 16 * lh, lineW + 8f, lh), PanelHeader); // 底部小字行 (第 16 行, rect 与正常 HUD 行同款 +8 裕量 — 精确 64 宽会渲染裁尾)
             GUI.color = Color.white;
         }
         finally {
@@ -74,17 +76,18 @@ public class FcsHud {
     }
 
     /// <summary>开机自检面板 (进任务自动): CMD 风黑框 — 分隔线先出, 日志从第二行逐行显现;
-    /// 框宽同 HUD (64 列), 高 = 分隔线 + 12 行日志; [FAIL] 行红显. 由 FcsModule 开机装配状态机驱动.</summary>
+    /// 框与正常 HUD 同尺寸 (64 列 × 17 行), 顶部分隔线 + 底部签名行与 NO SIGNAL 同款; [FAIL] 行红显.
+    /// 由 FcsModule 开机装配状态机驱动.</summary>
     public static void DrawBoot(BootLog boot) {
         var oldFont = GUI.skin.font;
         var oldSize = GUI.skin.label.fontSize;
         GUI.skin.font = UiFont.Mono;
         GUI.skin.label.fontSize = 14;
         try {
-            float lh = GUI.skin.label.lineHeight + 4f;
+            const float lh = 24f; // 行距与正常 HUD 一致 (固定 24f)
             float lineW = GUI.skin.label.CalcSize(new GUIContent(new string('-', LineWidth))).x;
             float w = lineW + 8f;
-            float h = 4f + (1 + boot.Lines.Length) * lh + 8f;
+            float h = 4f + 17 * lh + 8f; // 与正常 HUD/NO SIGNAL 同高 (17 行: 顶线 + 12 行日志 + 底部签名区)
             GUI.Box(new Rect(20, 20, w, h), "");
             GUI.color = Color.green;
             GUI.Label(new Rect(20 + 4f, 20 + 4f, lineW, lh), new string('-', LineWidth)); // 顶部分隔线 (64 '-')
@@ -102,6 +105,9 @@ public class FcsHud {
                 }
                 y += lh;
             }
+            GUI.color = Color.green;
+            GUI.Label(new Rect(20 + 4f, 20 + 4f + 15 * lh, lineW, lh), new string('-', LineWidth)); // 底部签名行上方分隔线 (第 15 行, NO SIGNAL 同款)
+            GUI.Label(new Rect(20 + 4f, 20 + 4f + 16 * lh, lineW + 8f, lh), PanelHeader); // 底部签名行 (第 16 行, +8 裕量 — 精确 64 宽渲染裁尾)
             GUI.color = Color.white;
         }
         finally {

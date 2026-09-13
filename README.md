@@ -146,18 +146,18 @@ dotnet build IronNestFCS.sln -c Release
 
 ## 开机自检
 
-进任务时左上角先播放开机自检面板（CMD 风黑框，逐行显现，约 5 秒），随后切换为火控状态面板：
+进任务时左上角先播放开机自检面板（CMD 风黑框，逐行显现，约 7 秒），随后切换为火控状态面板：
 
 ```text
 ----------------------------------------------------------------
 14.23.05 [INFO] System Init ...
 14.23.06 [INFO] System Loaded For FCS 2.0.0
-14.23.06 [CORE] Self Test Start ...
+14.23.06 [CORE] Enable Peripherals ...
                 |- Gun Control System ------------------- [DONE]
                 |- Data Process System ------------------ [DONE]
                 |- Fire Control System ------------------ [DONE]
                 |- Holography System -------------------- [DONE]
-14.23.08 [CORE] Self Test Complete
+14.23.08 [CORE] Peripherals Enabled
 14.23.08 [CORE] Connect To SAR DataLine ----------------- [DONE]
 14.23.08 [INFO] DataLine Bench ----------------- DL:41ms PL:0.0%
 14.23.09 [CORE] FINAL CHECK ...

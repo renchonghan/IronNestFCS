@@ -23,6 +23,7 @@ public class FcsModule : IFcsModule
     private const int BootFailCap = 10;        // 模块绑定失败重试上限
     private const float BootInitRetry = 0.5f;  // System Init 绑定重试间隔 (s)
     private const float BootInitCap = 30f;     // System Init 实体等待上限 (s)
+    private const float BootBenchWait = 2f;    // Bench 采样等待 (s, ping 节奏: 先 ... 等回复再报数)
 
     private BootLog? _boot;
     private GunControl? gunL;
@@ -105,8 +106,8 @@ public class FcsModule : IFcsModule
     // ===== 开机自检装配链 =====
 
     /// <summary>开机自检状态机 (Update 驱动, 不用协程 — 绕开 WaitForSeconds 调度异常).
-    /// 步骤: 0 System Init (重试硬件绑定 = 实体就绪等待) → 1 System Loaded → 2 Self Test Start →
-    /// 3-6 四模块按依赖序装配 (GC → DC_U → FC → DC_D) → 7 Self Test Complete → 8 SAR 数据链 → 9 Bench 实测 →
+    /// 步骤: 0 System Init (重试硬件绑定 = 实体就绪等待) → 1 System Loaded → 2 Enable Peripherals →
+    /// 3-6 四模块按依赖序装配 (GC → DC_U → FC → DC_D) → 7 Peripherals Enabled → 8 SAR 数据链 → 9 Bench 实测 (ping 节奏) →
     /// 10 FINAL CHECK → 11 Load Application → HUD 接管. 每行 [DONE] = 该阶段真实装配完成.</summary>
     private void BootTick()
     {
@@ -140,8 +141,8 @@ public class FcsModule : IFcsModule
                 }
                 if (t > BootGap) Advance();
                 break;
-            case 2:
-                if (lines[2].State == BootLineState.Hidden) { lines[2].ActiveText = $"{Stamp()} [CORE] Self Test Start ..."; lines[2].State = BootLineState.Active; }
+            case 2: // Enable Peripherals — 外设装配前奏
+                if (lines[2].State == BootLineState.Hidden) { lines[2].ActiveText = $"{Stamp()} [CORE] Enable Peripherals ..."; lines[2].State = BootLineState.Active; }
                 if (t > 0.2f) Advance();
                 break;
             case 3: BootModuleStep(3, TryBindGuns); break;
@@ -149,7 +150,7 @@ public class FcsModule : IFcsModule
             case 5: BootModuleStep(5, TryBindFireControl); break;
             case 6: BootModuleStep(6, TryBindRenderer); break;
             case 7:
-                if (lines[7].State == BootLineState.Hidden) { lines[7].ActiveText = $"{Stamp()} [CORE] Self Test Complete"; lines[7].State = BootLineState.Active; }
+                if (lines[7].State == BootLineState.Hidden) { lines[7].ActiveText = $"{Stamp()} [CORE] Peripherals Enabled"; lines[7].State = BootLineState.Active; }
                 if (t > 0.2f) Advance();
                 break;
             case 8: // SAR 数据链 — 真判据: 雷达已装配且板面注入完成 (雷达在 DC_U 阶段已建, 此行只验线)
@@ -160,15 +161,18 @@ public class FcsModule : IFcsModule
                     l.FailText = BootLog.PadFail(p);
                 });
                 break;
-            case 9: // Bench — 数据链间隔实测 (雷达粗跟 tick 间隔, 显现帧冻结读数)
+            case 9: // Bench — 数据链间隔实测 (ping 节奏: ... 等 ~2s 采样, 报最后一次粗跟 tick 间隔)
                 if (lines[9].State == BootLineState.Hidden) {
+                    lines[9].ActiveText = $"{Stamp()} [INFO] DataLine Bench ...";
+                    lines[9].State = BootLineState.Active;
+                }
+                if (t > BootBenchWait) {
                     float dl = radar2 != null ? radar2.LastIntervalMs : 0f;
                     string suffix = $" DL:{dl:0}ms PL:0.0%";
                     string p = $"{Stamp()} [INFO] DataLine Bench ";
                     lines[9].ActiveText = p + new string('-', Mathf.Max(0, 64 - p.Length - suffix.Length)) + suffix;
-                    lines[9].State = BootLineState.Active;
+                    Advance();
                 }
-                if (t > 0.35f) Advance();
                 break;
             case 10: // FINAL CHECK — 全链路核查 (硬件+五模块+端口), 不过 → [FAIL] 冻结
                 if (lines[10].State == BootLineState.Hidden) { lines[10].ActiveText = $"{Stamp()} [CORE] FINAL CHECK ..."; lines[10].State = BootLineState.Active; }
