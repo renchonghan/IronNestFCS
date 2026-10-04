@@ -37,6 +37,9 @@ public class FireTask {
 /// 保险 (Arm) 也是 FC 的事, 首次 AllReady 解一次, 已 Arm 不自动回保险.
 /// </summary>
 public class FireControl {
+    /// <summary>击发→出膛固定延迟 (§4.4 fireDelay, 触发核心储能 1s) — LeadSolve 前馈补偿量.</summary>
+    private const float FireDelay = 1f;
+
     // ===== 端口接线 (FcsModule 注入) =====
     public GunControl? GunL;
     public GunControl? GunR;
@@ -522,13 +525,13 @@ public class FireControl {
 
     /// <summary>提前量解析解 (三次轨迹曲线): 预测点 = p + v·T + ½a·T² + ⅙j·T³ (e' 在弧上, 不是切线直线),
     /// T = k·r (飞时线性), v/a/j 为地图局部系 (km/s, km/s², km/s³).
-    /// 无 fireDelay 补偿: 解算每帧滑动, 出膛瞬间炮指向的就是最新解算, 按钮→出膛延迟 Δ 只是把双方同步平移,
-    /// 加补偿反而把 aim 前移 Δ·v 打远.
+    /// fireDelay 前馈: 击发→出膛固定 1s (§4.4) — 真空期游戏锁炮塔, 出膛指向击发瞬间解算,
+    /// 目标多走 v·Δ — aim 前移 Δ·v 补偿 (实测落点滞后 v×1s 的量级, 2026-10-04).
     /// a/j≈0 走闭式一元二次; 否则数值不动点 8 次. 返回 (瞄准距离 km, 瞄准方位, 瞄准矢量 km 局部系 — 交汇点渲染用).</summary>
     private static (float dist, float angle, Vector2 aim) LeadSolve(float dist, float angle, Vector2 v, Vector2 a, Vector2 j, int charge) {
         float k = ShellData.FlightTime(1f, Mathf.Max(1, charge)); // 飞时斜率 (s/km) 按实际装药 — 满装药近似提前量不足, 移动目标落点滞后
         Vector2 dir = new(Mathf.Sin(angle * Mathf.Deg2Rad), Mathf.Cos(angle * Mathf.Deg2Rad)); // 方位 0°=+y (北) 顺时针
-        Vector2 p = dir * dist;
+        Vector2 p = dir * dist + FireDelay * v; // 前馈平移: 双方同步前移 1s (两分支共用, 不动点/闭式自然带 Δ)
         float r;
         Vector2 aimF;
         if (a.sqrMagnitude < 1e-10f && j.sqrMagnitude < 1e-10f) { // 匀速: 一元二次闭式
