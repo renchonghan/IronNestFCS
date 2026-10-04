@@ -56,7 +56,7 @@ public static class Glyph16Font {
     private static readonly Dictionary<char, ushort> Glyph16 = new() {
         // ---- 数字 ----
         ['0'] = A1|A2|B|C|D1|D2|E|F,
-        ['1'] = B|C,
+        ['1'] = A1|H|I|D1|D2,   // 左上旗 + 中竖整条 + 全底横 (用户定稿)
         ['2'] = A1|A2|B|G1|G2|E|D1|D2,
         ['3'] = A1|A2|B|G1|G2|C|D1|D2,
         ['4'] = F|G1|G2|B|C,
@@ -103,7 +103,7 @@ public static class Glyph16Font {
         ['h'] = F|E|G1|G2|C,
         ['i'] = I,
         ['j'] = C|I|D1|D2,
-        ['k'] = F|E|G1|G2|K|M,
+        ['k'] = F|E|G1|K|M,   // 中横只留左半 (同大写 K, 右半横多余)
         ['l'] = F|E,
         ['m'] = E|F|G1|G2|H|B|C,
         ['n'] = E|G1|G2|C,
@@ -134,7 +134,7 @@ public static class Glyph16Font {
         ['+'] = G1|G2|H|I,
         [','] = L,
         ['-'] = G1|G2,
-        ['.'] = G1|D1|E|I,   // 左下角画圈: g1 上 / d1 下 / e 左 / i 右
+        ['.'] = I,   // 靠下中竖 (基线小点, 用户定稿)
         ['/'] = K|L,
         [':'] = G1|D1,   // 左中横 + 左下横
         [';'] = A1|L,   // 逗号 + 左上横
@@ -172,6 +172,27 @@ public static class Glyph16Font {
             line.ColorStart = color;
             line.ColorEnd = color;
             var r = go.GetComponent<Renderer>(); // 强制渲染队列到顶: 与 SandboxRenderer 线同款, 防照片穿插 (DC 所有元素统一 5000)
+            if (r != null) r.material.renderQueue = 5000;
+        }
+    }
+
+    /// <summary>半宽字符: 宽度 = scale/2 (段 x 坐标 ×0.5), 笔画粗系数 0.010 — 紧凑数字文本用.</summary>
+    public static void DrawCharSegmentsNarrow(Transform parent, char ch, Color color, float x0, float scale)
+    {
+        if (!Glyph16.TryGetValue(ch, out var mask)) mask = A1|A2|B|C|D1|D2|E|F|G1|G2; // 未知字符全亮 (8 形)
+        for (int bit = 0; bit < SegBit16.Length; bit++) {
+            if ((mask & (1 << bit)) == 0) continue;
+            var (a, b) = Seg16[SegBit16[bit]];
+            var go = new GameObject("FCS_LabelSeg");
+            go.transform.SetParent(parent, false);
+            var line = go.AddComponent<Il2CppShapes.Line>();
+            line.Thickness = 0.010f * (scale / LabelSegW);
+            line.Start = new Vector3(x0 + a.x * scale * 0.5f, a.y * scale, 0f);
+            line.End = new Vector3(x0 + b.x * scale * 0.5f, b.y * scale, 0f);
+            line.Color = color;
+            line.ColorStart = color;
+            line.ColorEnd = color;
+            var r = go.GetComponent<Renderer>();
             if (r != null) r.material.renderQueue = 5000;
         }
     }

@@ -65,6 +65,7 @@ public class DisplayControl {
             SyncNestToken();     // 铁巢棋子吸附实际炮位 (旧版同款: 棋子摆偏不导致火控打飞)
             if (RadarPort == null) continue;
             RefreshTargets();
+            GroupTrains();       // 列车聚簇: 中心车出 TWS 文本, 其余成员隐藏 (定案后删探针)
             UpdateIcons();       // 实体图标差集 (在列表→画, 不在→删)
             TrackTokens();       // 令牌拖放: 上地图注册虚拟目标, 拖离自动取消
             if (AutoTask) Sweep();
@@ -122,7 +123,8 @@ public class DisplayControl {
     private void UpsertTarget(GameObject go, string name, Vector3 pos, Side3 side, EntityKind kind, int armour, bool isVirtual) {
         bool onGun = FcPort != null && (FcPort.LeftTask?.Entity == go || FcPort.RightTask?.Entity == go);
         Vector2 vel = Vector2.zero, acc = Vector2.zero, jerk = Vector2.zero;
-        if (Tws) (vel, acc, jerk) = TrackMotion(go, pos);
+        // 令牌虚拟目标不参与 TWS: 恒定按固定目标算 (拖放棋子无真实运动语义, 速度恒 0 → 火控自然无预瞄)
+        if (Tws && !isVirtual) (vel, acc, jerk) = TrackMotion(go, pos);
         // 追踪日志: 上炮目标 ~0.32s 一条 (时间门控 — 帧计数门控曾因共享计数+目标数奇偶永不命中, 见事故教训)
         if (onGun && Time.time - _lastTrakLog >= 0.32f) {
             _lastTrakLog = Time.time;
@@ -318,6 +320,89 @@ public class DisplayControl {
         }
     }
 
+    /// <summary>列车聚簇 (每 tick, 按命名): 同名前缀成员按近距 (0.35 板面) + 同标量速度并查集成链,
+    /// ≥3 车 = 列车; 代表 = 链序 (n+1)/2 号车 (4→2, 5→3, 6→3), 只它出 TWS 文本;
+    /// 代表文本横向避让: 右侧重叠车框需要多少右移就挪多少 (TrainShift).
+    /// (纯距离聚簇在 1.2 小格阈值下出一堆错误簇 — 弃用; 待有仓库/实体类型信息再改.)</summary>
+    private void GroupTrains() {
+        foreach (var t in _targetMap.Values) { t.TrainMember = false; t.TrainData = false; t.TrainAnchor = false; t.TrainDataOf = null; t.TrainShift = 0f; }
+        if (MapSurfaceRef == null) return;
+        var groups = new System.Collections.Generic.Dictionary<string, System.Collections.Generic.List<DcTarget>>();
+        foreach (var t in _targetMap.Values) {
+            if (t.Entity == null) continue;
+            // 前缀 = 剥尾部序号/分隔符 ('#'/下划线/连字符/括号) 再剥一个尾字母 — 车厢命名 cara/carb/carc/... 各带序号尾, 归同一 'car' 组
+            string prefix = System.Text.RegularExpressions.Regex.Replace(t.Name, @"[#_()\-\s]*\d+[#_()\-\s]*$", "");
+            if (prefix.Length >= 3 && prefix[^1] >= 'a' && prefix[^1] <= 'z') prefix = prefix[..^1];
+            if (prefix.Length == 0) prefix = t.Name;
+            if (!groups.TryGetValue(prefix, out var list)) groups[prefix] = list = new System.Collections.Generic.List<DcTarget>();
+            list.Add(t);
+        }
+        foreach (var kv in groups) {
+            var list = kv.Value;
+            if (list.Count < 3) continue;
+            list.Sort((a, b) => string.CompareOrdinal(a.Name, b.Name));
+            var parent = new int[list.Count];
+            for (int i = 0; i < list.Count; i++) parent[i] = i;
+            for (int i = 0; i < list.Count; i++)
+                for (int j = i + 1; j < list.Count; j++) {
+                    if (!NearCar(list[i], list[j])) continue;
+                    int ri = Find(parent, i), rj = Find(parent, j);
+                    if (ri != rj) parent[ri] = rj;
+                }
+            var chains = new System.Collections.Generic.Dictionary<int, System.Collections.Generic.List<DcTarget>>();
+            for (int i = 0; i < list.Count; i++) {
+                int r = Find(parent, i);
+                if (!chains.TryGetValue(r, out var chain)) chains[r] = chain = new System.Collections.Generic.List<DcTarget>();
+                chain.Add(list[i]);
+            }
+            foreach (var chain in chains.Values) if (chain.Count >= 3) MarkChain(chain);
+        }
+    }
+
+    private int Find(int[] parent, int i) {
+        while (parent[i] != i) { parent[i] = parent[parent[i]]; i = parent[i]; }
+        return i;
+    }
+
+    /// <summary>两车是否相邻 (板面距离 < 0.35 且标量速度差 < 5 m/s — 移动速度是标量不是矢量).</summary>
+    private bool NearCar(DcTarget a, DcTarget b) {
+        var pa = (Vector2)MapSurfaceRef!.InverseTransformPoint(a.Entity.transform.position);
+        var pb = (Vector2)MapSurfaceRef.InverseTransformPoint(b.Entity.transform.position);
+        if (Vector2.Distance(pa, pb) >= 0.35f) return false;
+        float va = a.Velocity.magnitude * 1000f, vb = b.Velocity.magnitude * 1000f; // m/s 标量
+        return Mathf.Abs(va - vb) < 5f;
+    }
+
+    /// <summary>链定案: 数据源 = (n+1)/2 号中心车, 文本锚点 = 最右边车厢 (max 板面 x — 与行车方向无关,
+    /// 从左往右/从右往左都挂右端, 文本永远伸向空处不压别的车厢); 横向避让量 = 从锚点算, 右侧重叠车框所需右移的最大值.</summary>
+    private void MarkChain(System.Collections.Generic.List<DcTarget> chain) {
+        chain.Sort((a, b) => string.CompareOrdinal(a.Name, b.Name));
+        var midT = chain[(chain.Count + 1) / 2 - 1]; // 4→#2, 5→#3, 6→#3 (数据源)
+        var tailT = chain[0];                        // 锚点 = 最右边车厢 (max x)
+        var tbx = (Vector2)MapSurfaceRef!.InverseTransformPoint(tailT.Entity.transform.position);
+        foreach (var t in chain) {
+            var b = (Vector2)MapSurfaceRef.InverseTransformPoint(t.Entity.transform.position);
+            if (b.x > tbx.x) { tailT = t; tbx = b; }
+        }
+        const float frameHalf = 0.03f, textHalf = 0.018f;
+        float baseA = 0.15f * GeoMap.MapCellSize; // 文本锚距 = 矢量符同距 (0.15 小格)
+        var tb = (Vector2)MapSurfaceRef!.InverseTransformPoint(tailT.Entity.transform.position);
+        float shift = 0f;
+        foreach (var t in chain) {
+            if (t == tailT) continue;
+            var b = (Vector2)MapSurfaceRef.InverseTransformPoint(t.Entity.transform.position);
+            float dx = b.x - tb.x, dy = b.y - tb.y;
+            if (dx <= 0f || Mathf.Abs(dy) > 0.05f) continue; // 只避车尾右侧且纵向重叠的框
+            float need = dx + frameHalf + textHalf - baseA;
+            if (need > shift) shift = need;
+        }
+        foreach (var t in chain) t.TrainMember = true;
+        midT.TrainData = true;
+        tailT.TrainAnchor = true;
+        tailT.TrainDataOf = midT;
+        tailT.TrainShift = Mathf.Max(0f, shift);
+    }
+
     /// <summary>棋盘边界 (A-T × 1-10 网格, 留 0.2 余量): 令牌世界坐标 → 板面局部判定 (统一 GeoMap.IsOnBoard).</summary>
     private bool IsOnMap(Vector3 worldPos) {
         if (MapSurfaceRef == null) return false;
@@ -370,4 +455,9 @@ public class DcTarget {
     public EntityKind Kind;
     public int Armour;
     public bool Virtual;          // 令牌虚拟目标: 不画实体图标 (没有内圈菱形框)
+    public bool TrainMember;      // 列车成员 (同名前缀 ≥3 车 + 近距链 + 同标量速度)
+    public bool TrainData;        // 列车数据源 (链序 (n+1)/2 中心车 — 文本显示它的距离/速度)
+    public bool TrainAnchor;      // 列车文本锚点 (名字序最后一节车尾 — 文本挂它右侧, 只它出字)
+    public DcTarget? TrainDataOf; // 锚点引用数据源 (中心车; 非锚点恒 null)
+    public float TrainShift;      // 锚点文本横向避让量 (板面单位, 避开右侧车框)
 }

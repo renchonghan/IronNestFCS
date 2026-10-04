@@ -24,6 +24,7 @@ public class FcsModule : IFcsModule
     private const float BootInitRetry = 0.5f;  // System Init 绑定重试间隔 (s)
     private const float BootInitCap = 30f;     // System Init 实体等待上限 (s)
     private const float BootBenchWait = 2f;    // Bench 采样等待 (s, ping 节奏: 先 ... 等回复再报数)
+    private const float BootHoldWait = 2.1f;   // 自检完成后保留画面 (s, linux 风: 日志停留片刻再切 HUD)
 
     private BootLog? _boot;
     private GunControl? gunL;
@@ -36,6 +37,7 @@ public class FcsModule : IFcsModule
     private FireControl? fireControl;
     private FcsHud? hud;
     private ScenePanel? scenePanel;
+    private NukeAlarm? nukeAlarm;
     private float _lastAliveCheck;
     private float _bootStageT;
     private float _bootRetryT;
@@ -43,6 +45,7 @@ public class FcsModule : IFcsModule
     private int _bootFails;
     private bool _booting;
     private bool _bootFailed;
+    private bool _nukeCanFire;
     private bool _shutdown;
 
     public bool Initialize()
@@ -87,6 +90,16 @@ public class FcsModule : IFcsModule
             fireControl.AutoTask = display.AutoTask;
         }
         scenePanel?.Update();
+        // 核弹警报 (ATMC, 不依赖自动装填 — 纯活读): CANFIRE 上升沿 (装填完成) 且膛内是 ATMC → Load 一轮三声
+        // (推弹落位不响, 响着就击发也不切 — 音轨短, 自然放完即可);
+        // Launch = 开火瞬间 (renderer2.OnNukeFired 回调), 单次自然放完 (落地不切尾巴)
+        if (nukeAlarm != null && nukeAlarm.Ready) {
+            bool anyNuke = IsNukeChamber(gunL?.ChamberLive) || IsNukeChamber(gunR?.ChamberLive);
+            bool anyCanFire = (gunL?.CanFire ?? false) || (gunR?.CanFire ?? false);
+            if (anyCanFire && !_nukeCanFire && anyNuke) nukeAlarm.StartLoad();
+            _nukeCanFire = anyCanFire;
+            if (renderer2 != null) renderer2.NukeArmed = anyCanFire && anyNuke; // 装填确认信号 (核弹圈旋转开始点; 手动装填同覆盖)
+        }
 
         var kb = Keyboard.current;
         if (kb == null || fireControl == null) return;
@@ -132,7 +145,7 @@ public class FcsModule : IFcsModule
                 break;
             case 1: // System Loaded — 全局端口总线 + 锁 + 射表 (硬件已绑定)
                 if (lines[1].State == BootLineState.Hidden) {
-                    lines[1].ActiveText = $"{Stamp()} [INFO] System Loaded For FCS 2.0.0";
+                    lines[1].ActiveText = $"{Stamp()} [INFO] System Loaded For FCS {FcsVersion.Str}";
                     lines[1].State = BootLineState.Active;
                     gcPurchaseLock = new CoroutineLock();
                     fireLock = new CoroutineLock();
@@ -187,8 +200,12 @@ public class FcsModule : IFcsModule
                     lines[11].State = BootLineState.Active;
                     scenePanel = new ScenePanel { Dc = display!, Fc = fireControl!, RadarPort = radar2! };
                     scenePanel.Build();
+                    nukeAlarm = new NukeAlarm();
+                    nukeAlarm.Initialize(); // 核弹警报音频 (wav 缺失只告警不炸)
+                    var alarm = nukeAlarm;
+                    renderer2!.OnNukeFired = () => alarm.StartLaunch(); // 开火瞬间 → Launch (每发一次)
                 }
-                if (t > 0.45f) {
+                if (t > BootHoldWait) { // 自检完成画面停留 (linux 风) 后 HUD 接管
                     _booting = false;
                     _boot = null;
                     MelonLogger.Msg("[FCS] boot complete, HUD live");
@@ -197,8 +214,8 @@ public class FcsModule : IFcsModule
         }
     }
 
-    /// <summary>模块装配步: 显现名字 → 装配 → 停顿后补 [DONE]; 连续失败超上限 → [FAIL] 中断.</summary>
-    private void BootModuleStep(int line, System.Func<bool> bind, System.Action<BootLog.Line>? setup = null)
+    /// <summary>模块装配步: 显现名字 → 装配 → 停顿 (名字与 [DONE] 之间的节奏) 后补 [DONE] 并立刻推下一行 (无推进间隙); 连续失败超上限 → [FAIL] 中断.</summary>
+    private void BootModuleStep(int line, System.Func<bool> bind, System.Action<BootLog.Line>? setup = null, float pause = BootBindPause)
     {
         var l = _boot!.Lines[line];
         float t = Time.time - _bootStageT;
@@ -209,14 +226,12 @@ public class FcsModule : IFcsModule
         }
         if (l.State == BootLineState.Active) {
             if (bind()) {
-                if (t > BootBindPause) l.State = BootLineState.Done;
+                if (t > pause) { l.State = BootLineState.Done; Advance(); } // [DONE] 即推下一行 (无推进间隙)
             } else if (Time.time - _bootRetryT > BootRetry) {
                 _bootRetryT = Time.time;
                 if (++_bootFails > BootFailCap) { l.State = BootLineState.Fail; AbortBoot(); return; }
             }
-            return;
         }
-        if (t > BootBindPause + BootGap) Advance();
     }
 
     private void Advance()
@@ -367,6 +382,8 @@ public class FcsModule : IFcsModule
         _booting = false;
         _bootFailed = false;
         _boot = null;
+        nukeAlarm?.Dispose(); // 音频先停 (F9 重载不留旧声)
+        nukeAlarm = null;
         // 各 Stop 独立 try: 一个炸了不漏全链 (残留实例 → 协程叠加事故防复发)
         try { scenePanel?.ShutDown(); } catch (System.Exception ex) { MelonLogger.Error($"[Shutdown] scenePanel: {ex}"); }
         try { fireControl?.Stop(); } catch (System.Exception ex) { MelonLogger.Error($"[Shutdown] fireControl: {ex}"); }
@@ -388,6 +405,12 @@ public class FcsModule : IFcsModule
         FcsBus.TurretSet = null;
         FcsBus.Fire = null;
         fcs.Dispose();
+    }
+
+    /// <summary>膛内弹字符串是否核弹 (游戏 BulletInChamber 输出, 与 BulletType 同名 — 解析兼容大小写/空格).</summary>
+    private static bool IsNukeChamber(string? chamber) {
+        if (string.IsNullOrEmpty(chamber)) return false;
+        return System.Enum.TryParse<BulletType>(chamber.Trim(), out var bt) && bt == BulletType.ATMC;
     }
 
     /// <summary>NumpadPlus/Minus: 控制所有蒸汽阀门开/关.</summary>

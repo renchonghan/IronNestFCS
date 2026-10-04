@@ -19,6 +19,10 @@ public class SandboxRenderer {
     public Transform? NestRef;       // 铁巢/炮塔 (预瞄线/落点线起点)
     /// <summary>TWS 开关活读 (FcsModule 注入): 关 → 速度矢量符整体不显示.</summary>
     public System.Func<bool>? TwsActive;
+    /// <summary>核弹开火事件 (FcsModule 注入 NukeAlarm): GC 击发确认 (手动/自动通用) → 响 Launch.</summary>
+    public System.Action? OnNukeFired;
+    /// <summary>核弹装填确认 (FcsModule 活读注入: CANFIRE 且膛内 ATMC — 旋转开始点; 手动装填同样覆盖).</summary>
+    public bool NukeArmed;
 
     // ===== 3D 指示器状态 =====
     private readonly Dictionary<GameObject, QueueIndicator> _queueMarks = new();
@@ -31,6 +35,8 @@ public class SandboxRenderer {
 
     private object? _loopHandle;
     private bool _disposed;
+    private float _nukeT0 = -1f;         // 核弹挂架时刻 (转速 S 型爬升起点; 无核弹在炮/在飞时 -1)
+    private float _nukeInactiveAt = -1f; // 失活时刻 (复位保持窗起点 — 从失活瞬间起算, 不是从 t0)
 
     // 层级偏移量 (相对板面 z=0, 越负越浮): 所有标记一律挂板面 —
     // 游戏大地图在实体层上堆叠照片 (改透明度), 挂实体的东西会被盖淡/消失, 只能挂板面.
@@ -46,6 +52,30 @@ public class SandboxRenderer {
     private const float ImpactOffset = ZStep * ImpactPrio; // 0.001
     private const float RedOffset = ZStep * RedPrio;       // 0.002
     private const float SurfScale = 0.212f / 0.81f; // 实体单位 → 板面单位 (实体世界缩放 / 板面世界缩放)
+    private const float NukeSpinZeta = 1.2f; // 核弹转速爬升过阻尼参数 (S 型: ~2s 到 84%, ~3s 到 95%)
+    private const float NukeSpinWn = 2.0f;
+
+    /// <summary>过阻尼阶跃 (0→1, S 型爬升 — 与风螺转速曲线同款).</summary>
+    private static float NukeRamp(float t) {
+        if (t <= 0f) return 0f;
+        float z = NukeSpinZeta, w = NukeSpinWn;
+        float s1 = -w * (z - Mathf.Sqrt(z * z - 1f));
+        float s2 = -w * (z + Mathf.Sqrt(z * z - 1f));
+        return 1f + (s1 * Mathf.Exp(s2 * t) - s2 * Mathf.Exp(s1 * t)) / (s2 - s1);
+    }
+
+    /// <summary>过阻尼阶跃积分 (相位 = 目标转速 × 此积分 — 转速缓慢爬升, 相位连续无跳变).</summary>
+    private static float NukeRampInt(float t) {
+        if (t <= 0f) return 0f;
+        float z = NukeSpinZeta, w = NukeSpinWn;
+        float s1 = -w * (z - Mathf.Sqrt(z * z - 1f));
+        float s2 = -w * (z + Mathf.Sqrt(z * z - 1f));
+        float d = s2 - s1;
+        return t + (s1 / s2 * Mathf.Exp(s2 * t) - s2 / s1 * Mathf.Exp(s1 * t)) / d - (s1 / s2 - s2 / s1) / d;
+    }
+
+    /// <summary>核弹旋转全局相位 (rad): 转速按过阻尼 S 型爬升至 60°/s — 瞄准圈/队列圈/落弹环共用同一时钟, 开火瞬间相位连续无割裂.</summary>
+    private float NukePhase => _nukeT0 >= 0f ? Mathf.PI / 3f * NukeRampInt(Time.time - _nukeT0) : 0f;
     // 速度矢量符尺寸 (板面单位, 用户定稿): 空心圆半径 0.005 = 静止点直径; 点缩至原 1/4
     private const float SpeedR = 0.005f;     // 矢量符圆半径 (线长基准 r: 0.5r/1r/1.5r 对数档)
     private const float SpeedDotR = 0.0025f; // 静止点半径
@@ -68,6 +98,52 @@ public class SandboxRenderer {
             UpdateImpacts();
             UpdateTracks();   // 目标轨迹线: 开火前跟解算, 开火后沿冻结轨迹缩短
             FollowIcons(); // 实体图标挂板面, 每帧跟随实体世界位置
+            UpdateQueueBreath(); // 队列杀伤圈呼吸 (0.5Hz 透明度脉动)
+            UpdateNukeClock();   // 核弹挂架时钟 (转速爬升起点)
+        }
+    }
+
+    /// <summary>核弹挂架时钟: 有 ATMC 在炮 (瞄准圈) 或在飞 (落弹环) 记 t0, 全无复位 — 下次挂架重新 S 型爬升.</summary>
+    private void UpdateNukeClock() {
+        bool active = NukeArmed; // 装填确认 (CANFIRE + 膛内核弹) = 旋转开始点; 手动装填同覆盖
+        if (!active) {
+            foreach (var kv in _impacts) {
+                var im = kv.Value;
+                bool expanding = im.Landed && im.NukeLandedAt >= 0f && Time.time - im.NukeLandedAt < 1f; // 落地扩散动画期间相位不断
+                if (im.Root != null && im.Root.activeSelf && im.Shell == BulletType.ATMC && (!im.Landed || expanding)) { active = true; break; }
+            }
+        }
+        // 复位加 1.5s 保持 (从失活瞬间起算): 开火后 armed 掉、落弹指示器 ~1s 才接上 — 空隙内相位不断, 开火交接无停顿
+        if (active) {
+            _nukeInactiveAt = -1f;
+            if (_nukeT0 < 0f) _nukeT0 = Time.time;
+        }
+        else if (_nukeT0 >= 0f) {
+            if (_nukeInactiveAt < 0f) _nukeInactiveAt = Time.time;
+            else if (Time.time - _nukeInactiveAt > 1.5f) _nukeT0 = -1f;
+        }
+    }
+
+    /// <summary>核弹队列辐射标呼吸 (周期 3s: 1s 升 → 0.5s 保持 1 → 1s 降 → 0.5s 保持 0): 只有 ATMC 的辐射标闪, 最外圈杀伤圈保持常显.
+    /// 弹种切换时 RebuildCircle 重画线 (alpha 回 1), 无需显式复位.</summary>
+    private void UpdateQueueBreath() {
+        float p = Time.time % 3f;
+        float alpha;
+        if (p < 1f) alpha = p;              // 1s 升 (0→1)
+        else if (p < 1.5f) alpha = 1f;      // 0.5s 保持 1
+        else if (p < 2.5f) alpha = 2.5f - p; // 1s 降 (1→0)
+        else alpha = 0f;                    // 0.5s 保持 0
+        foreach (var kv in _queueMarks) {
+            var mark = kv.Value;
+            if (mark.Root == null || mark.Shell != BulletType.ATMC) continue;
+            BreathRoot(mark.RadiationRoot, alpha);
+        }
+    }
+
+    private static void BreathRoot(GameObject root, float alpha) {
+        if (root == null || !root.activeSelf) return;
+        foreach (var line in root.transform.GetComponentsInChildren<Il2CppShapes.Line>()) {
+            line.Color = new Color(1f, 0f, 0f, alpha);
         }
     }
 
@@ -79,7 +155,58 @@ public class SandboxRenderer {
             var b = (Vector2)MapSurfaceRef.InverseTransformPoint(pair.Key.transform.position);
             pair.Value.Root.transform.localPosition = new Vector3(b.x, b.y, RedOffset);
             UpdateSpeedVector(pair.Value);
+            UpdateTwsInfo(pair.Value);
         }
+    }
+
+    /// <summary>TWS 信息文本 (菱形框右侧, 两排中心与矢量符同距): 上排距离 xx.xxkm / 下排速度 m/s
+    /// (≥100 整数, 10~100 一位小数, <10 两位小数 — 无 xxx.x 形态; 空格对齐不补 0); 静止单行只有距离;
+    /// TWS 关/参考点不显示. 两行总高 ≈ 菱形框高 (行高 0.025 × 2 ≈ 菱形 0.05).</summary>
+    private void UpdateTwsInfo(IconEntry e) {
+        if (e.TextRoot == null) return;
+        // 列车成员: 只让车尾锚点出文本, 其余成员 (含中心数据源) 的框留白
+        if (e.Target.TrainMember && !e.Target.TrainAnchor) { e.TextRoot.SetActive(false); return; }
+        if (TwsActive == null || !TwsActive() || e.Target.Kind == EntityKind.Reference || MapSurfaceRef == null || NestRef == null) {
+            e.TextRoot.SetActive(false);
+            return;
+        }
+        // 锚点文本横向避让 (避开右侧重叠车框 — GroupTrains 算的 TrainShift)
+        e.TextRoot.transform.localPosition = new Vector3(0.15f * GeoMap.MapCellSize + e.Target.TrainShift, 0f, 0f);
+        var data = e.Target.TrainDataOf ?? e.Target; // 列车: 数据 = 中心车 (距离/速度都取它)
+        var tb = (Vector2)MapSurfaceRef.InverseTransformPoint(data.Entity.transform.position);
+        var nb = (Vector2)MapSurfaceRef.InverseTransformPoint(NestRef.position);
+        float km = Vector2.Distance(tb, nb) * GeoMap.KmPerLocal; // 板面 → km (一律经 KmPerLocal)
+        float ms = data.Velocity.magnitude * 1000f;               // km/s → m/s
+        string dist = FmtDist(km);
+        string spd = ms >= 1f ? FmtSpd(ms) : "";                  // <1 m/s 静止: 单行
+        if (dist == e.DistText && spd == e.SpdText) return;       // 没变不重画
+        e.DistText = dist;
+        e.SpdText = spd;
+        const float segW = 0.006f;  // 字号 (字高 H = 1.6×segW; 原 2/3 再 ×3/4 — 用户定稿)
+        float step = segW * 0.7f;   // 半宽字形 (宽 segW/2) 的字符间距
+        // 行布局 (字形格从基线 y=0 向上长 H): 两行 = 上排基线 +0.25H / 下排基线 −1.25H (行间留 0.5H 空档, 块心在锚点);
+        // 单行 = 基线 −0.5H (垂直居中)
+        ClearChildren(e.Line1Root.transform);
+        for (int i = 0; i < dist.Length; i++)
+            Glyph16Font.DrawCharSegmentsNarrow(e.Line1Root.transform, dist[i], e.Color, i * step - ((dist.Length - 1) * step + segW * 0.5f) / 2f, segW);
+        e.Line1Root.transform.localPosition = new Vector3(0f, spd.Length > 0 ? 0.4f * segW : -0.8f * segW, 0f);
+        ClearChildren(e.Line2Root.transform);
+        if (spd.Length > 0) {
+            for (int i = 0; i < spd.Length; i++)
+                Glyph16Font.DrawCharSegmentsNarrow(e.Line2Root.transform, spd[i], e.Color, i * step - ((spd.Length - 1) * step + segW * 0.5f) / 2f, segW);
+            e.Line2Root.transform.localPosition = new Vector3(0f, -2f * segW, 0f);
+            e.Line2Root.SetActive(true);
+        } else e.Line2Root.SetActive(false);
+        e.TextRoot.SetActive(true);
+    }
+
+    /// <summary>距离文本: xx.xx + km, 数字前空格对齐不补 0.</summary>
+    private static string FmtDist(float km) => $"{km,5:F2}km";
+
+    /// <summary>速度文本: ≥100 整数 / 10~100 一位小数 / <10 两位小数 (无 xxx.x 形态), 空格对齐不补 0.</summary>
+    private static string FmtSpd(float ms) {
+        string s = ms >= 100f ? ms.ToString("F0") : ms >= 10f ? ms.ToString("F1") : ms.ToString("F2");
+        return $"{s,5}m/s";
     }
 
     /// <summary>速度矢量符 (战雷 TTS 同款): 目标中心往下 0.15 格, 静止 = 点, 运动 = 空心圆 (半径 SpeedR) + 速度方向线 (自圆周伸出).
@@ -144,9 +271,12 @@ public class SandboxRenderer {
             _ballistic[side] = mark;
         }
         mark.Root.transform.localPosition = new Vector3(boardPos.x, boardPos.y, GreenOffset);
+        mark.BulletType = bulletType;
         if (mark.RadiusRoot == null) {
             mark.RadiusRoot = new GameObject("FCS2_AimRadius");
             mark.RadiusRoot.transform.SetParent(mark.Root.transform, false);
+            mark.RadiationRoot = new GameObject("FCS2_AimRadiation");
+            mark.RadiationRoot.transform.SetParent(mark.Root.transform, false);
             mark.CrossRoot = new GameObject("FCS2_AimCross");
             mark.CrossRoot.transform.SetParent(mark.Root.transform, false);
             mark.CornerRoot = new GameObject("FCS2_AimCorners");
@@ -215,9 +345,14 @@ public class SandboxRenderer {
                 }
             }
         }
-        // 外圈跟任务弹种: 穿甲弹带 X 指示 (旧版同款)
+        // 外圈跟任务弹种: 穿甲弹带 X 指示 (旧版同款; ATMC = 辐射标 + 外圈带六刻度)
         RebuildCircle(mark.RadiusRoot.transform, killRadiusKm, GreenOffset, Color.green, solid: false, pierce: IsArmorPierce((BulletType)bulletType),
-            ref mark.RadiusKm, ref mark.SegCount, ref mark.Pierce);
+            (BulletType)bulletType, ref mark.RadiusKm, ref mark.SegCount, ref mark.Pierce, ref mark.PierceBt);
+        if ((BulletType)bulletType == BulletType.ATMC) RebuildRadiation(mark.RadiationRoot!.transform, killRadiusKm, Color.green, GreenPrio, ref mark.RadiationKm);
+        else if (mark.RadiationRoot != null && mark.RadiationRoot.transform.childCount > 0) { ClearChildren(mark.RadiationRoot.transform); mark.RadiationKm = -1f; }
+        // 核弹装填确认后转 (全局相位, 与队列/落弹环同步 — 开火瞬间无割裂): 只转辐射标 (外圈虚线圆/刻度保持静止, 与落弹点口径一致)
+        var nukeRot = Quaternion.Euler(0f, 0f, NukePhase * Mathf.Rad2Deg);
+        if (mark.RadiationRoot != null) mark.RadiationRoot.transform.localRotation = (BulletType)bulletType == BulletType.ATMC && NukeArmed ? nukeRot : Quaternion.identity;
     }
 
     /// <summary>打击队列指示器批量同步 (FC 每帧调用): 队列任务 + 在炮任务 → 逐实体更新指示器.
@@ -263,6 +398,7 @@ public class SandboxRenderer {
             mark = new QueueIndicator {
                 Root = new GameObject("FCS2_QueueMark"),
                 RadiusRoot = new GameObject("FCS2_QueueRadius"),
+                RadiationRoot = new GameObject("FCS2_QueueRadiation"),
                 LabelRoot = new GameObject("FCS2_QueueLabel"),
                 BulletRoot = new GameObject("FCS2_QueueBullet"),
                 LineRoot = new GameObject("FCS2_QueueLine"),
@@ -271,6 +407,7 @@ public class SandboxRenderer {
             };
             mark.Root.transform.SetParent(MapSurfaceRef, false);
             mark.RadiusRoot.transform.SetParent(mark.Root.transform, false);
+            mark.RadiationRoot.transform.SetParent(mark.Root.transform, false);
             mark.LabelRoot.transform.SetParent(mark.Root.transform, false);
             mark.BulletRoot.transform.SetParent(mark.Root.transform, false);
             mark.LineRoot.transform.SetParent(MapSurfaceRef, false); // 预瞄线直接挂板面 (落点层), 不跟队列标记根
@@ -293,6 +430,7 @@ public class SandboxRenderer {
         bool hasAim = !float.IsNaN(aimEnd.x) && !float.IsNaN(aimEnd.y) && aimEnd.sqrMagnitude > 1e-8f;
         Vector2 aimOff = hasAim ? aimEnd - entityBoard : Vector2.zero;
         mark.RadiusRoot.transform.localPosition = new Vector3(aimOff.x, aimOff.y, 0f); // 圈跟预瞄点
+        mark.RadiationRoot.transform.localPosition = new Vector3(aimOff.x, aimOff.y, 0f); // 辐射标同位移
         mark.Slot = slot;
         mark.QueuePos = queuePos;
         mark.Shell = shell;
@@ -312,11 +450,16 @@ public class SandboxRenderer {
                 }
             }
         }
-        // 红杀伤圈 (板面父级, 板面单位直接画)
+        // 红杀伤圈 (板面父级, 板面单位直接画; ATMC = 辐射标 + 外圈带六刻度)
         float rKm = ShellData.KillRadiusKm(shell);
         bool pierce = IsArmorPierce(shell);
-        RebuildCircle(mark.RadiusRoot.transform, rKm, RedOffset, Color.red, solid: shell == BulletType.DRIL, pierce: pierce,
-            ref mark.RadiusKm, ref mark.SegCount, ref mark.Pierce, RedPrio);
+        RebuildCircle(mark.RadiusRoot.transform, rKm, RedOffset, Color.red, solid: shell == BulletType.DRIL, pierce: pierce, shell,
+            ref mark.RadiusKm, ref mark.SegCount, ref mark.Pierce, ref mark.PierceBt, RedPrio);
+        if (shell == BulletType.ATMC) RebuildRadiation(mark.RadiationRoot.transform, rKm, Color.red, RedPrio, ref mark.RadiationKm);
+        else if (mark.RadiationRoot.transform.childCount > 0) { ClearChildren(mark.RadiationRoot.transform); mark.RadiationKm = -1f; }
+        // 核弹圈同全局相位旋转 (与绿瞄准圈/落弹环同步) — 上炮且装填确认才转, 排队不转; 只转辐射标, 外圈虚线圆/刻度静止
+        var nukeRot = Quaternion.Euler(0f, 0f, NukePhase * Mathf.Rad2Deg);
+        mark.RadiationRoot.transform.localRotation = shell == BulletType.ATMC && mark.Slot != Slot.Queue && NukeArmed ? nukeRot : Quaternion.identity;
         // 编号米字数码 (旧版 SetMarkLabel 逐条复刻, 板面空间: 实体局部字号 × SurfScale): 字号 0.045×5/6, 间距 1.4×, 上方 0.14+dy
         const float segW = 0.045f * 5f / 6f * SurfScale;
         float step = segW * 1.4f;
@@ -393,11 +536,13 @@ public class SandboxRenderer {
             im.SolidRoot = new GameObject("FCS2_ImpactSolid");
             im.DotRoot = new GameObject("FCS2_ImpactDot");
             im.CircleRoot = new GameObject("FCS2_ImpactCircle");
+            im.RadiationRoot = new GameObject("FCS2_ImpactRadiation");
+            im.TriRoot = new GameObject("FCS2_ImpactTris");
             im.TimerRoot = new GameObject("FCS2_ImpactTimer");
             im.BulletRoot = new GameObject("FCS2_ImpactBullet");
-            foreach (var c in new[] { im.FixedRoot, im.SolidRoot, im.DotRoot, im.CircleRoot, im.TimerRoot, im.BulletRoot })
+            foreach (var c in new[] { im.FixedRoot, im.SolidRoot, im.DotRoot, im.CircleRoot, im.RadiationRoot, im.TriRoot, im.TimerRoot, im.BulletRoot })
                 c.transform.SetParent(im.Root.transform, false);
-            // 红线/红点挂 ImpactOffset 同层 (圈/字在各自动作里单独设 z, 这里只抬线层)
+            // 红线/红点挂 ImpactOffset 同层 (圈/字/核弹三角在各自动作里单独设 z, 这里只抬线层)
             foreach (var c in new[] { im.FixedRoot, im.SolidRoot, im.DotRoot })
                 c.transform.localPosition = new Vector3(0f, 0f, ImpactOffset);
             // 实心红点 (圆画在局部原点, 后续移动父级位置即可, 只建一次)
@@ -411,6 +556,7 @@ public class SandboxRenderer {
         im.Flight = flight; // 剩余/落地统一口径 (GC 每帧更新 Flight, 这里只存引用直读字段)
         im.LastShownSecond = -1;
         im.Landed = false;
+        im.NukeLandedAt = -1f; // 上一发扩散残留复位
         // 上一发落地后隐藏的飞行件恢复激活 (虚线一直留着, 见 LandImpact)
         im.SolidRoot.SetActive(true);
         im.DotRoot.SetActive(true);
@@ -445,11 +591,29 @@ public class SandboxRenderer {
         im.FixedLine.gameObject.SetActive(true);
         // 实线缓存作废: 下一帧 UpdateImpacts 按新弹道重建 (起点=炮口, 终点=新落点)
         if (im.SolidLine != null) { try { UnityEngine.Object.Destroy(im.SolidLine.gameObject); } catch { } im.SolidLine = null; }
-        // 红落点圈 (弹种杀伤半径, 随弹种)
+        // 红落点圈 (弹种杀伤半径, 随弹种; ATMC = 辐射标 + 外圈带六刻度 + 飞行收拢三角)
         float rKm = ShellData.KillRadiusKm(im.Shell);
-        RebuildCircle(im.CircleRoot.transform, rKm, 0f, Color.red, solid: im.Shell == BulletType.DRIL, pierce: IsArmorPierce(im.Shell),
-            ref im.RadiusKm, ref im.SegCount, ref im.Pierce, ImpactPrio);
+        RebuildCircle(im.CircleRoot.transform, rKm, 0f, Color.red, solid: im.Shell == BulletType.DRIL, pierce: IsArmorPierce(im.Shell), im.Shell,
+            ref im.RadiusKm, ref im.SegCount, ref im.Pierce, ref im.PierceBt, ImpactPrio);
         im.CircleRoot.transform.localPosition = new Vector3(im.ImpactBoard.x, im.ImpactBoard.y, ImpactOffset);
+        if (im.Shell == BulletType.ATMC) {
+            im.NukeR = rKm * GeoMap.MapCellSize / 3f; // 核弹 R = 杀伤半径/3 (板面单位)
+            RebuildRadiation(im.RadiationRoot.transform, rKm, Color.red, ImpactPrio, ref im.RadiationKm);
+            im.RadiationRoot.transform.localPosition = new Vector3(im.ImpactBoard.x, im.ImpactBoard.y, ImpactOffset);
+            im.RadiationRoot.transform.localScale = Vector3.one; // 上一发收拢残留复位
+            im.RadiationLines.Clear();
+            foreach (var line in im.RadiationRoot.transform.GetComponentsInChildren<Il2CppShapes.Line>())
+                im.RadiationLines.Add((line, line.Thickness)); // 线宽基准缓存 (收缩补偿用)
+            im.TriRoot.transform.localScale = Vector3.one; // 三角跟缩残留复位
+            im.TriRoot.transform.localPosition = new Vector3(im.ImpactBoard.x, im.ImpactBoard.y, ImpactOffset); // 三角锚点 = 落点 (根挂板面原点, 不跟落点会聚拢到地图中心)
+            BuildTris(im);
+            OnNukeFired?.Invoke(); // 核弹开火 → Launch 警报 (每发一次)
+        } else {
+            if (im.RadiationRoot.transform.childCount > 0) { ClearChildren(im.RadiationRoot.transform); im.RadiationKm = -1f; }
+            ClearTris(im);
+        }
+        im.RadiationRoot.SetActive(im.Shell == BulletType.ATMC);
+        im.TriRoot.SetActive(im.Shell == BulletType.ATMC);
         // 弹种标签 (飞行时挪到队列编号位: 与队列时 L-X 同 y = 0.14 + dy; 板面空间 = 实体空间常量 × SurfScale)
         float segW = 0.045f * 5f / 6f * SurfScale;
         float step = segW * 1.4f;
@@ -466,7 +630,19 @@ public class SandboxRenderer {
         im.SegW = segW;
         im.Step = step;
         im.TimerY = im.ImpactBoard.y + (-0.2f * SurfScale - dy);
+        // 淡入预写 alpha 0: 消除开火瞬间到下一帧 UpdateImpacts 之间的 ~16ms 全亮闪
+        foreach (var line in im.Root.transform.GetComponentsInChildren<Il2CppShapes.Line>())
+            line.Color = new Color(1f, 0f, 0f, 0f);
         im.Root.SetActive(true);
+    }
+
+    /// <summary>核弹扩散启动 (飞行计时到 0 或落地事件都行, 只触发一次): 扇叶/三角/外圈藏, 中心内圈实体复用为扩散环.</summary>
+    private static void StartNukeExpand(ImpactIndicator im) {
+        if (im.NukeLandedAt >= 0f) return;
+        im.CircleRoot.SetActive(false);
+        im.TriRoot.SetActive(false);
+        for (int i = 48; i < im.RadiationLines.Count; i++) im.RadiationLines[i].Line.gameObject.SetActive(false); // 内圈 48 段在前, 扇叶 78 线在后
+        im.NukeLandedAt = Time.time;
     }
 
     /// <summary>落地对账: Flight 判定的落地时刻, 目标彼时实际位置 vs 落点 — 直接差 = 打远/打近 (不依赖铁巢/开火计时).</summary>
@@ -477,7 +653,8 @@ public class SandboxRenderer {
     }
 
     /// <summary>落地: 飞行件全部隐藏 (实线/红点/计时/弹种标签/杀伤圈) — 只有红色虚线弹道保留到下一次开火
-    /// (下一发 ImpactFired 恢复并重画; 恒定实体不销毁).</summary>
+    /// (下一发 ImpactFired 恢复并重画; 恒定实体不销毁).
+    /// 核弹例外: 圈/辐射标/三角保留 — 中心收敛图标 1s 扩散回整杀伤圈后再藏 (航拍反馈接管前).</summary>
     private static void LandImpact(ImpactIndicator im) {
         if (im.Landed) return;
         im.Landed = true;
@@ -485,7 +662,13 @@ public class SandboxRenderer {
         im.DotRoot.SetActive(false);
         im.TimerRoot.SetActive(false);
         im.BulletRoot.SetActive(false);
+        if (im.Shell == BulletType.ATMC) {
+            StartNukeExpand(im); // 扩散动画起点 (扇叶/三角/外圈藏, 内圈复用扩散)
+            return;
+        }
         im.CircleRoot.SetActive(false);
+        im.RadiationRoot.SetActive(false); // 核弹辐射标同属飞行件
+        im.TriRoot.SetActive(false);
     }
 
     // ===== 目标轨迹线 + 交汇点 (FC 解算 push) =====
@@ -610,9 +793,26 @@ public class SandboxRenderer {
     private void UpdateImpacts() {
         foreach (var kv in _impacts) {
             var im = kv.Value;
-            if (im.Root == null || !im.Root.activeSelf || im.Landed) continue; // 未激活/已落地 不动
+            if (im.Root == null || !im.Root.activeSelf) continue; // 未激活 不动
             if (im.Flight == null) continue;
-            if (im.Flight.Landed) { LogLanding(kv.Key, im); LandImpact(im); continue; } // 落地: 飞行件隐藏
+            if (im.Flight.Landed && !im.Landed) { LogLanding(kv.Key, im); LandImpact(im); } // 落地: 飞行件隐藏
+            if (im.NukeLandedAt >= 0f) {
+                // 核弹扩散动画: 收拢结束 (最后 1.5s 刚完, 不等落地事件) 中心内圈 1s 扩到杀伤半径
+                // (0.6R×s=3R → s: sStop→5, 线宽补偿保持 5t 世界宽, 旋转继续), 扩完全部隐藏 (航拍反馈接管)
+                float e = Mathf.Clamp01((Time.time - im.NukeLandedAt) / 1f);
+                im.RadiationRoot.transform.localRotation = Quaternion.Euler(0f, 0f, NukePhase * Mathf.Rad2Deg);
+                if (e >= 1f) {
+                    im.RadiationRoot.SetActive(false);
+                    im.NukeLandedAt = -1f; // 扩散完
+                } else {
+                    float sStop = Mathf.Min(1f, 0.125f / Mathf.Max(0.1f, im.RadiusKm));
+                    float s = Mathf.Lerp(sStop, 5f, e); // 缩到中心的内圈 → 杀伤半径
+                    im.RadiationRoot.transform.localScale = new Vector3(s, s, s);
+                    foreach (var (line, t) in im.RadiationLines) line.Thickness = t / s;
+                }
+                continue;
+            }
+            if (im.Landed) continue; // 非核弹已落地: 飞行件已在 LandImpact 藏好
             float remain = im.Flight.Remain;
             float progress = 1f - remain / im.Flight.FlyTime; // 0=刚出膛 1=落地
             Vector2 shell = Vector2.Lerp(im.NestBoard, im.ImpactBoard, progress);
@@ -637,6 +837,51 @@ public class SandboxRenderer {
                 for (int k = 0; k < t.Length; k++) {
                     Glyph16Font.DrawCharSegments(im.TimerRoot.transform, t[k], Color.red, k * im.Step, im.SegW);
                 }
+            }
+            // 核弹指示器旋转 + 三角收拢 (恒定实体每帧只动端点):
+            // 整体逆时针 60°/s (= 1/6 圈/s — 三对称转 120° 即"归位", 视觉周期 2s; 你写的 1/6 rad/s 按圈理解, 否则归位要 12.6s);
+            // 开火后 1s 透明度淡入 (旋转开始不生硬); 收拢终点 = 顶角重合 (d→h: 内顶点压在圆心, 三三角不再叠成一团)
+            if (im.Shell == BulletType.ATMC && im.TriLines[0] != null) {
+                var rot = Quaternion.Euler(0f, 0f, NukePhase * Mathf.Rad2Deg); // 全局相位 — 与瞄准圈/队列圈同步, 开火瞬间无割裂
+                im.RadiationRoot.transform.localRotation = rot; // 辐射标跟转 (内圈圆旋转对称无感, 扇叶/刻度转)
+                im.TriRoot.transform.localRotation = rot;
+                // 淡入: 完全透明 1s (传导延迟), 再 1s 缓慢浮现 (alpha 0→1) — 全根扫描, 外圈/刻度/辐射标/三角/字一起缓入
+                float fade = Mathf.Clamp01((im.Flight.FlyTime - remain - 1f) / 1f);
+                foreach (var line in im.Root.transform.GetComponentsInChildren<Il2CppShapes.Line>())
+                    line.Color = new Color(1f, 0f, 0f, fade);
+                float denom = im.Flight.FlyTime - 1.5f;
+                if (denom < 0.001f) denom = im.Flight.FlyTime; // 短弹道: 收拢压到全程
+                float frac = Mathf.Clamp01((im.Flight.FlyTime - remain) / denom);
+                float h = 0.5f * im.NukeR / Mathf.Sqrt(3f); // 顶点距 (边长 0.5R)
+                float d = Mathf.Lerp(2.8f * im.NukeR, h, frac); // 从 2.8R 收到 h (顶角重合于圆心)
+                // 最后 1.5s: 辐射告警收拢 — s: 1 → s_stop = 0.125/rKm (内圈直径 = 线宽 5t 即停, 再缩没意义);
+                // 三角跟缩 ts = min(1, s/0.208) — 保证外廓 0.5R·ts ≤ 扇叶外缘 2.4R·s (扇叶缩过 0.5R 后三角同步缩);
+                // 两处线宽都补偿 (世界线宽不随缩放走)
+                float sStop = Mathf.Min(1f, 0.125f / Mathf.Max(0.1f, im.RadiusKm));
+                float shrinkP = Mathf.Clamp01((1.5f - remain) / 1.5f);
+                float s = Mathf.Lerp(1f, sStop, shrinkP);
+                float ts = Mathf.Min(1f, s / 0.208f);
+                im.RadiationRoot.transform.localScale = new Vector3(s, s, s);
+                im.TriRoot.transform.localScale = new Vector3(ts, ts, ts);
+                if (s > 0.001f) {
+                    foreach (var (line, t) in im.RadiationLines) line.Thickness = t / s;
+                }
+                if (ts > 0.05f) {
+                    float tTri = 0.05f * GeoMap.MapCellSize / ts; // 三角线宽补偿 (基准 5t)
+                    for (int k = 0; k < im.TriLines.Length; k++) if (im.TriLines[k] != null) im.TriLines[k].Thickness = tTri;
+                }
+                for (int k = 0; k < 3; k++) {
+                    float a = Mathf.PI / 6f + k * 2f * Mathf.PI / 3f; // 30/150/270° (与扇叶互补)
+                    TrisVerts(a, d, h, out var p1, out var p2, out var p3);
+                    im.TriLines[k * 3].Start = new Vector3(p1.x, p1.y, 0f);
+                    im.TriLines[k * 3].End = new Vector3(p2.x, p2.y, 0f);
+                    im.TriLines[k * 3 + 1].Start = new Vector3(p2.x, p2.y, 0f);
+                    im.TriLines[k * 3 + 1].End = new Vector3(p3.x, p3.y, 0f);
+                    im.TriLines[k * 3 + 2].Start = new Vector3(p3.x, p3.y, 0f);
+                    im.TriLines[k * 3 + 2].End = new Vector3(p1.x, p1.y, 0f);
+                }
+                // 收拢结束 (最后 1.5s 刚完, remain≤0): 内圈开始扩散 — 用计时不等落地事件
+                if (remain <= 0f) StartNukeExpand(im);
             }
         }
     }
@@ -677,8 +922,17 @@ public class SandboxRenderer {
             FillDot(dotRoot.transform, Vector2.zero, SpeedDotR, color, RedPrio);
             line = Line(speedRoot.transform, Vector2.zero, new Vector2(SpeedR, 0f), spdW, color, RedPrio);
         }
+        // TWS 信息文本 (菱形框右侧): 两排中心 = (a,0), 与矢量符 (0,-a) 到目标同距 (用户定稿)
+        var textRoot = new GameObject("FCS2_TwsInfo");
+        textRoot.transform.SetParent(root.transform, false);
+        textRoot.transform.localPosition = new Vector3(0.15f * GeoMap.MapCellSize, 0f, 0f);
+        var line1 = new GameObject("FCS2_TwsDist");
+        line1.transform.SetParent(textRoot.transform, false);
+        var line2 = new GameObject("FCS2_TwsSpd");
+        line2.transform.SetParent(textRoot.transform, false);
         _icons[t.Entity] = new IconEntry {
             Root = root, Target = t, SpeedRoot = speedRoot!, CircleRoot = circleRoot!, DotRoot = dotRoot!, SpeedLine = line!,
+            TextRoot = textRoot, Line1Root = line1, Line2Root = line2, Color = color,
         };
     }
 
@@ -792,33 +1046,107 @@ public class SandboxRenderer {
     }
 
     /// <summary>杀伤圈 (旧版 BuildKillCircle 逐条复刻): 段数 = 2πr/(2×dashLen) 取偶 (奇数不轴对称),
-    /// 各圈自转 90°/n, 实线覆盖角 = dash/r; solid=整圆 24 段; pierce = 从圆周向内 4 条半半径 X 线.
-    /// 全部挂板面, 板面单位直接画.</summary>
-    private static void RebuildCircle(Transform root, float rKm, float z, Color color, bool solid, bool pierce, ref float lastR, ref int lastN, ref bool lastPierce, int prio = GreenPrio) {
+    /// 各圈自转 90°/n, 实线覆盖角 = dash/r; solid=整圆 24 段; pierce = 穿甲指示 (AP 等 = 从圆周向内 4 条半半径 X 线;
+    /// ATMC = 外圈带 2.8R~3R 六短辐刻度). 全部挂板面, 板面单位直接画.</summary>
+    private static void RebuildCircle(Transform root, float rKm, float z, Color color, bool solid, bool pierce, BulletType bt, ref float lastR, ref int lastN, ref bool lastPierce, ref BulletType lastBt, int prio = GreenPrio) {
         float rB = rKm * GeoMap.MapCellSize;               // 板面单位 (段数/虚线长按板面算)
         const float dashB = 0.01f;                         // KillDashLen (板面单位)
         int n = solid ? 24 : Mathf.Max(4, (int)Mathf.Round(2f * Mathf.PI * rB / (2f * dashB)));
         if (!solid && (n & 1) != 0) n--; // 虚线段数取偶数: 奇数段图案不轴对称, 看着歪
-        if (Mathf.Abs(rKm - lastR) < 0.0001f && n == lastN && pierce == lastPierce && root.childCount > 0) return;
+        if (Mathf.Abs(rKm - lastR) < 0.0001f && n == lastN && pierce == lastPierce && bt == lastBt && root.childCount > 0) return;
         lastR = rKm;
         lastN = n;
         lastPierce = pierce;
+        lastBt = bt;
         ClearChildren(root);
         float r = rB;                                       // 板面半径
         float dash = dashB;                                 // 板面虚线弧长
-        float t = 0.01f * GeoMap.MapCellSize;               // KillThick (板面单位)
+        float t = 0.02f * GeoMap.MapCellSize;               // KillThick 2× (板面单位, 用户定稿)
         for (int s = 0; s < n; s++) {
             float a0 = Mathf.PI * 2f * s / n + (solid ? 0f : Mathf.PI / (2f * n)); // 各圈各自转 90°/n
             float a1 = a0 + (solid ? Mathf.PI * 2f / n : dash / r);                // 实线覆盖角
             Line(root, new Vector2(Mathf.Cos(a0), Mathf.Sin(a0)) * r, new Vector2(Mathf.Cos(a1), Mathf.Sin(a1)) * r, t, color, prio);
         }
-        if (pierce) { // 穿甲指示: 从圆周向内 4 条半半径长线, X 型 (对角方向)
-            Vector2[] xdirs = { new(1f, 1f), new(-1f, 1f), new(1f, -1f), new(-1f, -1f) };
-            foreach (var d in xdirs) {
-                Vector2 dn = d.normalized;
-                Line(root, dn * r, dn * (r * 0.5f), t, color, prio);
+        if (pierce) {
+            if (bt == BulletType.ATMC) {
+                // 核弹穿甲指示: 外圈带 6 条短辐线 (2.8R~3R, 每 60°, 随辐射标顺时针 30°) — 辐射警示刻度 (X 留给其他穿甲弹)
+                for (int s = 0; s < 6; s++) {
+                    float a = Mathf.PI * 2f * s / 6f - Mathf.PI / 6f;
+                    var d = new Vector2(Mathf.Cos(a), Mathf.Sin(a));
+                    Line(root, d * (r * 2.8f / 3f), d * r, t, color, prio);
+                }
+            } else {
+                // 穿甲指示: 从圆周向内 4 条半半径长线, X 型 (对角方向)
+                Vector2[] xdirs = { new(1f, 1f), new(-1f, 1f), new(1f, -1f), new(-1f, -1f) };
+                foreach (var d in xdirs) {
+                    Vector2 dn = d.normalized;
+                    Line(root, dn * r, dn * (r * 0.5f), t, color, prio);
+                }
             }
         }
+    }
+
+    /// <summary>核弹辐射标 (ATMC 专属): 内圈实线圆 (0.6R, 线宽 5×) + 3 扇叶 (0.9R~2.4R, 线宽 5×, 两条径向边 + 0.9R 内弧/2.4R 外弧, 闭合成形);
+    /// 整体顺时针转 30° (轴 −30/90/210°). 段数加密 (圆 48 段/弧 12 弦) 消小半径棱角. R = 杀伤半径/3, 板面单位直接画.</summary>
+    private static void RebuildRadiation(Transform root, float rKm, Color color, int prio, ref float lastR) {
+        if (Mathf.Abs(rKm - lastR) < 0.0001f && root.childCount > 0) return;
+        lastR = rKm;
+        ClearChildren(root);
+        float t = 0.01f * GeoMap.MapCellSize; // 基准线宽
+        float tC = t * 5f;                    // 中心圆线宽 5× (用户定稿)
+        float tB = t * 5f;                    // 扇叶线宽 5× (用户定稿)
+        float R = rKm * GeoMap.MapCellSize / 3f;
+        const int segs = 48; // 中心圆段数 (24 段小半径有棱角)
+        for (int i = 0; i < segs; i++) { // 内圈圆 (0.6R)
+            float a0 = i * 2f * Mathf.PI / segs, a1 = (i + 1) * 2f * Mathf.PI / segs;
+            Line(root, new Vector2(Mathf.Cos(a0), Mathf.Sin(a0)) * (0.6f * R), new Vector2(Mathf.Cos(a1), Mathf.Sin(a1)) * (0.6f * R), tC, color, prio);
+        }
+        for (int b = 0; b < 3; b++) { // 3 扇叶 (顺时针 30°: 轴 −30/90/210°, ±30° 径向边 + 内弧 0.9R/外弧 2.4R 各 12 弦, 闭合成形)
+            float axis = b * 2f * Mathf.PI / 3f - Mathf.PI / 6f;
+            for (int e = -1; e <= 1; e += 2) {
+                float a = axis + e * Mathf.PI / 6f;
+                var d = new Vector2(Mathf.Cos(a), Mathf.Sin(a));
+                Line(root, d * (0.9f * R), d * (2.4f * R), tB, color, prio);
+            }
+            const int arcSegs = 12;
+            for (int s = 0; s < arcSegs; s++) {
+                float a0 = axis - Mathf.PI / 6f + s * (Mathf.PI / 3f) / arcSegs;
+                float a1 = axis - Mathf.PI / 6f + (s + 1) * (Mathf.PI / 3f) / arcSegs;
+                Line(root, new Vector2(Mathf.Cos(a0), Mathf.Sin(a0)) * (2.4f * R), new Vector2(Mathf.Cos(a1), Mathf.Sin(a1)) * (2.4f * R), tB, color, prio);
+                Line(root, new Vector2(Mathf.Cos(a0), Mathf.Sin(a0)) * (0.9f * R), new Vector2(Mathf.Cos(a1), Mathf.Sin(a1)) * (0.9f * R), tB, color, prio);
+            }
+        }
+    }
+
+    /// <summary>核弹飞行三角构建 (恒定实体 9 线): 3 个等边三角 (边长 0.5R), 中心在 2.8R 圈, 一角指圆心,
+    /// 30/150/270° (与扇叶互补), 线宽 5× 基准; 位置由 UpdateImpacts 每帧改端点 (收拢动画).</summary>
+    private void BuildTris(ImpactIndicator im) {
+        ClearChildren(im.TriRoot.transform);
+        float t2 = 0.05f * GeoMap.MapCellSize; // 线宽 5× 基准 (用户定稿)
+        float h = 0.5f * im.NukeR / Mathf.Sqrt(3f); // 顶点距 (边长 0.5R)
+        for (int k = 0; k < 3; k++) {
+            float a = Mathf.PI / 6f + k * 2f * Mathf.PI / 3f; // 30/150/270° (随辐射标顺时针 30°, 与扇叶互补)
+            TrisVerts(a, 2.8f * im.NukeR, h, out var p1, out var p2, out var p3);
+            im.TriLines[k * 3] = Line(im.TriRoot.transform, p1, p2, t2, Color.red, ImpactPrio);
+            im.TriLines[k * 3 + 1] = Line(im.TriRoot.transform, p2, p3, t2, Color.red, ImpactPrio);
+            im.TriLines[k * 3 + 2] = Line(im.TriRoot.transform, p3, p1, t2, Color.red, ImpactPrio);
+        }
+    }
+
+    /// <summary>核弹三角清空 (非 ATMC 弹种/重画前).</summary>
+    private static void ClearTris(ImpactIndicator im) {
+        ClearChildren(im.TriRoot.transform);
+        for (int i = 0; i < im.TriLines.Length; i++) im.TriLines[i] = null!;
+    }
+
+    /// <summary>等边三角三顶点: 中心 = 方向 a × 距 d, 顶点 1 指向圆心 (中心向圆心退 h = 边长/√3), 顶点 2/3 = ±120° 旋转.</summary>
+    private static void TrisVerts(float a, float d, float h, out Vector2 p1, out Vector2 p2, out Vector2 p3) {
+        var dir = new Vector2(Mathf.Cos(a), Mathf.Sin(a));
+        var c = dir * d;
+        var off = -dir * h;
+        p1 = c + off;
+        p2 = c + new Vector2(off.x * -0.5f - off.y * 0.8660254f, off.x * 0.8660254f - off.y * 0.5f);
+        p3 = c + new Vector2(off.x * -0.5f + off.y * 0.8660254f, -off.x * 0.8660254f - off.y * 0.5f);
     }
 
     /// <summary>编号米字数码: 逐字符画 (Glyph16Font 复用), 字符间距 = 字宽.</summary>
@@ -851,11 +1179,18 @@ public class SandboxRenderer {
         public GameObject CircleRoot = null!; // 矢量符圆 (运动显示)
         public GameObject DotRoot = null!;    // 静止点 (速度 <1 m/s 显示)
         public Il2CppShapes.Line SpeedLine = null!; // 速度方向线 (每帧只动端点)
+        public GameObject TextRoot = null!;   // TWS 信息文本 (菱形框右侧, 两排中心 = (a,0))
+        public GameObject Line1Root = null!;  // 距离行 (上, 静止时居中单行)
+        public GameObject Line2Root = null!;  // 速度行 (下, 静止隐藏)
+        public Color Color;                   // 图标色 (敌红/友蓝/参考点绿 — 文本同色)
+        public string DistText = "";          // 距离字符串缓存 (变了才重画)
+        public string SpdText = "";           // 速度字符串缓存 (空 = 静止单行)
     }
 
     private class QueueIndicator {
         public GameObject Root = null!;
         public GameObject RadiusRoot = null!;
+        public GameObject RadiationRoot = null!; // 核弹辐射标 (ATMC 专属, 跟杀伤圈同层同位移)
         public GameObject LabelRoot = null!;
         public GameObject BulletRoot = null!;
         public GameObject LineRoot = null!;
@@ -870,8 +1205,10 @@ public class SandboxRenderer {
         public string LabelText = "";
         public string BulletText = "";
         public float RadiusKm = -1f;
+        public float RadiationKm = -1f;
         public int SegCount;
         public bool Pierce;
+        public BulletType PierceBt = (BulletType)(-1); // 穿甲指示弹种缓存 (ATMC 刻度 vs X 要重画)
     }
 
     private class ImpactIndicator {
@@ -880,6 +1217,8 @@ public class SandboxRenderer {
         public GameObject SolidRoot = null!;
         public GameObject DotRoot = null!;
         public GameObject CircleRoot = null!;
+        public GameObject RadiationRoot = null!; // 核弹辐射标 (ATMC 专属, 同落点圈层)
+        public GameObject TriRoot = null!;       // 核弹飞行收拢三角 (恒定实体 9 线, 每帧动端点)
         public GameObject TimerRoot = null!;
         public GameObject BulletRoot = null!;
         public Vector2 ImpactBoard;
@@ -891,10 +1230,16 @@ public class SandboxRenderer {
         public float Step;      // 字符间距
         public float TimerY;    // 计时标签 y (板面空间)
         public float RadiusKm = -1f;
+        public float RadiationKm = -1f;
+        public float NukeR;     // 核弹 R = 杀伤半径/3 (板面单位, 三角几何基准)
         public int SegCount;
         public bool Pierce;
+        public BulletType PierceBt = (BulletType)(-1); // 穿甲指示弹种缓存 (ATMC 刻度 vs X 要重画)
         public int LastShownSecond = -1;
         public Il2CppShapes.Line? SolidLine; // 未飞段实线 (缓存, 每帧只动端点)
+        public readonly Il2CppShapes.Line[] TriLines = new Il2CppShapes.Line[9]; // 3 三角 × 3 边
+        public readonly List<(Il2CppShapes.Line Line, float Thickness)> RadiationLines = new(); // 辐射标线宽缓存 (收缩期等比缩位置 + 线宽补偿)
+        public float NukeLandedAt = -1f; // 核弹落地时刻 (扩散动画起点; -1 = 未落地/扩散完)
         public bool Landed; // 已落地: 飞行件 (实线/红点/计时/弹种标签) 隐藏, 虚线弹道+落点圈保留到下一次开火
     }
 
@@ -921,6 +1266,7 @@ public class SandboxRenderer {
     private class BallisticMark {
         public GameObject? Root;
         public GameObject? RadiusRoot;
+        public GameObject? RadiationRoot; // 核弹辐射标 (ATMC 专属, 跟绿圈同层)
         public GameObject? CrossRoot;
         public GameObject CornerRoot = null!;
         public GameObject BulletRoot = null!;
@@ -929,7 +1275,10 @@ public class SandboxRenderer {
         public string BulletText = "";
         public string FlyText = "";
         public float RadiusKm = -1f;
+        public float RadiationKm = -1f;
         public int SegCount;
+        public int BulletType = -1;        // 当前任务弹种 (挂架时钟判 ATMC 用)
         public bool Pierce;
+        public BulletType PierceBt = (BulletType)(-1); // 穿甲指示弹种缓存 (ATMC 刻度 vs X 要重画)
     }
 }
