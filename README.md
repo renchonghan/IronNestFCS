@@ -146,10 +146,9 @@ dotnet build IronNestFCS.sln -c Release
 
 ## 开机自检
 
-进任务时左上角先播放开机自检面板（CMD 风黑框，逐行显现，约 7 秒），随后切换为火控状态面板：
+进任务时左上角先播放开机自检面板（CMD 风黑框，逐行显现，约 8 秒，自检完成后画面再停留 2.1 秒），随后切换为火控状态面板：
 
 ```text
-----------------------------------------------------------------
 14.23.05 [INFO] System Init ...
 14.23.06 [INFO] System Loaded For FCS 2.0.0
 14.23.06 [CORE] Enable Peripherals ...
@@ -167,7 +166,7 @@ dotnet build IronNestFCS.sln -c Release
 - 自检就是绑定过程：`System Init ...` 期间等待实体就绪（重试绑定），每行 `[DONE]` = 该模块真实装配完成；行序 = 真实依赖序（炮控 → 数据/显示 → 火控 → 全息渲染）。
 - `DataLine Bench` 的 DL 为雷达 25Hz 粗跟循环的实测间隔（约 40ms，随游戏帧率抖动）。
 - 绑定失败：该行红显 `[FAIL]` 并冻结面板；按 **F9** 重试，或回主菜单（NO SIGNAL 接管）。
-- 主菜单 / 实体未初始化时显示 NO SIGNAL ASCII 大字占位（同尺寸深色框）。
+- 主菜单 / 实体未初始化时显示 NO SIGNAL 艺术字 + 短横线 X 框占位（同尺寸深色框）。
 
 ## 贡献
 

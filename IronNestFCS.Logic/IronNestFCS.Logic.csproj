@@ -5,6 +5,7 @@
         <ImplicitUsings>enable</ImplicitUsings>
         <Nullable>enable</Nullable>
         <AssemblyName>IronNestFCS.Logic</AssemblyName>
+        <Version>2.0.0</Version>
         <AppendTargetFrameworkToOutputPath>false</AppendTargetFrameworkToOutputPath>
         <!-- x64: 与 MelonLoader/Il2CppInterop 的 AMD64 目标一致 (消 MSB3270); 游戏进程本身就是 x64 -->
         <PlatformTarget>x64</PlatformTarget>
@@ -16,6 +17,9 @@
 
     <ItemGroup>
         <Compile Include="..\Shared\NullablePolyfill.cs" Link="NullablePolyfill.cs" />
+        <!-- 核弹警报音频: git pull + build 直接就位 (Link 落到输出根的 siren_samples\ 子目录, 与 NukeAlarm 读取路径一致) -->
+        <None Include="Audio\NukeLoad.wav" Link="siren_samples\NukeLoad.wav" CopyToOutputDirectory="PreserveNewest" />
+        <None Include="Audio\NukeLunch.wav" Link="siren_samples\NukeLunch.wav" CopyToOutputDirectory="PreserveNewest" />
     </ItemGroup>
 
     <ItemGroup>
