@@ -86,8 +86,8 @@ public class GunControl {
     private const float SlopeAlphaA = 0.5f;  // H 斜率平滑加大 (过最近点角速度急变段跟快点)
     private object? _loopHandle;
     private object? _taskHandle;
-    private bool _lastHasFired;                // pendingReload 上升沿检测 (击发自检)
-    private bool? _lastCanFire;                // CanFire 沿检测 (装填完成 → 击发沿复位)
+    private bool _lastHasFired;                // pendingReload 上升沿检测 (击发自检兜底)
+    private bool? _lastCanFire;                // CanFire 沿检测 (装填完成 → 击发沿复位; 下降沿 = 出膛)
     private bool _forceFullPowder;             // 上轮 LOAD 推药失败: 下轮 PWDR 无视分配器读数强制拉满
     private readonly List<object> _childHandles = new(); // 子协程句柄 (2-2 并行 Calculate 等; Stop 时回收, F9 防泄漏)
     private bool _disposed;
@@ -160,28 +160,16 @@ public class GunControl {
                     Fired = false;
                     _lastHasFired = false;
                 }
+                else if (!Fired && !DesiredDump) {
+                    // 二步确认第二步: 膛空下降沿 = 出膛真时刻 (拉绳要拉到速度才击发, 膛空即弹离膛;
+                    // 游戏 pendingReload 通知晚 ~1s — 旧检测据此晚 1s, 是"落地滞后 1s"的来源)
+                    FireNow();
+                }
                 _lastCanFire = cf;
             }
-            // 击发自检 (手动/自动通用, 不依赖 FC): pendingReload 上升沿 + 膛空 (CanFire 已掉) = 开火瞬间 →
-            // 锁存炮表真值 + 通知 DC 画落点线; 手动开火 (无 FC 收尾) 同样出飞行轨迹
+            // 兜底: 下降沿漏掉 (F9 中途重载等) 时 pendingReload 上升沿 + 膛空 仍算开火
             bool firedNow = _gun.HasFired();
-            if (firedNow && !_lastHasFired && !Fired && !cf) {
-                Fired = true; // 内部防重 (不对外 — FC 用 FlyRemaining 作击发确认)
-                var sw = _gun.StopwatchLatch();
-                float fly = sw.HasValue && sw.Value.travelTime > 0.01f ? sw.Value.travelTime : FlyTime; // 倒计时未启动 (fireDelay): 瞄准期预测值兜底
-                FlyTime = fly; // 击发后: 锁存真值 (瞄准期活读停更, 下一帧 ReadSensors 走 else)
-                // DUMP 平射 (FC 强制退弹): 不建 Flight (不画落点/不传导倒计时)
-                if (!DesiredDump) {
-                    // 弹种: 最后非空膛内弹 (击发瞬间膛已空, 活读拿不到 — 开火按最后一次落点指示走); 兜底 DesiredShell
-                    BulletType firedShell = System.Enum.TryParse<BulletType>(_lastChamberLive, out var fb) ? fb : DesiredShell;
-                    CurrentFlight = new Flight {
-                        FlyTime = fly,
-                        FiredAtLocal = Time.time,
-                        FiredAtMission = MissionClock.Seconds, // 出膛时刻任务时钟 (FC 完成队列 FireMission 同口径)
-                    };
-                    OnImpactFired?.Invoke(_side, _lastAimLive.x, _lastAimLive.y, firedShell, fly, CurrentFlight);
-                }
-            }
+            if (firedNow && !_lastHasFired && !Fired && !cf && !DesiredDump) FireNow();
             _lastHasFired = firedNow;
             // 飞行期间: 每帧更新 Flight (Remain 统一口径 — 唯一落地判定; DC/HUD 直读字段, 不逐帧传导);
             // 炮表冻结/清表由 Flight 本地外推兜底
@@ -252,6 +240,23 @@ public class GunControl {
     internal void RefreshSnapshot() {
         Chamber = _gun.BulletInChamber() ?? "";
         Charges = _gun.LoadedPowderCharges();
+    }
+
+    /// <summary>开火 (膛空下降沿 = 出膛真时刻): 锁存炮表真值 + 建 Flight + 通知 DC 画落点线 — 手动/自动通用, 不依赖 FC.</summary>
+    private void FireNow() {
+        Fired = true; // 内部防重 (不对外 — FC 用 FlyRemaining 作击发确认)
+        var sw = _gun.StopwatchLatch();
+        float fly = sw.HasValue && sw.Value.travelTime > 0.01f ? sw.Value.travelTime : FlyTime; // 倒计时未启动 (fireDelay): 瞄准期预测值兜底
+        FlyTime = fly; // 击发后: 锁存真值 (瞄准期活读停更)
+        if (DesiredDump) return; // DUMP 平射 (FC 强制退弹): 不建 Flight (不画落点/不传导倒计时)
+        // 弹种: 最后非空膛内弹 (击发瞬间膛已空, 活读拿不到 — 开火按最后一次落点指示走); 兜底 DesiredShell
+        BulletType firedShell = System.Enum.TryParse<BulletType>(_lastChamberLive, out var fb) ? fb : DesiredShell;
+        CurrentFlight = new Flight {
+            FlyTime = fly,
+            FiredAtLocal = Time.time,
+            FiredAtMission = MissionClock.Seconds, // 出膛时刻任务时钟 (FC 完成队列 FireMission 同口径)
+        };
+        OnImpactFired?.Invoke(_side, _lastAimLive.x, _lastAimLive.y, firedShell, fly, CurrentFlight);
     }
 
     /// <summary>任务链 (单发): 弹药准备 (逐步决策) → TRAK (持续) → 击发后 REST → IDLE. 齐射走 SalvoDirector.

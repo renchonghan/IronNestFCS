@@ -109,7 +109,7 @@ public class SandboxRenderer {
         if (!active) {
             foreach (var kv in _impacts) {
                 var im = kv.Value;
-                bool expanding = im.Landed && im.NukeLandedAt >= 0f && Time.time - im.NukeLandedAt < 1f; // 落地扩散动画期间相位不断
+                bool expanding = im.Landed && im.NukeLandedAt >= 0f && Time.time - im.NukeLandedAt < 2f; // 落地扩散动画 (2s) 期间相位不断
                 if (im.Root != null && im.Root.activeSelf && im.Shell == BulletType.ATMC && (!im.Landed || expanding)) { active = true; break; }
             }
         }
@@ -630,9 +630,11 @@ public class SandboxRenderer {
         im.SegW = segW;
         im.Step = step;
         im.TimerY = im.ImpactBoard.y + (-0.2f * SurfScale - dy);
-        // 淡入预写 alpha 0: 消除开火瞬间到下一帧 UpdateImpacts 之间的 ~16ms 全亮闪
-        foreach (var line in im.Root.transform.GetComponentsInChildren<Il2CppShapes.Line>())
-            line.Color = new Color(1f, 0f, 0f, 0f);
+        // 淡入预写 alpha 0 (只核弹的辐射标+三角 — 消除开火瞬间到下一帧 UpdateImpacts 之间的 ~16ms 全亮闪)
+        if (im.Shell == BulletType.ATMC) {
+            foreach (var (line, _) in im.RadiationLines) line.Color = new Color(1f, 0f, 0f, 0f);
+            for (int k = 0; k < im.TriLines.Length; k++) if (im.TriLines[k] != null) im.TriLines[k].Color = new Color(1f, 0f, 0f, 0f);
+        }
         im.Root.SetActive(true);
     }
 
@@ -797,18 +799,22 @@ public class SandboxRenderer {
             if (im.Flight == null) continue;
             if (im.Flight.Landed && !im.Landed) { LogLanding(kv.Key, im); LandImpact(im); } // 落地: 飞行件隐藏
             if (im.NukeLandedAt >= 0f) {
-                // 核弹扩散动画: 收拢结束 (最后 1.5s 刚完, 不等落地事件) 中心内圈 1s 扩到杀伤半径
-                // (0.6R×s=3R → s: sStop→5, 线宽补偿保持 5t 世界宽, 旋转继续), 扩完全部隐藏 (航拍反馈接管)
-                float e = Mathf.Clamp01((Time.time - im.NukeLandedAt) / 1f);
+                // 核弹扩散动画: 收拢结束 (最后 1.5s 刚完, 不等落地事件) 中心内圈匀速 2s:
+                // 1s 扩到杀伤半径 (0.6R×s=3R → s=5), 继续同速率扩到 s=10, 第 2 秒 alpha 1→0 归零后全部隐藏
+                float e = Mathf.Clamp01((Time.time - im.NukeLandedAt) / 2f);
                 im.RadiationRoot.transform.localRotation = Quaternion.Euler(0f, 0f, NukePhase * Mathf.Rad2Deg);
                 if (e >= 1f) {
                     im.RadiationRoot.SetActive(false);
-                    im.NukeLandedAt = -1f; // 扩散完
+                    im.NukeLandedAt = -1f; // 扩散完 (alpha 已归 0)
                 } else {
                     float sStop = Mathf.Min(1f, 0.125f / Mathf.Max(0.1f, im.RadiusKm));
-                    float s = Mathf.Lerp(sStop, 5f, e); // 缩到中心的内圈 → 杀伤半径
+                    float s = Mathf.Lerp(sStop, 10f, e); // 匀速: 1s 到杀伤半径 (s=5), 继续扩到 10
                     im.RadiationRoot.transform.localScale = new Vector3(s, s, s);
-                    foreach (var (line, t) in im.RadiationLines) line.Thickness = t / s;
+                    float fadeOut = Mathf.Clamp01((e - 0.5f) / 0.5f); // 第 2 秒 alpha 1→0
+                    foreach (var (line, t) in im.RadiationLines) {
+                        line.Thickness = t / s;
+                        line.Color = new Color(1f, 0f, 0f, 1f - fadeOut);
+                    }
                 }
                 continue;
             }
@@ -845,10 +851,10 @@ public class SandboxRenderer {
                 var rot = Quaternion.Euler(0f, 0f, NukePhase * Mathf.Rad2Deg); // 全局相位 — 与瞄准圈/队列圈同步, 开火瞬间无割裂
                 im.RadiationRoot.transform.localRotation = rot; // 辐射标跟转 (内圈圆旋转对称无感, 扇叶/刻度转)
                 im.TriRoot.transform.localRotation = rot;
-                // 淡入: 完全透明 1s (传导延迟), 再 1s 缓慢浮现 (alpha 0→1) — 全根扫描, 外圈/刻度/辐射标/三角/字一起缓入
+                // 淡入 (只辐射标+三角, 外圈/红线/字不参与): 完全透明 1s (传导延迟), 再 1s 缓慢浮现 (alpha 0→1)
                 float fade = Mathf.Clamp01((im.Flight.FlyTime - remain - 1f) / 1f);
-                foreach (var line in im.Root.transform.GetComponentsInChildren<Il2CppShapes.Line>())
-                    line.Color = new Color(1f, 0f, 0f, fade);
+                foreach (var (line, _) in im.RadiationLines) line.Color = new Color(1f, 0f, 0f, fade);
+                for (int k = 0; k < im.TriLines.Length; k++) if (im.TriLines[k] != null) im.TriLines[k].Color = new Color(1f, 0f, 0f, fade);
                 float denom = im.Flight.FlyTime - 1.5f;
                 if (denom < 0.001f) denom = im.Flight.FlyTime; // 短弹道: 收拢压到全程
                 float frac = Mathf.Clamp01((im.Flight.FlyTime - remain) / denom);

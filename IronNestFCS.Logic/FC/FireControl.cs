@@ -37,8 +37,9 @@ public class FireTask {
 /// 保险 (Arm) 也是 FC 的事, 首次 AllReady 解一次, 已 Arm 不自动回保险.
 /// </summary>
 public class FireControl {
-    /// <summary>击发→出膛固定延迟 (§4.4 fireDelay, 触发核心储能 1s) — LeadSolve 前馈补偿量.</summary>
-    private const float FireDelay = 1f;
+    /// <summary>LeadSolve 前馈补偿量 (s): 三个已知固定延迟之和 = 拉栓 1s (按钮→出膛) + 炮表启动 1s + 落地弹坑显示 1s.
+    /// 解算每帧活刷 (aim 含拦截提前量), Δ 只补传导链固定滞后.</summary>
+    private const float FireDelay = 3f;
 
     // ===== 端口接线 (FcsModule 注入) =====
     public GunControl? GunL;
@@ -349,10 +350,8 @@ public class FireControl {
         public bool Fire;            // 击发已按 (Fired latch 前防连点)
         public bool DumpStuck;       // DUMP 全哑挂起 (Manual/Stop 复位)
         public FireTask? SolTask;    // 解算快照对应任务 (派发当帧解算未刷, 应用层据此跳过)
-        public FireTask? FrozenTask; // 击发真空期锁存对应任务 (换任务自动重快照)
-        public float SolCharge, SolElev, SolT, FrozenT;              // 解算快照: 装药/仰角/飞时 (HUD 显示 + GC 下发同源)
+        public float SolCharge, SolElev, SolT;                       // 解算快照: 装药/仰角/飞时 (HUD 显示 + GC 下发同源)
         public Vector2 SolAim, SolV, SolA, SolJ;                     // 解算快照: 交汇点矢量 (km 局部) / 轨迹参数 (km/s, km/s², km/s³)
-        public Vector2 FrozenAim, FrozenV, FrozenA, FrozenJ;         // 击发瞬间解算锁存 (push 用 — 预瞄线/交汇点停住不跟滑)
     }
     private PerGun _gL, _gR;
     /// <summary>火控解算 push (DC 渲染目标轨迹线+交汇点): (side, 目标引用, 交汇点板面, 轨迹速度板面/s, 加速度板面/s², 三次项板面/s³, 飞时秒).
@@ -441,7 +440,7 @@ public class FireControl {
     }
 
     /// <summary>火控解算 push (DC 渲染目标轨迹线+交汇点): 25fps 随解算循环 — 轨迹参数+交汇点+飞时;
-    /// 无任务/DUMP/解算未刷 → 目标引用 null (DC 隐藏). 开火后 DC 侧冻结 (GC 击发通知), push 被忽略.</summary>
+    /// 无任务/DUMP/解算未刷 → 目标引用 null (DC 隐藏). 真空期不冻结 (2026-10-06): 炮塔跟最新解算, 画面同步跟 — 观感一致.</summary>
     private void PushFireSolutions() {
         if (OnFireSolution == null || MapSurfaceRef == null || NestRef == null) return;
         var nestBoard = (Vector2)MapSurfaceRef.InverseTransformPoint(NestRef.position);
@@ -452,19 +451,13 @@ public class FireControl {
             ref var g = ref (isL ? ref _gL : ref _gR);
             Vector2 aimKm, vKm, aKm, jKm;
             float T;
-            bool frozen, valid;
-            // 击发真空期锁存: 第一次看到 _fire 置位 → 快照击发瞬间解算; 之后重发快照 —
-            // 预瞄虚线/交汇点停在击发瞬间画面, 不跟解算滑 (炮塔跟踪仍走 ApplySolutions 最新解算, 两路分离)
-            if (g.Fire && g.FrozenTask != task) {
-                g.FrozenTask = task;
-                g.FrozenAim = g.SolAim; g.FrozenV = g.SolV; g.FrozenA = g.SolA; g.FrozenJ = g.SolJ; g.FrozenT = g.SolT;
-            }
-            frozen = g.Fire && g.FrozenTask == task;
-            aimKm = frozen ? g.FrozenAim : g.SolAim;
-            vKm = frozen ? g.FrozenV : g.SolV;
-            aKm = frozen ? g.FrozenA : g.SolA;
-            jKm = frozen ? g.FrozenJ : g.SolJ;
-            T = frozen ? g.FrozenT : g.SolT;
+            bool valid;
+            aimKm = g.SolAim;
+            vKm = g.SolV;
+            aKm = g.SolA;
+            jKm = g.SolJ;
+            T = g.SolT + FireDelay; // 曲线时长含前馈: 交汇点在 v·(T+Δ) 处, 曲线只铺 T 会差一截到不了点;
+            // 缩短动画仍由 Flight 驱动 (progress×T0), Δ 不参与动画计时 — 落地恰好缩到交汇点
             valid = task != null && !task.Dump && (isL ? _gL.SolTask : _gR.SolTask) == task && !float.IsNaN(T)
                 && vKm.magnitude > 0.0001f; // SRC 模式 (无预瞄): 目标轨迹线/交汇点不 push (DC 隐藏)
             OnFireSolution(isL ? LeftRight.Left : LeftRight.Right,
@@ -525,8 +518,8 @@ public class FireControl {
 
     /// <summary>提前量解析解 (三次轨迹曲线): 预测点 = p + v·T + ½a·T² + ⅙j·T³ (e' 在弧上, 不是切线直线),
     /// T = k·r (飞时线性), v/a/j 为地图局部系 (km/s, km/s², km/s³).
-    /// fireDelay 前馈: 击发→出膛固定 1s (§4.4) — 真空期游戏锁炮塔, 出膛指向击发瞬间解算,
-    /// 目标多走 v·Δ — aim 前移 Δ·v 补偿 (实测落点滞后 v×1s 的量级, 2026-10-04).
+    /// fireDelay 前馈: Δ = 拉栓 1s + 炮表启动 1s + 落地弹坑 1s (§4.4) — 真空期游戏锁炮塔, 出膛指向击发瞬间解算,
+    /// 目标多走 v·Δ — aim 前移 Δ·v 补偿.
     /// a/j≈0 走闭式一元二次; 否则数值不动点 8 次. 返回 (瞄准距离 km, 瞄准方位, 瞄准矢量 km 局部系 — 交汇点渲染用).</summary>
     private static (float dist, float angle, Vector2 aim) LeadSolve(float dist, float angle, Vector2 v, Vector2 a, Vector2 j, int charge) {
         float k = ShellData.FlightTime(1f, Mathf.Max(1, charge)); // 飞时斜率 (s/km) 按实际装药 — 满装药近似提前量不足, 移动目标落点滞后
