@@ -69,7 +69,7 @@ public static class Glyph16Font {
         ['A'] = A1|A2|B|C|E|F|G1|G2,
         ['B'] = A1|A2|F|E|G1|D1|D2|K|M,   // 左竖 + 三横 + 右侧斜边 k/m
         ['C'] = A1|A2|D1|D2|E|F,
-        ['D'] = F|E|J|L,   // 左竖 + 左侧尖角 j/l (上 \ 下 /)
+        ['D'] = A1|A2|B|C|D1|D2|H|I,   // 数码管标准 D: 外框三边 (上/右/下) + 中竖 (0 的左竖挪到中间)
         ['E'] = A1|A2|F|G1|G2|E|D1|D2,
         ['F'] = A1|A2|F|G1|G2|E,
         ['G'] = A1|A2|F|E|G2|C|D1|D2,

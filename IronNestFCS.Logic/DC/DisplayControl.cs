@@ -118,24 +118,10 @@ public class DisplayControl {
     }
 
     /// <summary>单目标参数更新/建表: TWS 轨迹参数 (定速模型, 75 帧线性滤波).</summary>
-    private float _lastTrakLog;
-    private float _lastTargetLog;
     private void UpsertTarget(GameObject go, string name, Vector3 pos, Side3 side, EntityKind kind, int armour, bool isVirtual) {
-        bool onGun = FcPort != null && (FcPort.LeftTask?.Entity == go || FcPort.RightTask?.Entity == go);
         Vector2 vel = Vector2.zero, acc = Vector2.zero, jerk = Vector2.zero;
         // 令牌虚拟目标不参与 TWS: 恒定按固定目标算 (拖放棋子无真实运动语义, 速度恒 0 → 火控自然无预瞄)
         if (Tws && !isVirtual) (vel, acc, jerk) = TrackMotion(go, pos);
-        // 追踪日志: 上炮目标 ~0.32s 一条 (时间门控 — 帧计数门控曾因共享计数+目标数奇偶永不命中, 见事故教训)
-        if (onGun && Time.time - _lastTrakLog >= 0.32f) {
-            _lastTrakLog = Time.time;
-            MelonLogger.Msg($"[DC] trak {name}: v=({vel.x:F3},{vel.y:F3}) |v|={vel.magnitude:F3}km/s");
-        }
-        // 目标点对账日志: 上炮目标每秒一条板面位置 (与开火探针的 aim/T 对账: 落地时刻目标在哪 vs 落点在哪)
-        if (onGun && Time.time - _lastTargetLog >= 1f) {
-            _lastTargetLog = Time.time;
-            var b = MapSurfaceRef != null ? (Vector2)MapSurfaceRef.InverseTransformPoint(pos) : Vector2.zero;
-            MelonLogger.Msg($"[DC] tgt {name}: board=({b.x:F3},{b.y:F3})");
-        }
         if (_targetMap.TryGetValue(go, out var t)) {
             t.WorldPos = pos;
             t.Velocity = vel;
