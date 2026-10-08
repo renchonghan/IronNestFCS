@@ -234,7 +234,9 @@ public class FcsHud {
         string eStr = float.IsNaN(gun.Elevation) ? "--.--" : $"{gun.Elevation:00.00}";
         string aStr = float.IsNaN(gun.Azimuth) ? "---.-" : $"{gun.Azimuth:000.0}";
         string cStr = gun.ChargesLive > 0 ? gun.ChargesLive.ToString() : "-";
-        string ft = !float.IsNaN(gun.FlyTime) && gun.FlyTime > 0.01f ? $"{gun.FlyTime:00.00}" : "--.--";
+        // FT 显示门控 (简单粗暴): REST 复位期 + 仰角 ≤ 0 都不显示 — REST 期间仰角还没回零 (残余读数会漏),
+        // 复位完仰角回 0 自然 ----, 装填期同样安全; 只有 TRAK 抬炮后有值
+        string ft = gun.Action != GunAction.Rest && gun.Elevation > 0f && !float.IsNaN(gun.FlyTime) && gun.FlyTime > 0.01f ? $"{gun.FlyTime:00.00}" : "--.--";
         var task = Fc != null ? (gun == GunL ? Fc.LeftTask : Fc.RightTask) : null;
         bool isL = gun == GunL;
         // 前导位 = 预定打击时间 (默认 -1 → [--:--:--]); 齐射时右炮行前导 >>>[SALVO] (1.x 同款, 左炮为主炮)

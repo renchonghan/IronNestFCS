@@ -285,6 +285,10 @@ public class FcsModule : IFcsModule
         gunR = new GunControl(LeftRight.Right, fcs.RightGun, deck, gcPurchaseLock!);
         gunL.SyncPeer = gunR;
         gunR.SyncPeer = gunL;
+        gunL.NestRef = GameObject.Find("Player Turret Piece")?.transform;      // 击发前标记冻结补偿 (炮指向反算落点)
+        gunR.NestRef = gunL.NestRef;
+        gunL.MapSurfaceRef = GameObject.Find("Draggable Surface")?.transform;  // 同上 (板面换算)
+        gunR.MapSurfaceRef = gunL.MapSurfaceRef;
         // 解算台注入 (装填期 PWDR 前 Calculate 刷新分配器读数缓存; 锁与 FC 共用同一把 — 计算台是共享硬件)
         gunL.Calculator = fcs.BallisticCalculator;
         gunR.Calculator = fcs.BallisticCalculator;

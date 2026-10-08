@@ -152,6 +152,7 @@ public class GunControl {
                 _hAxis.LockDeadband = db;
             }
             // 实时弹道指示器 (GC 全权 push, 与 FC 解算/任务/手动无关): 内部按 CanFire 门控 (装填完成即显示)
+            CompensateFrozenMark(); // 击发前 ~2s 游戏锁存标记/飞时: 炮还在追就用炮指向反算替代 (见方法注释)
             PushBallistic();
             // 装填完成 (CanFire 上升沿): 击发沿基准复位 — 手动连打多发时每发都是新的击发事件
             var cf = _gun.CanFire();
@@ -375,9 +376,16 @@ public class GunControl {
         }
     }
 
+    /// <summary>REST 复位看门狗期限 (按当前仰角估): |仰角| / 2.5°/s + 机构复位 15s (实测至少 15s), 下限 30s 上限 120s —
+    /// 高角开火 (仰角最高 60°) 回位慢, 固定 30s 会误报 FALL.</summary>
+    internal float RestDeadline() {
+        float elevCost = float.IsNaN(Elevation) ? 10f : Mathf.Abs(Elevation) / 2.5f;
+        return Mathf.Clamp(elevCost + 15f, 30f, 120f);
+    }
+
     /// <summary>3-3 REST 复位 → IDLE; AllReady 一并清 (防残留误导下个任务装填期).</summary>
     internal IEnumerator RunRest() {
-        yield return Exec(GunAction.Rest, 30f, RestRoutine);
+        yield return Exec(GunAction.Rest, RestDeadline(), RestRoutine);
         Action = GunAction.Idle;
         AllReady = false;
     }
@@ -626,10 +634,54 @@ public class GunControl {
     public float LastElevationSet = float.NaN;
     private string _lastChamberLive = ""; // 最后非空膛内弹活读 (击发瞬间膛已空, 弹种用它 — 开火按最后一次落点指示走)
     private Vector2 _lastAimLive;         // CanFire 期间每帧更新的瞄准点 (板面坐标; 击发瞬间冻结 — 开火后游戏把落点标记拉回铁巢, 不能跟进)
+    public Transform? NestRef;            // 铁巢棋子 (冻结补偿: 炮指向反算落点的原点; FcsModule 注入)
+    public Transform? MapSurfaceRef;      // 表面 (板面换算, 同上)
+
+    // ===== 击发前标记冻结补偿 =====
+    private Vector3 _lastMarkGrid;        // 标记网格坐标 (冻结检测)
+    private int _markStillFrames;         // 连续不动帧数
+    private float _lastCompElev = float.NaN, _lastCompAz = float.NaN;
+    private Vector2? _frozenBoard;        // 冻结期反算落点 (板面; null = 用游戏标记真值)
+    private float _frozenFly = float.NaN; // 冻结期反算飞时
+
+    /// <summary>击发前 ~2s (拉绳→出膛窗口) 游戏把落点标记与飞时读数锁存: 炮还在追 (动目标跟到最后一刻)
+    /// 但绿十字/飞时数字停 2s, 且击发瞬间 _lastAimLive 是旧值 (落点指示器打 2s 前的位置).
+    /// 检测: 标记连续 6 帧 (~0.24s) 不动 + 炮指向还在动 → 用炮指向射表逆解替代:
+    /// d = 仰角×药包/12 (ElevationDeg = d×12/c 逆解), 落点 = 铁巢 + 方位方向×d, 飞时 = ShellData.FlightTime.
+    /// 静止稳定态 (标记不动+炮不动) 不触发 — 继续用游戏真值.</summary>
+    private void CompensateFrozenMark() {
+        if (_impact == null || !CanFire || NestRef == null || MapSurfaceRef == null) {
+            _frozenBoard = null;
+            _frozenFly = float.NaN;
+            _markStillFrames = 0;
+            return;
+        }
+        var g = _impact.localPosition;
+        bool still = (g - _lastMarkGrid).magnitude <= 0.0005f;
+        _lastMarkGrid = g;
+        _markStillFrames = still ? _markStillFrames + 1 : 0;
+        bool aimMoving = float.IsNaN(Elevation) || float.IsNaN(Azimuth) ? false
+            : Mathf.Abs(Elevation - _lastCompElev) > 0.01f || Mathf.Abs(Mathf.DeltaAngle(Azimuth, _lastCompAz)) > 0.01f;
+        if (!float.IsNaN(Elevation)) _lastCompElev = Elevation;
+        if (!float.IsNaN(Azimuth)) _lastCompAz = Azimuth;
+        if (_markStillFrames < 6 || !aimMoving) {
+            _frozenBoard = null;
+            _frozenFly = float.NaN;
+            return;
+        }
+        int c = _gun.LoadedPowderCharges();
+        if (c <= 0 || Elevation < 0.5f) return; // 无药/平射不反算 (标记本来就该在近处)
+        float distKm = Elevation * c / 12f;
+        var nb = (Vector2)MapSurfaceRef.InverseTransformPoint(NestRef.position);
+        float distLocal = distKm / GeoMap.KmPerLocal;
+        var dir = new Vector2(Mathf.Sin(Azimuth * Mathf.Deg2Rad), Mathf.Cos(Azimuth * Mathf.Deg2Rad)); // 0°=+y 顺时针 (与 FC 同口径)
+        _frozenBoard = nb + dir * distLocal;
+        _frozenFly = ShellData.FlightTime(distKm, c);
+    }
 
     /// <summary>每帧 push 实时弹道指示器数据给 DC (GC 全权: 瞄准点/杀伤圈/弹种/AllReady/飞时).
     /// 瞄准点每帧都传真实值 (弹种 -1 只管绿十字显隐, DC 侧瞄准点缓存必须跟着炮走 —
-    /// 击发瞬间 CanFire 已掉, 落点线终点 = 开火前最后有效瞄准点).
+    /// 击发瞬间 CanFire 已掉, 落点线终点 = 开火前最后有效瞄准点); 冻结窗口用反算替代 (见 CompensateFrozenMark).
     /// 弹种 = CanFire 门控 (实测不含保险: 装填完成 — 弹+药+炮闩锁 — 未开保险即 True),
     /// 不跟任务/相位走 — F9 后/无任务时膛内有弹也显示 (弹种读膛内实弹活读).</summary>
     private void PushBallistic() {
@@ -644,12 +696,14 @@ public class GunControl {
         var g = _impact.localPosition; // 游戏网格坐标 → 板面 (1.x: MapBottomLeft + grid × MapCellSize)
         float bx = GeoMap.MapBottomLeft.x + g.x * GeoMap.MapCellSize;
         float by = GeoMap.MapBottomLeft.y + g.y * GeoMap.MapCellSize;
+        Vector2 board = _frozenBoard ?? new Vector2(bx, by);        // 冻结窗口: 反算替代
+        float fly = float.IsNaN(_frozenFly) ? FlyTime : _frozenFly;
         if (CanFire) { // 只在装填完成期间跟进 — 击发后游戏把标记拉回铁巢, 冻结住开火前最后落点
-            _lastAimLive = new Vector2(bx, by);
+            _lastAimLive = board;
         }
         OnBallisticPush?.Invoke(_side,
-            bx, by,
-            shell >= 0 ? ShellData.KillRadiusKm(shell) : 0f, (int)shell, AllReady, FlyTime);
+            board.x, board.y,
+            shell >= 0 ? ShellData.KillRadiusKm(shell) : 0f, (int)shell, AllReady, fly);
     }
 
     // ===== 齐射导演接口 (SalvoDirector 驱动两门炮, 1.x 单协程带双炮同款) =====

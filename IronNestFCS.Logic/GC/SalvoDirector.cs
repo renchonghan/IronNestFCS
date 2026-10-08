@@ -54,9 +54,9 @@ internal static class SalvoDirector {
             StopChild(trakL);
             StopChild(trakR);
 
-            // REST: 双炮并行复位 (RunRest = Exec(Rest) + 回 IDLE)
-            yield return ExecBoth(l, new GunControl.SalvoStep { Action = GunAction.Rest, Deadline = 30f, Routine = l.RunRest },
-                                  r, new GunControl.SalvoStep { Action = GunAction.Rest, Deadline = 30f, Routine = r.RunRest });
+            // REST: 双炮并行复位 (RunRest = Exec(Rest) + 回 IDLE); 期限按各自仰角估 (高角回位慢, 固定 30s 误报)
+            yield return ExecBoth(l, new GunControl.SalvoStep { Action = GunAction.Rest, Deadline = l.RestDeadline(), Routine = l.RunRest },
+                                  r, new GunControl.SalvoStep { Action = GunAction.Rest, Deadline = r.RestDeadline(), Routine = r.RunRest });
         }
         finally {
             foreach (var h in _children) { try { MelonCoroutines.Stop(h); } catch { } }

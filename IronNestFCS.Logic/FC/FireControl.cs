@@ -239,11 +239,16 @@ public class FireControl {
             GunControl? freeL = GunL != null && _gL.Task == null && !_gL.DumpStuck && GunL.Action != GunAction.Fall ? GunL : null;
             GunControl? freeR = GunR != null && _gR.Task == null && !_gR.DumpStuck && GunR.Action != GunAction.Fall ? GunR : null;
             if (freeL == null && freeR == null) break;
-            // 空闲炮挑选: 弹种匹配队首者优先 (都匹配/都不匹配 → L)
+            // 空闲炮挑选: Idle 优先 (REST 复位中的炮接了任务也起不了链, 白白占住 — 任务先去真空闲的);
+            // 同状态: 弹种匹配队首者优先 (都匹配/都不匹配 → L)
             GunControl pick;
             if (freeL != null && freeR != null) {
-                bool lOk = LoadoutMatches(freeL, head), rOk = LoadoutMatches(freeR, head);
-                pick = lOk || !rOk ? freeL : freeR;
+                bool lIdle = GunL.Action == GunAction.Idle, rIdle = GunR.Action == GunAction.Idle;
+                if (lIdle != rIdle) pick = lIdle ? freeL : freeR;
+                else {
+                    bool lOk = LoadoutMatches(freeL, head), rOk = LoadoutMatches(freeR, head);
+                    pick = lOk || !rOk ? freeL : freeR;
+                }
             }
             else pick = freeL ?? freeR!;
             string ch = pick.ChamberLive;

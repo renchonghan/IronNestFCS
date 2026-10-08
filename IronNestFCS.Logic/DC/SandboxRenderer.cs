@@ -184,16 +184,20 @@ public class SandboxRenderer {
         e.SpdText = spd;
         const float segW = 0.006f;  // 字号 (字高 H = 1.6×segW; 原 2/3 再 ×3/4 — 用户定稿)
         float step = segW * 0.7f;   // 半宽字形 (宽 segW/2) 的字符间距
+        // 右对齐 + 块框居中: 对齐点按最长文本宽 (速度 " 12.3m/s" 8 字符; 距离最长 7) — 短行左边补空右缘整齐;
+        // 块框 (MaxLen 宽) 中心保持在锚点 (最长行中心 = 原居中位置), 不因右对齐整体偏右
+        const int MaxLen = 8;
+        float rowShift = (MaxLen - 1) * step / 2f; // 框半宽: 整体左移让框中心回锚点
         // 行布局 (字形格从基线 y=0 向上长 H): 两行 = 上排基线 +0.25H / 下排基线 −1.25H (行间留 0.5H 空档, 块心在锚点);
         // 单行 = 基线 −0.5H (垂直居中)
         ClearChildren(e.Line1Root.transform);
         for (int i = 0; i < dist.Length; i++)
-            Glyph16Font.DrawCharSegmentsNarrow(e.Line1Root.transform, dist[i], e.Color, i * step - ((dist.Length - 1) * step + segW * 0.5f) / 2f, segW);
+            Glyph16Font.DrawCharSegmentsNarrow(e.Line1Root.transform, dist[i], e.Color, i * step + (MaxLen - dist.Length) * step - rowShift, segW);
         e.Line1Root.transform.localPosition = new Vector3(0f, spd.Length > 0 ? 0.4f * segW : -0.8f * segW, 0f);
         ClearChildren(e.Line2Root.transform);
         if (spd.Length > 0) {
             for (int i = 0; i < spd.Length; i++)
-                Glyph16Font.DrawCharSegmentsNarrow(e.Line2Root.transform, spd[i], e.Color, i * step - ((spd.Length - 1) * step + segW * 0.5f) / 2f, segW);
+                Glyph16Font.DrawCharSegmentsNarrow(e.Line2Root.transform, spd[i], e.Color, i * step + (MaxLen - spd.Length) * step - rowShift, segW);
             e.Line2Root.transform.localPosition = new Vector3(0f, -2f * segW, 0f);
             e.Line2Root.SetActive(true);
         } else e.Line2Root.SetActive(false);
