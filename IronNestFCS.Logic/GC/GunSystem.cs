@@ -50,7 +50,7 @@ public class GunSystem {
     private OdometerDisplay? remainingCharges;
     private OdometerDisplay? selectedCharges;
 
-    private TextMeshPro shellId;
+    private TextMeshPro shellId = null!; // 绑定后非空 (TryBind 失败不读)
 
     public bool TryBind(string surfix) {
         this._surfix = surfix;
@@ -181,10 +181,11 @@ public class GunSystem {
     }
     
     /// <summary>
-    /// 正式版的装填状态索引是数据驱动的, 空闲时可能处于不同的 CurrentStateIndex
+    /// 装填机构就绪等待: 正式版的装填状态索引是数据驱动的, 空闲时可能处于不同的 CurrentStateIndex
     /// 因此不把某个固定索引当作"可装填". 只依据控制器实际的 working, 炮闩锁定和炮管运动状态判断
+    /// (TRAK 开始前也用它等机构停稳 — 装填完炮管还有回落动作, 不等就追会鬼畜).
     /// </summary>
-    private IEnumerator WaitForReloadReady() {
+    public IEnumerator WaitForReloadReady() {
         while (gunController != null) {
             var mechanismReady = reloadController == null || !reloadController.working;
             var breechReady = !gunController.ExternalReloadLoweringLocked;
@@ -231,7 +232,7 @@ public class GunSystem {
     /// <summary>按推弹按钮把炮弹送上推弹架 (面板 2-1 DLRD 阶段).</summary>
     public IEnumerator PressRammer() {
         yield return WaitForReloadReady();
-        yield return FcsSceneInteractor.WaitAndClick(loadBulletButton!);
+        yield return UiClick.WaitAndClick(loadBulletButton!);
     }
 
     /// <summary>按完推弹按钮后等推弹机启动 (装填状态机进入 ShellRamming), 10 秒兜底.</summary>
@@ -256,7 +257,7 @@ public class GunSystem {
                     yield break;
                 }
             }
-            yield return FcsSceneInteractor.WaitAndClick(powderButtons[i]);
+            yield return UiClick.WaitAndClick(powderButtons[i]);
         }
     }
 
@@ -302,8 +303,10 @@ public class GunSystem {
         yield return SelectPowder(count);
     }
 
-    /// <summary>按推药按钮 (P4 推药入膛).</summary>
+    /// <summary>按推药按钮 (P4 推药入膛). 先等游戏机构停稳 (状态确认, 与 PressRammer 同款),
+    /// 避免拉杆/机构动作中按推药钮不激活 (Charge Rammer 9s 超时的根因).</summary>
     public IEnumerator RamPowder() {
+        yield return WaitForReloadReady();
         // 推药杆引用可能因 reload 重建而失效, 重新绑定
         if (loadPowderButton == null || loadPowderButton.gameObject == null) {
             var gunSystem = GameObject.Find("Gun System " + _surfix)?.transform;
@@ -315,7 +318,7 @@ public class GunSystem {
                 yield break;
             }
         }
-        yield return FcsSceneInteractor.WaitAndClick(loadPowderButton);
+        yield return UiClick.WaitAndClick(loadPowderButton);
     }
 
     public bool HaveBulletInCylinder(BulletType type) {
@@ -356,7 +359,7 @@ public class GunSystem {
     }
     
     public int RemainingCharges() {
-        return (int)remainingCharges.CurrentNumber;
+        return remainingCharges != null ? (int)remainingCharges.CurrentNumber : 0;
     }
 
     /// <summary>实装药包数 (P4 推入确认后生效, 之前为 0). 弹种保护状态机的关键输入.</summary>
@@ -372,6 +375,30 @@ public class GunSystem {
     /// <summary>推弹机是否正在把炮弹推入 (装填状态机 ShellRamming). 检查点用: 此时膛内读数不可信.</summary>
     public bool IsShellRamming() {
         return reloadController?.CurrentState?.stateKey == "ShellRamming";
+    }
+
+    /// <summary>游戏装填状态机当前状态码 (HUD 相位显示 / COFM 实装确认用).</summary>
+    public string? ReloadStateKey() {
+        try { return reloadController?.CurrentState?.stateKey; } catch { return null; }
+    }
+
+    /// <summary>装填状态码序判定: 当前码是否已达/超过目标码 (码已过时不盲等, 实机抓的完整序).</summary>
+    public bool ReloadStateAtOrAfter(string target) {
+        string[] order = { "GuideDeploy", "BreechOpen", "ShellRamming", "SelectPowderCharge", "RamCharges", "CloseShellGuide", "FinalSequence", "BreachLocked" };
+        var key = ReloadStateKey();
+        int iK = key == null ? -1 : System.Array.IndexOf(order, key);
+        return iK >= System.Array.IndexOf(order, target);
+    }
+
+    /// <summary>等装填状态机进入目标码 (状态确认替代盲等, 20s 兜底).</summary>
+    public IEnumerator WaitReloadState(string key, float timeout = 20f) {
+        float waited = 0f;
+        while (waited < timeout) {
+            if (ReloadStateKey() == key) yield break;
+            yield return new WaitForSeconds(0.5f);
+            waited += 0.5f;
+        }
+        MelonLogger.Msg($"[FCS] GunSystem {_surfix}: WaitReloadState '{key}' timeout (now '{ReloadStateKey()}')");
     }
 
     /// <summary>炮弹预计飞行时间 (游戏 GunController 弹道预测, 未解算时为 0).</summary>

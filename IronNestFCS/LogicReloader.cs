@@ -89,7 +89,8 @@ internal sealed class LogicReloader
             var ok = current.Initialize();
             if (!ok)
             {
-                MelonLogger.Warning("[Reload] Logic.Initialize() returns false。");
+                // 主菜单/场景未就绪时 Initialize 返回 false (FMR 不在案) — 设计内, NO SIGNAL 占位, 不吓人
+                MelonLogger.Msg("[Reload] Logic not initialized: no mission scene (main menu → NO SIGNAL placeholder).");
             }
             else
             {

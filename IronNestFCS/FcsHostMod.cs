@@ -5,7 +5,7 @@ using MelonLoader.Utils;
 using UnityEngine;
 using UnityEngine.InputSystem;
 
-[assembly: MelonInfo(typeof(FcsHostMod), "IronNestFCS", "1.0.7", "svr2kos2")]
+[assembly: MelonInfo(typeof(FcsHostMod), "IronNestFCS", "2.0.0", "svr2kos2, Lancelot_Holland & DeepSeek(TM) V4")]
 [assembly: MelonGame("Iron Nest", "Iron Nest Heavy Turret Simulator")]
 
 namespace IronNestFCS;
@@ -54,7 +54,8 @@ public class FcsHostMod : MelonMod
     
     private IEnumerator ReloadCoroutine()
     {
-        yield return new WaitForSeconds(3f);
+        // 进任务 0.5s 后重载: 实体就绪等待已交给 Logic 开机自检 (System Init 重试绑定), 不再固定等 3s
+        yield return new WaitForSeconds(0.5f);
         reloader?.Reload();
     }
 

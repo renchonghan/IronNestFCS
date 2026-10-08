@@ -37,3 +37,4 @@ Desktop.ini
 # Agent workspace / code index
 .omo/
 .codegraph/
+logs.txt
