@@ -4,7 +4,7 @@
 
 [Iron Nest: Heavy Turret Simulator](https://store.steampowered.com/app/4300500/) 的 [MelonLoader](https://melonwiki.xyz/) Mod，为游戏中的重型炮塔加入一套自动化**火控系统（Fire Control System, FCS）**：在地图上点选目标，Mod 会自动解算弹道、采购/装填炮弹、调整炮塔方向与仰角，并完成确认与击发的全套流程。
 
-> 基于游戏 Demo 版本开发，使用 IL2CPP + MelonLoader。
+> 基于游戏Steam发行版本开发，使用 IL2CPP + MelonLoader。
 
 # 安装教程
 
