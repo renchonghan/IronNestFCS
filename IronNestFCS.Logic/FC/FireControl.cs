@@ -243,7 +243,7 @@ public class FireControl {
             // 同状态: 弹种匹配队首者优先 (都匹配/都不匹配 → L)
             GunControl pick;
             if (freeL != null && freeR != null) {
-                bool lIdle = GunL.Action == GunAction.Idle, rIdle = GunR.Action == GunAction.Idle;
+                bool lIdle = freeL.Action == GunAction.Idle, rIdle = freeR.Action == GunAction.Idle;
                 if (lIdle != rIdle) pick = lIdle ? freeL : freeR;
                 else {
                     bool lOk = LoadoutMatches(freeL, head), rOk = LoadoutMatches(freeR, head);

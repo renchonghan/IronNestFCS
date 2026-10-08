@@ -79,7 +79,7 @@ public static class Glyph16Font {
         ['K'] = F|E|G1|K|M,   // 中横只留左半
         ['L'] = F|E|D1|D2,
         ['M'] = F|E|J|K|B|C,
-        ['N'] = F|E|K|L|B|C,
+        ['N'] = F|E|J|M|B|C,
         ['O'] = A1|A2|B|C|D1|D2|E|F,
         ['P'] = A1|A2|F|E|G1|G2|B,
         ['Q'] = A1|A2|B|C|D1|D2|E|F|M,
