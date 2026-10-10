@@ -8,9 +8,9 @@ namespace IronNestFCS.Logic.FCS;
 
 /// <summary>
 /// 弹种数据: 从游戏 ShellDefinition 资产读取杀伤半径与速度倍率曲线.
-/// 实测: 所有弹种 ShellSpeed=0.7 且速度曲线相同, 弹种只影响 ImpactRadius (km, 半径).
+/// 弹种只影响 ImpactRadius (km, 半径); 速度曲线全弹种同一条 (chargeToSpeedMultiplier).
 /// 曲线: c1=0.30 c2=0.3728 c3=0.5464 c4=0.7536 c5=0.9272 c6=1.0.
-/// 射表公式: 仰角(度) = 距离(km) x 12 / 药包; 飞行时间(s) = 仰角 / (1.4 x 倍率).
+/// 射表公式: 仰角(度) = 距离(km) x 12 / 药包; 飞行时间(s) 见 FlightTime 方法注释 (d×10/7/倍率).
 /// </summary>
 public static class ShellData {
     private static readonly Dictionary<string, float> _killRadius = new();

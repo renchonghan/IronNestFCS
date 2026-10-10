@@ -13,6 +13,8 @@ namespace IronNestFCS.Logic.FCS;
 /// 误差超死区但帧间几乎不动连续 10s → GaveUp (同时锁 Locked, 调用方不再追).
 /// 误差在死区内不算卡 (套上跟稳静默正常, 远处慢目标帧间转角极小不误判).
 /// 仰角 (E) 与方位 (H) 通用, 死区按轴实例化.
+/// 当前实例化参数 kp=ki=kd=0 (天顶星伺服实测只靠设定值前馈 + 死区锁定就很好): Step 恒返回 0 修正,
+/// PID 计算保留作未来调参位; Locked/Stuck/GaveUp 判定与死区是实打实生效的部分.
 /// </summary>
 public class TrackAxis {
     private float _lockDeadband;              // 锁定判定死区 (°) — 与修正死区独立; 动态口径 (弹道学: 落点偏移 ≤ 混凝土弹 R/5)
@@ -20,9 +22,9 @@ public class TrackAxis {
     private readonly float ctrlDeadband;      // 修正死区 (°): |err| 在此内不输出修正 (防量化抖动; 死区太宽 PID 总是偏一点)
     private readonly float iWindowFull;       // 变积分: 全额积分区 (|err| 上限), 按轴调 (E 0.1 / H 0.3)
     private readonly float iWindowOff;        // 变积分: 积分完全关闭区 (|err| 下限, ≥此值清窗), 按轴调 (E 0.5 / H 1)
-    private readonly float kp;                // P 系数 (误差增益; 现传 0 — P 由调用方预测值直设承担)
-    private readonly float ki;                // I 系数 (滑动窗口积分; 0.05)
-    private readonly float kd;                // D 系数 (两帧差分), 按轴调 (E 5.2 防超调 / H 3.0)
+    private readonly float kp;                // P 系数 (误差增益; 现传 0 — 天顶星伺服: 设定值前馈 + 死区锁定已够, PID 项留作调参位)
+    private readonly float ki;                // I 系数 (滑动窗口积分; 现传 0, 同上)
+    private readonly float kd;                // D 系数 (两帧差分; 现传 0, 同上)
     private readonly int bufferSize;          // I 误差窗长度 (帧)
     private const float DDeadband = 0.01f;    // D 项差分死区
     private const float StuckStep = 0.005f;   // 帧间位置变化 < 此值累计卡死 (0.125°/s)
@@ -59,9 +61,6 @@ public class TrackAxis {
         Stable = Stuck = 0f;
         Locked = GaveUp = false;
     }
-
-    /// <summary>旧版 3 参兼容 (vel 忽略 — 速度不参与稳定判定; 旧 FSC 未清退前编译用).</summary>
-    public float Step(float err, float vel, float pos) => Step(err, pos);
 
     /// <summary>推进一步: err = 目标-实际, pos = 实际位置 (卡死检测用). 返回修正量 (叠加到预测值).</summary>
     public float Step(float err, float pos) {

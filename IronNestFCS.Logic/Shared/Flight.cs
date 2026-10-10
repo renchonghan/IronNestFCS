@@ -18,6 +18,8 @@ public class Flight {
     public float Remain;            // 剩余秒 (统一口径, 每帧更新)
     public bool Landed;             // 落地封存 (之后 Remain 恒 0)
     public float GcRaw = float.NaN; // 原始炮表值 (诊断)
+    /// <summary>冻结落点 (板面坐标): GC 击发时锁存的开火前最后瞄准点, 与落点线同一数据源 — 扫荡覆盖判定圈中心用 (不跟目标走).</summary>
+    public Vector2 ImpactBoard;
 
     private float _lastGc = float.NaN;
     private float _gcLag = float.NaN; // 本地 − 炮表 基准差 (倒计时启动滞后 ~1s, 恒差锁定)

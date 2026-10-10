@@ -7,7 +7,7 @@ using UnityEngine;
 namespace IronNestFCS.Logic.FCS;
 
 /// <summary>
-/// [DC] DisplayControl — 2.0 显控台数据循环 (迁移期: 未接线).
+/// [DC] DisplayControl — 2.0 显控台数据循环 (FcsModule 已接线).
 /// 数据循环 25fps: 铁巢位置 / Radar SRC → Target 列表 (相对位置 + TWS 5 帧平均速度) / 实体图标差集 / 操作响应 (请求).
 /// 渲染不在这里 — 独立渲染线程 <see cref="SandboxRenderer"/>.
 /// 状态端口 (FC 读): Target 列表 + 火控请求 + AutoFire/AutoTask 开关位.
@@ -209,10 +209,13 @@ public class DisplayControl {
     }
 
     /// <summary>扫荡 (舰长席排布): 智能选弹 (AutoTask 不受 SelectedShell 影响) + 集群覆盖比价 + 收益密度排序.
-    /// 弹种规则 (EQKE/核弹/特种排除): 装甲 AP (10) 点杀, 成对 ≤APHE 半径 0.25km 一发 APHE (15) 覆盖 (同穿甲能力);
-    /// 无甲 DRIL (3) 点杀, 扎堆按 LE (8, r0.15) / HE (10, r0.25) / HCHE (18, r0.55) 覆盖比价 (药价 0.25/包计入).
-    /// 集群 = 一发覆盖弹锁种子头 (杀伤半径内必死), 溅射成员跳过不再打; 覆盖半径内有友军 → 禁用该覆盖弹 (别学美国人).
-    /// 排序 = 收益密度 (装甲 20 / 无甲 5) / 总成本 降序; 成本相等覆盖胜 (轮次少优先).
+    /// 选弹规则 (EQKE/核弹/特种排除): 装甲阶段比价 — APHE (15) 覆盖尝试 vs AP (10) + 圈内逐个点杀,
+    /// 覆盖成本 ≤ 点杀成本 + 1 走覆盖 (装甲价值 20 恒回本, 只认成本账不认回本 — 否则全 APHE), 纯单目标直接 AP, 圈内有友军禁用 APHE;
+    /// 软目标阶段回本 — 覆盖弹按 HCHE (18, r0.55) → HE (10, r0.25) → LE (8, r0.15) 序尝试,
+    /// 覆盖成本 ≤ 圈内总价值 (5×n) 就走覆盖 (比点杀贵一点也吃, 省轮次), 不回本兜底 DRIL (3) 点杀 (分散目标覆盖弹基本都亏);
+    /// 覆盖圈内有友军 → 禁用该覆盖弹 (别学美国人). 药价按各自距离 × 当前装药模式 (T/N/X) 解析的药包量动态算 (与 FC 派发同口径).
+    /// 请求批排序 = 优先级 (杀伤区继承圈内最大值 — 反炮兵) 降序, 同级收益密度降序
+    /// (最终队列序由 FC 重排: 手动段冻结在前 + 自动段稳定冒泡 + 层内最大缺口点名链).
     /// 3s 一轮 (与雷达扫描同数量级): 每轮按 现有任务 (队列+在炮) + 未落地炮弹 的杀伤覆盖算漏网之鱼 —
     /// 手动压入的任务/飞行中的弹同样参与覆盖 (不重复编排); 弹落地跳一轮 (击杀结算死区). 无批次去重集合.</summary>
     private const float PowderCost = 0.25f; // 征用/包 (20 包 = 5 征用)
@@ -224,6 +227,7 @@ public class DisplayControl {
         public BulletType Shell;
         public float Cost;  // 弹+药 (征用)
         public float Value; // 集群总价值
+        public int Priority; // 杀伤区继承优先级 (圈内目标最大值 — 反炮兵插队)
     }
 
     private void Sweep() {
@@ -251,28 +255,43 @@ public class DisplayControl {
         var consumed = new HashSet<GameObject>();
         var plans = new List<SweepPlan>();
 
-        // 装甲: 配对 (间距 ≤ APHE 半径) → APHE 一发覆盖; 单点 → AP
+        // 装甲阶段 (两次判定: 先数圈内伴生, 有伴生才比价): APHE 覆盖尝试 → 与 AP + 圈内逐个点杀比价
+        // (覆盖成本 ≤ 点杀成本 + 1 走覆盖 — 装甲价值 20 恒回本, 只认成本账, 否则无脑全 APHE); 纯单目标直接 AP; 圈内有友军禁用 APHE
         var armours = enemies.FindAll(e => e.Armour > 0);
         foreach (var a in armours) {
             if (consumed.Contains(a.Entity)) continue;
             float rAphe = ShellData.KillRadiusKm(BulletType.APHE) / GeoMap.KmPerLocal;
-            var pair = armours.Find(b => b != a && !consumed.Contains(b.Entity) && (Board(b) - Board(a)).magnitude <= rAphe);
+            bool friendInside = false;
+            foreach (var f in friends) if ((f - Board(a)).magnitude <= rAphe) { friendInside = true; break; }
+            var inR = enemies.FindAll(o => o != a && !consumed.Contains(o.Entity) && (Board(o) - Board(a)).magnitude <= rAphe);
             consumed.Add(a.Entity);
-            if (pair != null) {
-                consumed.Add(pair.Entity);
-                plans.Add(new SweepPlan { Seed = a, Shell = BulletType.APHE, Cost = 15f + Powder(a), Value = 40f });
+            if (friendInside || inR.Count == 0) {
+                plans.Add(new SweepPlan { Seed = a, Shell = BulletType.AP, Cost = ShellCost(BulletType.AP) + Powder(a), Value = 20f, Priority = PriorityOf(a) });
+                continue;
             }
-            else plans.Add(new SweepPlan { Seed = a, Shell = BulletType.AP, Cost = 10f + Powder(a), Value = 20f });
+            float cover = ShellCost(BulletType.APHE) + Powder(a);
+            float point = ShellCost(BulletType.AP) + Powder(a);
+            foreach (var o in inR) point += (o.Armour > 0 ? ShellCost(BulletType.AP) : ShellCost(BulletType.DRIL)) + Powder(o);
+            if (cover <= point + 1f) { // 差异 ≤1 按覆盖走
+                foreach (var m in inR) consumed.Add(m.Entity);
+                float value = 20f;
+                foreach (var m in inR) value += m.Armour > 0 ? 20f : 5f;
+                plans.Add(new SweepPlan { Seed = a, Shell = BulletType.APHE, Cost = cover, Value = value, Priority = PlanPriority(a, inR) });
+            }
+            else {
+                // AP 点杀 (圈内成员不消费 — 各自扫描时再处理)
+                plans.Add(new SweepPlan { Seed = a, Shell = BulletType.AP, Cost = ShellCost(BulletType.AP) + Powder(a), Value = 20f, Priority = PriorityOf(a) });
+            }
         }
 
-        // 无甲: 贪心覆盖比价 — DRIL 逐点 vs LE/HE/HCHE 覆盖 (相等成本覆盖胜 = 轮次少)
+        // 软目标阶段 (回本判据): 覆盖弹按 HCHE→HE→LE 序尝试, 覆盖成本 ≤ 圈内总价值 (5×n) 就走覆盖 —
+        // 比点杀贵一点也吃 (省轮次, "能回本即可"); 分散目标圈不到人覆盖弹基本都亏 → 兜底 DRIL 点杀; 圈内有友军禁用该覆盖弹
         var softs = enemies.FindAll(e => e.Armour <= 0);
         foreach (var s in softs) {
             if (consumed.Contains(s.Entity)) continue;
             float p = Powder(s);
-            BulletType best = BulletType.DRIL;
-            float bestCost = 3f + p;
-            var members = new List<DcTarget>();
+            SweepPlan plan = null!; // 兜底分支必赋值 (编译器不跨变量推 definite assignment)
+            bool covered = false;
             foreach (var shell in new[] { BulletType.HCHE, BulletType.HE, BulletType.LE }) {
                 float r = ShellData.KillRadiusKm(shell) / GeoMap.KmPerLocal;
                 bool friendInside = false;
@@ -280,23 +299,28 @@ public class DisplayControl {
                 if (friendInside) continue; // 覆盖圈里有友军: 禁用该覆盖弹
                 var inR = new List<DcTarget>();
                 foreach (var o in softs) if (o != s && !consumed.Contains(o.Entity) && (Board(o) - Board(s)).magnitude <= r) inR.Add(o);
-                if (inR.Count == 0) continue;
                 float coverCost = ShellCost(shell) + p;
-                float pointCost = (inR.Count + 1) * (3f + p); // 逐点 DRIL 成本 (含成员)
-                if (coverCost <= pointCost && coverCost < bestCost) { best = shell; bestCost = coverCost; members = inR; }
+                if (coverCost > 5f * (inR.Count + 1)) continue; // 不回本: 试下一个
+                foreach (var m in inR) consumed.Add(m.Entity); // 溅射成员跳过 (杀伤半径内必死)
+                plan = new SweepPlan { Seed = s, Shell = shell, Cost = coverCost, Value = 5f * (inR.Count + 1), Priority = PlanPriority(s, inR) };
+                covered = true;
+                break;
             }
+            if (!covered) plan = new SweepPlan { Seed = s, Shell = BulletType.DRIL, Cost = ShellCost(BulletType.DRIL) + p, Value = 5f, Priority = PriorityOf(s) };
             consumed.Add(s.Entity);
-            foreach (var m in members) consumed.Add(m.Entity); // 溅射成员跳过 (杀伤半径内必死)
-            plans.Add(new SweepPlan { Seed = s, Shell = best, Cost = bestCost, Value = 5f * (members.Count + 1) });
+            plans.Add(plan);
         }
 
-        // 收益密度降序 → 发请求 (队列顺序 = 派发顺序)
-        plans.Sort((x, y) => (y.Value / y.Cost).CompareTo(x.Value / x.Cost));
+        // 排序: 优先级 (杀伤区继承圈内最大值 — 反炮兵插队) 降序, 同级收益密度降序 → 发请求 (队列顺序 = 派发顺序)
+        plans.Sort((x, y) => {
+            int p = y.Priority.CompareTo(x.Priority);
+            return p != 0 ? p : (y.Value / y.Cost).CompareTo(x.Value / x.Cost);
+        });
         foreach (var plan in plans) {
             Requests.Add(new FireTask {
                 Entity = plan.Seed.Entity,
                 Name = plan.Seed.Name,
-                Priority = PriorityOf(plan.Seed),
+                Priority = plan.Priority,
                 Shell = plan.Shell,
                 Mode = ChargeModeSelection,
             });
@@ -316,11 +340,16 @@ public class DisplayControl {
             var seed = task.Entity != null ? GetTarget(task.Entity) : null;
             if (seed != null && WithinCover(seed, task.Shell, t)) return true;
         }
-        // 未落地的炮弹同样覆盖其落点圈 (落地后 = 已结算, 活着才算漏网补刀)
+        // 未落地的炮弹同样覆盖其落点圈 (落地后 = 已结算, 活着才算漏网补刀).
+        // 圈中心 = GC 击发时冻结的落点 (Flight.ImpactBoard, 与落点线同一数据源) — 不跟目标走:
+        // 种子死了圈也在, 动目标/被拖走的令牌圈钉在真实落点. 指定目标本体始终覆盖 (动目标飞行中
+        // 当前位置可能还在圈外, 弹与目标在汇合点相遇).
         foreach (var e in FcPort.Finished) {
             if (e.Flight == null || e.Flight.Landed) continue;
-            var seed = e.Task.Entity != null ? GetTarget(e.Task.Entity) : null;
-            if (seed != null && WithinCover(seed, e.Task.Shell, t)) return true;
+            var task = e.Task;
+            if (t.Entity == task.Entity) return true;
+            float r = ShellData.KillRadiusKm(task.Shell) / GeoMap.KmPerLocal;
+            if ((e.Flight.ImpactBoard - Board(t)).magnitude <= r) return true;
         }
         return false;
     }
@@ -336,12 +365,12 @@ public class DisplayControl {
     private Vector2 Board(DcTarget t) =>
         MapSurfaceRef != null ? (Vector2)MapSurfaceRef.InverseTransformPoint(t.WorldPos) : (Vector2)t.WorldPos;
 
-    /// <summary>本发药价 (征用): 0.25/包 × 最小装药包数 (按距铁巢距离查表).</summary>
+    /// <summary>本发药价 (征用): 0.25/包 × 装药包数 — 按当前选择的装药模式 (T/N/X) 解析, 与 FC 派发口径一致 (不是恒最小装药).</summary>
     private float Powder(DcTarget t) {
         if (NestRef == null || MapSurfaceRef == null) return PowderCost;
         var nb = (Vector2)MapSurfaceRef.InverseTransformPoint(NestRef.position);
         float distKm = (Board(t) - nb).magnitude * GeoMap.KmPerLocal;
-        return PowderCost * BallisticCalculator.MinimumCharge(distKm);
+        return PowderCost * BallisticCalculator.ChargeFor(ChargeModeSelection, distKm); // T/N/X 统一口径 (与 FC 派发同源, 双处维护会漂移)
     }
 
     /// <summary>弹体价 (征用): 自动使用范围; 特种/排除弹返回极大值 (不可用).</summary>
@@ -362,6 +391,13 @@ public class DisplayControl {
             case EntityKind.Armour: return 2;
             default: return 1;
         }
+    }
+
+    /// <summary>计划优先级: 杀伤区继承范围内所有目标的最大值 (FDC 4/炮兵 3/装甲 2/其他 1) — 覆盖到高价值目标的任务重排靠前 (反炮兵).</summary>
+    private static int PlanPriority(DcTarget seed, List<DcTarget> members) {
+        int p = PriorityOf(seed);
+        foreach (var m in members) p = Mathf.Max(p, PriorityOf(m));
+        return p;
     }
 
     // ===== 目标输入 (用户操作 → 请求) =====
@@ -390,7 +426,7 @@ public class DisplayControl {
         Requests.Add(new FireTask {
             Entity = go,
             Name = go.name,
-            Priority = 1,
+            Manual = true, // 手动段: 顺序冻结永远在前 (人工大于自动, 不参与自动排序)
             Shell = SelectedShell,
             Mode = ChargeModeSelection,
         });
@@ -491,13 +527,14 @@ public class DisplayControl {
         return i;
     }
 
-    /// <summary>两车是否相邻 (板面距离 < 0.35 且标量速度差 < 5 m/s — 移动速度是标量不是矢量).</summary>
+    /// <summary>两车是否相邻 (板面距离 < 0.35 且标量速度差 < 0.5 m/s — 移动速度是标量不是矢量;
+    /// 0.5 收紧: 同列车厢速度几乎一致, 5 m/s 会把同向异速的两列车/车队链成一串).</summary>
     private bool NearCar(DcTarget a, DcTarget b) {
         var pa = (Vector2)MapSurfaceRef!.InverseTransformPoint(a.Entity.transform.position);
         var pb = (Vector2)MapSurfaceRef.InverseTransformPoint(b.Entity.transform.position);
         if (Vector2.Distance(pa, pb) >= 0.35f) return false;
         float va = a.Velocity.magnitude * 1000f, vb = b.Velocity.magnitude * 1000f; // m/s 标量
-        return Mathf.Abs(va - vb) < 5f;
+        return Mathf.Abs(va - vb) < 0.5f;
     }
 
     /// <summary>链定案: 数据源 = (n+1)/2 号中心车, 文本锚点 = 最右边车厢 (max 板面 x — 与行车方向无关,
@@ -561,7 +598,7 @@ public class DisplayControl {
         Requests.Add(new FireTask {
             Entity = token,
             Name = token.name,
-            Priority = 1,
+            Manual = true, // 手动段: 顺序冻结永远在前 (人工大于自动)
             Shell = SelectedShell,
             Mode = ChargeModeSelection,
         });

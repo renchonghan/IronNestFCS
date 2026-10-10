@@ -16,18 +16,25 @@ public class TriggerConsole {
     private SliderEnergyMomentumSpinner? _fire;
 
     public bool TryBind() {
-        var console = GameObject.Find(".Review Console Parent").transform;
+        var consoleGo = GameObject.Find(".Review Console Parent");
+        if (consoleGo == null) {
+            MelonLogger.Error("[FCS] TriggerConsole: Can't find .Review Console Parent");
+            return false;
+        }
+        var console = consoleGo.transform;
         var buttons = new List<LookAtTarget>();
-        
+
         for (var i = 0; i < console.childCount; ++i) {
             var child = console.GetChild(i);
             if (child.name.StartsWith(".Check Switch")) {
-                buttons.Add(child.GetComponentInChildren<LookAtTarget>());
+                var bt = child.GetComponentInChildren<LookAtTarget>();
+                if (bt != null) buttons.Add(bt);
             }
         }
 
-        if (buttons.Count != 5) {
-            MelonLogger.Error("Can't bind trigger console.");
+        if (buttons.Count != 5) { // 五步确认开关数不足: 绑定失败等开机重试 (继续索引 [0..4] 会越界)
+            MelonLogger.Error($"[FCS] TriggerConsole: found {buttons.Count} check switches, need 5");
+            return false;
         }
         _taskCheck = buttons[0];
         _bulletCheck = buttons[1];
@@ -48,7 +55,7 @@ public class TriggerConsole {
     }
 
     public void Fire() {
-        _fire?.AddEnergy(255);
+        _fire?.AddEnergy(255); // 满能量值 (游戏能量条 0-255 口径)
     }
 
     public IEnumerator Arm(LeftRight leftRight) {

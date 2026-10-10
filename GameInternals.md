@@ -1,7 +1,7 @@
 # 游戏逆向发现记录 (Game Internals Notes)
 
 > 铁巢: 重炮塔模拟器 (正式版) IL2CPP 逆向笔记. 记录通过探针发现的接口 / 组件 / 特性, 供后续开发查阅.
-> 所有探针方法都保留在 GunSystem.cs 里 (注释状态), 需要时取消注释调用即可.
+> 探针方法已随 v2.0 清退 (GunSystem.cs 重写为纯硬件驱动, 探针全删), 需要时从 git 历史找回.
 
 ---
 
@@ -90,7 +90,7 @@
 - `Draggable Surface` (BoxCollider 6.29x2.85 = 板子含边框), 令牌的父物体
 - `Canvas/MapRoot` (UI 网格空间, 0-20 x 0-10 = A-T x 1-10 大格, 每大格 9x9 小格)
 - `Player Turret Piece` (**铁巢棋子**, DraggableItem, 玩家可拖动)
-- 令牌: `MapToken_Artillery` (炮击目标 1-4 = T1-T4) / `MapToken_RefrencePoint` (参考点) / `MapToken_Recon` (侦察)
+- 令牌: `MapToken_Artillery` (炮击目标 1-10 = T1-10) / `MapToken_RefrencePoint` (参考点) / `MapToken_Recon` (侦察)
 - 实体: `Fire Mission Root` 子物体, 每个带 `EntityLocation` (名字如 hostiletank#1 / allyinfantry#3 / enemytarget#1 / fdc#1)
   - **实体坐标系单位 = km**: Fire Mission Root 1 单位 = 1 km = MapCellSize(0.262) 板面单位; 世界缩放 = 0.262 x 板面世界缩放 0.81 ≈ 0.212 (实体自身 localScale=1, lossyScale≈0.21). Draggable Surface 世界缩放 0.81. 挂在实体下的自绘元素: 半径/线宽都除以"实体世界缩放/板面世界缩放"即得 km 制局部值
 - `---ImpactMarkerManager` (ImpactMarkerManager + ImpactTracker):
@@ -109,7 +109,7 @@
 
 ### 1.10 弹种定义 (ShellDefinition 资产, ScriptableObject)
 
-场景里有 21 个 ShellDefinition 资产 (名字如 `ShellDefinition_AP` / `ShellDefinition_STAR`), 通过 `Resources.FindObjectsOfTypeAll<ScriptableObject>()` + 类型名过滤扫描. 关键字段:
+场景里有 21 个 ShellDefinition 资产 (名字如 `ShellDefinition_AP` / `ShellDefinition_STAR`; **21 个含 EMPT, mod 弹种枚举 `BulletType` 只有 20 种不含 EMPT**), 通过 `Resources.FindObjectsOfTypeAll<ScriptableObject>()` + 类型名过滤扫描. 关键字段:
 
 - `ShellId` (string, 如 "AP"/"STAR"; 注意游戏侧 PCLM 叫 PLCM) / `DisplayName` / `Description`
 - **`ShellSpeed` = 0.7 (全部 21 个弹种同值)**
@@ -171,39 +171,20 @@
 
 ---
 
-## 4. 探针清单 (全部保留在 GunSystem.cs, 注释状态)
+## 4. 探针清单 (已移除 — v2.0 清退)
 
-| 探针 | 用途 |
-| --- | --- |
-| DebugDumpReloadState | 炮管+装填控制台全结构 dump, GunController/ArtilleryReloadController 字段 |
-| DumpChildrenRecursive | 层级递归 dump (Odometer/TMP/Renderer/Light + 真实类型名) |
-| DumpReloadStates | 装填状态定义表 + 当前状态 |
-| DumpFields | 托管反射 dump 字段 (强类型引用时值真实) |
-| DumpNativeFields | 原生反射 dump (封箱组件用) |
-| TrueTypeName | 封箱组件的真实 Il2Cpp 类型名 |
-| FindChildDeep | 递归找子物体 |
-| ProbeTacticalMap | 地图子树 dump + 坐标/矩形/碰撞体 |
-| ProbeNestVariable | ImpactMarkerManager/MarkerData 字段 (确认真源 turretBase) |
-| ProbeFlightTimer | Gun Watch / GunStopwatch 读数 |
-| ProbeArtilleryTimer | 炮兵计时器 (确认为 PredictedImpactTime) |
-| ProbeDrawnArrows | 玩家画的箭头 (MapMarkerLineUI + Line 字段) |
-| ProbeNestPrompt | 含"铁巢"的 TMP 文本扫描 |
-| ProbeBallisticData | 扫描全部 ShellDefinition 资产 (杀伤半径/速度曲线/射程映射) |
-| DumpShellDefinition | 单个 ShellDefinition dump (字段解箱 + 曲线 Evaluate + 映射表逐元素) |
-| ProbeFlightFormula | 每秒打印左炮仰角/飞行时间 (拟合飞行时间公式用) |
-| ProbeEntityScale | 实体缩放链 (发现 Fire Mission Root 0.21) |
-| ProbeDashParams | Line 虚线参数 (DashSize/DashSpacing = 4 x 线宽) |
+探针方法随 GunSystem.cs 重写一并删除, 不再保留在代码里; 旧清单见 git 历史。需要 dump 时按 §3 的踩坑记录重写即可。
 
 ---
 
 ## 5. 已实现的特性速查
 
 - **面板**: 两行火控状态 (行1 炮实际状态 FT:, 行2 火控解 T:-), 两列队列 (任务/完成, 固定 8 行), 荧光绿等宽字体; 齐射任务行首显示 `>>>[SALVO]`
-- **齐射**: 右键实体 1 次入队 (双圈), 2 次升级齐射 (三圈), 3 次出队; 派发要求两炮同时空闲, 原任务左炮 + 克隆右炮同时开火
-- **CALL 枢纽状态机**: 检查点鲁棒性 (推弹中读数不可信), 计数器防死循环, 单次解算
+- **齐射**: 右键实体 1 次入队 (双圈), 2 次升级齐射 (三圈), 3 次出队; 派发要求两炮同时空闲, **单任务双槽 + SyncCommand + SalvoDirector (无克隆)**, 双炮同时开火
+- **CALL 枢纽状态机** (v1.x 历史): 检查点鲁棒性 (推弹中读数不可信), 计数器防死循环, 单次解算
 - **铁巢棋子吸附**: turretBase 真源, 10fps, 沙盘校准
-- **地图元素**: 实体菱形框 (敌对红/友军蓝), 右键入队/取消, 序列标签 (十六段米字数码), 落点计时器 (整秒), 瞄准十字/X (CanFire 显示), 铁巢->目标虚线
-- **炮兵计时表**: GunStopwatch 读数, 行 1 瞄准期读活变量 PredictedImpactTime
+- **地图元素** (v1.x 历史): 实体菱形框 (敌对红/友军蓝), 右键入队/取消, 序列标签 (十六段米字数码), 落点计时器 (整秒), 瞄准十字/X (CanFire 显示), 铁巢->目标虚线
+- **炮兵计时表** (v1.x 历史): GunStopwatch 读数, 行 1 瞄准期读活变量 PredictedImpactTime
 
 ## 6. 火控台实现方式 (设计方向)
 

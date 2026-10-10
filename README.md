@@ -6,6 +6,10 @@
 
 > 基于游戏Steam发行版本开发，使用 IL2CPP + MelonLoader。
 
+# 功能手册
+
+完整的功能说明与操作指南（沙盘点选、任务队列、扫荡、齐射、HUD 面板、常见情形）见 **[Function.md](Function.md)**；架构与开发细节见 [Architecture.md](Architecture.md)。
+
 # 安装教程
 
 > 本教程假设你**只有一款原版游戏**，没装过任何 Mod。按顺序一步步做，不用懂任何技术。
@@ -41,8 +45,8 @@ MelonLoader 是运行本 Mod 必需的前置工具（所有 MelonLoader Mod 都�
 ## 第 3 步：下载本 Mod
 
 1. 打开本仓库的 Releases 发布页：**[Releases](../../releases)**
-2. 下载 **`IronNestFCS_v1.0.7.zip`**（火控，必装）
-3. （可选）如果你还想用"自定义唱片机"，再下载 **`CustomRecords_v1.0.2.zip`**
+2. 下载最新的 **`IronNestFCS_v2.0.0.zip`**（火控，必装）
+3. （可选）如果你还想用"自定义唱片机"，再下载 **`CustomRecords` 压缩包**
 4. 解压你下载的 zip（右键 → 全部解压缩），得到文件夹
 
 ## 第 4 步：把 Mod 装进游戏（重点，仔细看）
@@ -68,34 +72,10 @@ MelonLoader 是运行本 Mod 必需的前置工具（所有 MelonLoader Mod 都�
 
 1. 从 Steam 正常启动游戏
 2. 如果 MelonLoader 装好了，启动时屏幕上会**弹出一个黑色控制台窗口**——别关它，那是正常现象
-3. 进入有炮塔和地图桌的关卡 — 左上角会先播放**开机自检画面**（CMD 风逐行自检，约 5 秒），随后切换为火控状态面板
+3. 进入有炮塔和地图桌的关卡 — 左上角会先播放**开机自检画面**（CMD 风逐行自检，约 8 秒，自检完成后画面再停留 2.1 秒），随后切换为火控状态面板
 4. 如果最终出现**火控状态面板**，说明安装成功 🎉
    - 如果自检卡在红字 `[FAIL]`，按键盘 **F9** 重试绑定即可
-5. 使用步骤见下文"使用"章节
-
-## 功能
-
-- **一键打击**：点击地图上的炮兵目标（T1~T4），自动为其下达一次完整的打击任务。
-- **双炮管任务调度**：任务进入队列后由调度器自动派给空闲炮管，一管炮打完一发自动拉取下一个任务，两管炮并行作业。
-- **自动弹道解算**：读取目标的方向角与距离，自动设定装药、弹种并解算所需仰角。
-- **多弹种支持**：AP / HCHE / HE / STAR / SMK，可在面板上选择当前弹种；弹仓缺弹时自动到采购台购买。
-- **自动击发（可选）**：通过面板上的 `Auto Fire` 开关切换是手动还是自动完成最后的击发动作。
-- **状态面板**：IMGUI 窗口实时显示两管炮的当前任务、目标参数与待派发任务数。
-- **热重载开发**：火控逻辑独立成可卸载的程序集，开发时改完代码按 **F9** 即可在不重启游戏的情况下重新加载。
-- **自定义唱片机**（附带的独立 Mod）：把 `UserData/CustomRecords/` 下的音频文件（`.mp3` / `.wav` / `.flac`，封面取同名图片或内嵌封面）自动克隆成场景内的 RecordDisk，换上合成封面与音轨。
-
-## 架构
-
-工程拆分为四个程序集，核心是为**热重载**服务的宿主 / 逻辑分离设计：
-
-| 项目 | 角色 | 说明 |
-| --- | --- | --- |
-| `IronNestFCS` | **宿主 Mod** | 稳定加载、永不重载。负责首次加载 Logic、进任务/按 F9 触发热重载、转发生命周期回调。 |
-| `IronNestFCS.Abstractions` | **契约** | 仅含 `IFcsModule` 接口。只加载一份，是唯一能安全跨 `AssemblyLoadContext` 边界传递的类型。 |
-| `IronNestFCS.Logic` | **火控逻辑** | 所有高频改动的火控代码：弹道解算、任务调度、炮塔/炮管操控、UI。被装进可回收的 ALC，按 F9 卸载并重载。 |
-| `IronNestFCS.CustomRecords` | **独立 Mod** | 与火控无关的场景装饰，扫描 `UserData/CustomRecords/` 下的音频文件，为每个文件克隆一张 RecordDisk 并替换音轨与封面。 |
-
-热重载的关键点：Logic 程序集从内存字节加载（不锁住磁盘 dll），装进 `isCollectible` 的 `AssemblyLoadContext`；重载时先 `Shutdown`（撤销 Harmony 补丁、停止协程、清空 IL2CPP 引用）再卸载旧 ALC，最后从磁盘重新加载新版本。详见 [LogicReloader.cs](IronNestFCS/LogicReloader.cs) 与 [FSC.cs](IronNestFCS.Logic/FSC.cs) 中的注释。
+5. 使用方法见 [Function.md](Function.md) 功能手册
 
 ## 构建与安装
 
@@ -131,49 +111,12 @@ dotnet build IronNestFCS.sln -c Release
 
 > `IronNestFCS.Logic.csproj` 默认已把 `OutputPath` 指向 `$(GameDir)\UserData\IronNestFCS\`，构建即就位，改完代码进游戏按 F9 即可生效。
 
-## 使用
-
-1. 启动已安装 MelonLoader 与本 Mod 的游戏。
-2. 进入包含炮塔与地图桌的关卡场景。若火控面板提示 `Dial 未绑定`，按 **F9** 在当前场景重新绑定。
-3. 在控制台旁的按钮上选择弹种（默认 HE），并按需开启 `Auto Fire`。
-4. 拖动地图上的目标标记 (1~4) 到目标位置。
-5. 点击地图右侧的目标按钮（T1~T4）下达打击任务，Mod 会自动完成解算、装填、瞄准与击发。
-6. 左上角面板实时显示两管炮的任务进度与队列情况。
-
-### 开发热重载
-
-修改 `IronNestFCS.Logic` 内的代码后，重新构建该项目（dll 会直接输出到游戏的 `UserData/IronNestFCS/`），切回游戏按 **F9** 即可加载新逻辑，无需重启游戏。
-
-## 开机自检
-
-进任务时左上角先播放开机自检面板（CMD 风黑框，逐行显现，约 8 秒，自检完成后画面再停留 2.1 秒），随后切换为火控状态面板：
-
-```text
-14.23.05 [INFO] System Init ...
-14.23.06 [INFO] System Loaded For FCS 2.0.0
-14.23.06 [CORE] Enable Peripherals ...
-                |- Gun Control System ------------------- [DONE]
-                |- Data Process System ------------------ [DONE]
-                |- Fire Control System ------------------ [DONE]
-                |- Holography System -------------------- [DONE]
-14.23.08 [CORE] Peripherals Enabled
-14.23.08 [CORE] Connect To SAR DataLine ----------------- [DONE]
-14.23.08 [INFO] DataLine Bench ----------------- DL:41ms PL:0.0%
-14.23.09 [CORE] FINAL CHECK ...
-14.23.09 [INFO] Load Application ...
-```
-
-- 自检就是绑定过程：`System Init ...` 期间等待实体就绪（重试绑定），每行 `[DONE]` = 该模块真实装配完成；行序 = 真实依赖序（炮控 → 数据/显示 → 火控 → 全息渲染）。
-- `DataLine Bench` 的 DL 为雷达 25Hz 粗跟循环的实测间隔（约 40ms，随游戏帧率抖动）。
-- 绑定失败：该行红显 `[FAIL]` 并冻结面板；按 **F9** 重试，或回主菜单（NO SIGNAL 接管）。
-- 主菜单 / 实体未初始化时显示 NO SIGNAL 艺术字 + 短横线 X 框占位（同尺寸深色框）。
-
 ## 贡献
 
 欢迎提交 Issue 和 Pull Request。
 
 - 发现 Bug、有功能建议或疑问，请[提交 Issue](../../issues)。
-- 改进代码请[提交 Pull Request](../../pulls)。改动火控逻辑时请留意 `FSC.cs` 中关于热重载与协程的约定（不要在 Logic 中注册新的 IL2CPP 类型、协程必须登记以便卸载时停止、跨 ALC 只能传递 `IFcsModule`）。
+- 改进代码请[提交 Pull Request](../../pulls)。改动火控逻辑时请留意 [Architecture.md](Architecture.md) §1.3 的热重载约束（不要在 Logic 中注册新的 IL2CPP 类型、协程必须登记以便卸载时停止、跨 ALC 只能传递 `IFcsModule`）。
 
 ## 免责声明
 

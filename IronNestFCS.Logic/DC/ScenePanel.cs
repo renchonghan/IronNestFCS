@@ -8,7 +8,7 @@ using UnityEngine;
 namespace IronNestFCS.Logic.FCS;
 
 /// <summary>
-/// [DC] ScenePanel — 2.0 场景交互层 (迁移期: 旧 FcsSceneInteractor 清退前不 Build, 无视觉冲突).
+/// [DC] ScenePanel — 2.0 场景交互层 (FcsModule 开机末段 Build).
 /// 3D 按钮列 (沙盘右侧第二列, 原 T1-T4 位置): AutoFire / AutoTask / TWS / TightCharge(T) / NormalCharge(N) / ExtraCharge(X);
 /// 火控台右侧按钮列改为三个: Start / Pause-Resume / Stop; 弹种选择按钮列保持现状 (旧层).
 /// 目标输入: 实体右键 = 入队请求 (再点取消); 令牌拖放注册由 DisplayControl 方法承载.
@@ -26,6 +26,9 @@ public class ScenePanel {
     private readonly HashSet<Collider> _tokenColliders = new();
     private float _lastRegister;
     private bool _built;
+    private const float BtnStepX = 0.05f, BtnStepY = 0.0045f; // 按钮列步进 (弹种列/模式列同款)
+    private const float PlaneBulletZ = -18.4181f; // 弹种列/火控台按钮层 (z 越浅越靠前)
+    private const float PlaneModeZ = -18.6181f;   // 模式列/STP 层
 
     /// <summary>火控台三态: 停止 (白/白/红) / 运行 (绿/白/白) / 暂停 (白/黄/白).</summary>
     private enum PanelState { Stopped, Running, Paused }
@@ -43,7 +46,7 @@ public class ScenePanel {
 
     // ===== 弹种选择按钮列 (保持现状: 火控台右侧斜线列, 全弹种枚举) =====
     private void BuildBulletButtons() {
-        const float z = -18.4181f;
+        const float z = PlaneBulletZ;
         var x = 0.8f;
         var y = -0.65f;
         foreach (BulletType type in System.Enum.GetValues(typeof(BulletType))) {
@@ -59,8 +62,8 @@ public class ScenePanel {
             Place(button, x, y, z);
             _bulletButtons.Add((type, button));
             _refreshColors.Add(() => SetColor(button, Dc != null && Dc.SelectedShell == captured ? Color.green : Color.white));
-            x -= 0.05f;
-            y -= 0.0045f;
+            x -= BtnStepX;
+            y -= BtnStepY;
         }
     }
     private readonly List<(BulletType, GameObject)> _bulletButtons = new();
@@ -73,6 +76,8 @@ public class ScenePanel {
         _owned.Clear();
         _refreshColors.Clear();
         _entityColliders.Clear();
+        _tokenColliders.Clear();
+        _bulletButtons.Clear(); // 重建前清弹种按钮表 (残留销毁按钮: 点击 SetColor 抛 MissingReference + 新按钮重复入表双重着色)
         _built = false;
     }
 
@@ -94,12 +99,14 @@ public class ScenePanel {
         foreach (var c in _entityColliders) {
             var t = c.transform;
             t.rotation = Quaternion.identity;
-            t.position = t.parent.position;
+            var p = t.parent.position;
+            t.position = new Vector3(p.x, p.y, p.z - 0.01f); // 保留初始 z 偏移 (防 Z-fighting — 旧实现每帧抹平了它)
         }
         foreach (var c in _tokenColliders) {
             var t = c.transform;
             t.rotation = Quaternion.identity;
-            t.position = t.parent.position;
+            var p = t.parent.position;
+            t.position = new Vector3(p.x, p.y, p.z - 0.01f);
         }
     }
 
@@ -110,18 +117,11 @@ public class ScenePanel {
             if (c == null || c.Entity == null) continue;
             // 不用实体自带的 collider (游戏棋子的可能太小/位置偏), 统一挂 FCS 自有点击盒
             if (_entityColliders.Any(x => x != null && x.transform.parent == c.Entity.transform)) continue;
-            var boxGo = new GameObject("FCS2_ClickBox");
-            boxGo.transform.SetParent(c.Entity.transform, false);
-            boxGo.transform.localPosition = new Vector3(0f, 0f, -0.01f);
-            var box = boxGo.AddComponent<BoxCollider>();
-            box.size = new Vector3(0.26f, 0.26f, 0.1f);
-            _owned.Add(boxGo); // 随 ShutDown 清理
-            _entityColliders.Add(box);
             var go = c.Entity;
-            _clicks.Register(box, () => {
+            _entityColliders.Add(AddClickBox(c.Entity.transform, 0.26f, () => {
                 MelonLogger.Msg($"[DC] right-click {go.name}");
                 Dc?.RightClickEntity(go);
-            }, right: true); // 右键 (左键留给游戏自身拖拽)
+            }));
         }
         // 死亡拆盒: 父级实体不在雷达 Contacts (阵亡出表) → 注销 + 销毁盒子 — 摧毁目标不可点, 尸体不挡射线
         // (拆盒后右键自然无门控可达: 盒都没了就没有"点"这回事; 死亡检测延迟窗口 ~1-3s, 期间点击由雷达下一轮扫描自愈)
@@ -141,17 +141,10 @@ public class ScenePanel {
             // 标记令牌只注册 T1-10 (MapToken_Artillery 系列); 击杀/侦察/参考点令牌不可点
             if (go == null || !go.name.StartsWith("MapToken_Artillery") || go.name.Contains("Killed")) continue;
             if (_tokenColliders.Any(x => x != null && x.transform.parent == go.transform)) continue;
-            var boxGo = new GameObject("FCS2_ClickBox");
-            boxGo.transform.SetParent(go.transform, false);
-            boxGo.transform.localPosition = new Vector3(0f, 0f, -0.01f);
-            var box = boxGo.AddComponent<BoxCollider>();
-            box.size = new Vector3(0.03f, 0.03f, 0.1f);
-            _owned.Add(boxGo); // 随 ShutDown 清理
-            _tokenColliders.Add(box);
             var token = go;
-            _clicks.Register(box, () => {
+            _tokenColliders.Add(AddClickBox(go.transform, 0.03f, () => {
                 Dc?.RightClickToken(token);
-            }, right: true);
+            }));
         }
         // 击杀改名令牌同款拆盒 (Killed 系列不可点, 注册扫描本就跳过 — 已挂的盒子拆掉)
         var deadTokens = new List<Collider>();
@@ -174,13 +167,25 @@ public class ScenePanel {
         MelonLogger.Msg($"[DC] click box removed: '{parentName}'");
     }
 
+    /// <summary>建 FCS 点击盒 (实体 0.26 / 令牌 0.03 局部尺寸; 世界归正由 StraightenClickBoxes 每帧维护).</summary>
+    private Collider AddClickBox(Transform parent, float size, System.Action onClick) {
+        var boxGo = new GameObject("FCS2_ClickBox");
+        boxGo.transform.SetParent(parent, false);
+        boxGo.transform.localPosition = new Vector3(0f, 0f, -0.01f);
+        var box = boxGo.AddComponent<BoxCollider>();
+        box.size = new Vector3(size, size, 0.1f);
+        _owned.Add(boxGo); // 随 ShutDown 清理
+        _clicks.Register(box, onClick, right: true); // 右键 (左键留给游戏自身拖拽)
+        return box;
+    }
+
     // ===== 沙盘右侧第二列 (原 T1-T4 按钮位置): AUTO TASK / AUTO FIRE / (空) / SAR RADAR / TWS CGMTI / (空) / T/N/X =====
     // 空行 = 面板上占一个按钮位置 (视觉分组); 全大写标签. SAR = 雷达电源: 默认关, 关时无雷达 (目标全无), TWS 灰按不动.
     private void BuildModeButtons() {
-        const float z = -18.6181f; // 与弹种列 (-18.4181) 间隔 0.2
+        const float z = PlaneModeZ; // 与弹种列 (PlaneBulletZ) 间隔 0.2
         var x = 0.8f;
         var y = -0.65f;
-        void Step() { x -= 0.05f; y -= 0.0045f; }
+        void Step() { x -= BtnStepX; y -= BtnStepY; }
 
         // 先声明再赋值: lambda 要捕获按钮引用, 不能在其声明表达式内部引用它
         GameObject autoTask = null!, autoFire = null!, sar = null!, tws = null!, tight = null!, normal = null!, extra = null!;
@@ -255,9 +260,9 @@ public class ScenePanel {
         _refreshColors.Add(() => SetColor(extra, Dc != null && Dc.ChargeModeSelection == ChargeMode.Extra ? Color.green : Color.white));
     }
 
-    // ===== 火控台右侧: START / PAUSE / ST/CL (START 占原 PAUSE 位; PAUSE 在 START 右侧, 上下对齐第二列 AUTO TASK; ST/CL 原位) =====
+    // ===== 火控台: RUN / HLD / STP / RST 四按钮同点叠放 (z 步进 0.1, 越浅越靠前) =====
     private void BuildControlButtons() {
-        const float z = -18.4181f;
+        const float z = PlaneBulletZ;
 
         GameObject start = null!, pause = null!, stop = null!, rst = null!;
         // 三态指示: 停止 (白/白/红) → 运行 (绿/白/白) → 暂停 (白/橙/白); 当前状态亮在对应按钮, 其余白
@@ -376,9 +381,13 @@ public class ScenePanel {
             if (renderer.material != null) renderer.material.color = color;
             return;
         }
-        var mat = new Material(shader);
+        // 复用上次 SetColor 实例化的材质 (同 shader 判定) — 每次新建材质从不销毁会泄漏累积
+        var mat = renderer.material;
+        if (mat == null || mat.shader != shader) {
+            mat = new Material(shader);
+            renderer.material = mat;
+        }
         mat.color = color;
         if (mat.HasProperty("_BaseColor")) mat.SetColor("_BaseColor", color);
-        renderer.material = mat;
     }
 }

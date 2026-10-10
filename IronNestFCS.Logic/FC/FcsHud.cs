@@ -3,9 +3,9 @@ using UnityEngine;
 namespace IronNestFCS.Logic.FCS;
 
 /// <summary>
-/// [FC] FcsHud — 2.0 HUD 面板直出 (内核直出, 渲染每帧, 不经 DisplayControl; 迁移期未接线).
+/// [FC] FcsHud — 2.0 HUD 面板直出 (内核直出, 渲染每帧, 不经 DisplayControl; FcsModule 已接线).
 /// 格式: 每行 64 字符 (行首缩进 1 + 内容 62 + 结尾空 1), 分隔线 64 个 '-'.
-/// 相位映射/编号格式见 Architecture.md HUD 段 (Action → 相位代号; 00T/01N/02X; 在炮上 L-N / R-X).
+/// 相位映射/编号格式见 Function.md (Action → 相位代号; 01T/02N/03X 起; 在炮上 L-N / R-X).
 /// </summary>
 public class FcsHud {
     private const int LineWidth = 64;
@@ -20,28 +20,48 @@ public class FcsHud {
     public GunControl? GunL;
     public GunControl? GunR;
 
-    private Rect _panelRect = new(20, 20, 560, 260);
+    private Rect _panelRect = new(20, 20, 560, 260); // 尺寸每帧由 Draw 按内容重算 (初值无意义)
+    private readonly List<string> _rowBuffer = new(); // 队列行缓冲 (每帧 Clear 复用, 免每帧分配)
 
-    public void OnGui() {
-        if (Fc == null) return;
+    /// <summary>等宽字体切换 (OnGui/NO SIGNAL/开机自检三处样板收口): 返回旧值, finally 里 RestoreMono.</summary>
+    private static (Font oldFont, int oldSize) EnterMono() {
         var oldFont = GUI.skin.font;
         var oldSize = GUI.skin.label.fontSize;
         GUI.skin.font = UiFont.Mono;
         GUI.skin.label.fontSize = 14;
+        return (oldFont, oldSize);
+    }
+
+    private static void RestoreMono(Font oldFont, int oldSize) {
+        GUI.skin.label.fontSize = oldSize;
+        GUI.skin.font = oldFont;
+    }
+
+    /// <summary>面板几何 (NO SIGNAL/开机自检同口径): 64 字符 × 17 行, 左上角 (20,20), 行距 24.</summary>
+    private static (float w, float h, float lh) PanelGeom() {
+        const float lh = 24f; // 行距固定 24f (与正常 HUD 一致)
+        float lineW = GUI.skin.label.CalcSize(new GUIContent(new string('-', LineWidth))).x;
+        return (lineW + 8f, 4f + 17 * lh + 8f, lh);
+    }
+
+    /// <summary>底部签名区 (第 15 行分隔线 + 第 16 行签名行, NO SIGNAL/开机自检同款).</summary>
+    private static void DrawFooter(float lh) {
+        float lineW = GUI.skin.label.CalcSize(new GUIContent(new string('-', LineWidth))).x;
+        GUI.Label(new Rect(20 + 4f, 20 + 4f + 15 * lh, lineW, lh), new string('-', LineWidth)); // 签名行上方分隔线 (第 15 行)
+        GUI.Label(new Rect(20 + 4f, 20 + 4f + 16 * lh, lineW + 8f, lh), PanelHeader); // 底部签名行 (第 16 行, +8 裕量 — 精确 64 宽会渲染裁尾)
+    }
+
+    public void OnGui() {
+        if (Fc == null) return;
+        var (oldFont, oldSize) = EnterMono();
         try { Draw(); }
-        finally {
-            GUI.skin.label.fontSize = oldSize;
-            GUI.skin.font = oldFont;
-        }
+        finally { RestoreMono(oldFont, oldSize); }
     }
 
     /// <summary>实体未初始化占位 (1.0.7 的 "wait for ..." 位): 面板位置/尺寸与正常 HUD 一致 (左上角 20,20; 64 字符 × 17 行深色框),
     /// 内容 = 短横线 X 框 (两臂从两边延伸到中间, 顶臂直达面板顶端, 无顶部分隔线) 环绕 NO SIGNAL 艺术字 (5 行) 居中. 由 FcsModule 在 hud 未构建时调用.</summary>
     public static void DrawNoSignal() {
-        var oldFont = GUI.skin.font;
-        var oldSize = GUI.skin.label.fontSize;
-        GUI.skin.font = UiFont.Mono;
-        GUI.skin.label.fontSize = 14;
+        var (oldFont, oldSize) = EnterMono();
         try {
             string[] art = {
                 "  _   _  ___    ____ ___ _   _  ____    _    _     ",
@@ -56,11 +76,9 @@ public class FcsHud {
                 xTop[k] = XRow(4 * k, 62 - 4 * k);
                 xBot[k] = XRow(16 - 4 * k, 46 + 4 * k);
             }
-            // 无顶部分隔线 (X 顶臂延伸至面板顶端, 与开机自检同款) → X 框上臂 + 艺术字 5 行 (居中) + X 框下臂 → 底部小字行 (定稿文本, 恰好 64 列 — 版本与 FcsHostMod MelonInfo 同步)
-            const float lh = 24f; // 行距固定 24f 与正常 HUD 一致 (lineHeight+4 实测比 HUD 矮 ~60px)
-            float lineW = GUI.skin.label.CalcSize(new GUIContent(new string('-', LineWidth))).x;
-            float w = lineW + 8f;
-            float h = 4f + 17 * lh + 8f; // 与正常 HUD 同高 (17 行)
+            // 无顶部分隔线 (X 顶臂延伸至面板顶端, 与开机自检同款) → X 框上臂 + 艺术字 5 行 (居中) + X 框下臂 → 底部签名区
+            var (w, h, lh) = PanelGeom(); // 与正常 HUD 同高 (17 行)
+            float lineW = w - 8f;
             GUI.Box(new Rect(20, 20, w, h), "");
             GUI.color = Color.green;
             float y = 20 + 4f; // 第 0 行起: X 上臂 5 行 (行 0-4)
@@ -75,14 +93,10 @@ public class FcsHud {
                 y += lh;
             }
             foreach (var row in xBot) { GUI.Label(new Rect(20 + 4f, y, lineW + 8f, lh), row); y += lh; } // X 下臂 5 行 (行 10-14)
-            GUI.Label(new Rect(20 + 4f, 20 + 4f + 15 * lh, lineW, lh), new string('-', LineWidth)); // 小字上方分隔线 (第 15 行)
-            GUI.Label(new Rect(20 + 4f, 20 + 4f + 16 * lh, lineW + 8f, lh), PanelHeader); // 底部小字行 (第 16 行, rect 与正常 HUD 行同款 +8 裕量 — 精确 64 宽会渲染裁尾)
+            DrawFooter(lh);
             GUI.color = Color.white;
         }
-        finally {
-            GUI.skin.label.fontSize = oldSize;
-            GUI.skin.font = oldFont;
-        }
+        finally { RestoreMono(oldFont, oldSize); }
     }
 
     /// <summary>X 框行: 64 列内左右两处各 2 短横.</summary>
@@ -97,15 +111,10 @@ public class FcsHud {
     /// 框与正常 HUD 同尺寸 (64 列 × 17 行), 底部签名行与 NO SIGNAL 同款; [FAIL] 行红显.
     /// 由 FcsModule 开机装配状态机驱动.</summary>
     public static void DrawBoot(BootLog boot) {
-        var oldFont = GUI.skin.font;
-        var oldSize = GUI.skin.label.fontSize;
-        GUI.skin.font = UiFont.Mono;
-        GUI.skin.label.fontSize = 14;
+        var (oldFont, oldSize) = EnterMono();
         try {
-            const float lh = 24f; // 行距与正常 HUD 一致 (固定 24f)
-            float lineW = GUI.skin.label.CalcSize(new GUIContent(new string('-', LineWidth))).x;
-            float w = lineW + 8f;
-            float h = 4f + 17 * lh + 8f; // 与正常 HUD/NO SIGNAL 同高 (17 行: 12 行日志 + 底部签名区)
+            var (w, h, lh) = PanelGeom(); // 与正常 HUD/NO SIGNAL 同高 (17 行: 12 行日志 + 底部签名区)
+            float lineW = w - 8f;
             GUI.Box(new Rect(20, 20, w, h), "");
             GUI.color = Color.green;
             float y = 20 + 4f; // 第 0 行起 (无顶部分隔线 — 日志直抵面板顶端)
@@ -123,14 +132,10 @@ public class FcsHud {
                 y += lh;
             }
             GUI.color = Color.green;
-            GUI.Label(new Rect(20 + 4f, 20 + 4f + 15 * lh, lineW, lh), new string('-', LineWidth)); // 底部签名行上方分隔线 (第 15 行, NO SIGNAL 同款)
-            GUI.Label(new Rect(20 + 4f, 20 + 4f + 16 * lh, lineW + 8f, lh), PanelHeader); // 底部签名行 (第 16 行, +8 裕量 — 精确 64 宽渲染裁尾)
+            DrawFooter(lh);
             GUI.color = Color.white;
         }
-        finally {
-            GUI.skin.label.fontSize = oldSize;
-            GUI.skin.font = oldFont;
-        }
+        finally { RestoreMono(oldFont, oldSize); }
     }
 
     private void Draw() {
@@ -160,11 +165,12 @@ public class FcsHud {
         var queue = Fc?.Queue ?? System.Array.Empty<FireTask>();
         var finished = Fc?.Finished ?? System.Array.Empty<FireControl.FinishedEntry>();
         // 队列展开: 齐射对占两行 — 第一行正常, 第二行前导 >>>[SALVO] (1.0.8 同款, 数据层仍是单任务挂双槽)
-        var rows = new System.Collections.Generic.List<string>();
+        _rowBuffer.Clear();
         foreach (var t in queue) {
-            rows.Add(QueueRow(t));
-            if (t.SalvoPair) rows.Add(SalvoRow(t));
+            _rowBuffer.Add(QueueRow(t));
+            if (t.SalvoPair) _rowBuffer.Add(SalvoRow(t));
         }
+        var rows = _rowBuffer;
         for (int i = 0; i < 8; i++) {
             string left;
             if (rows.Count > 8 && i == 7) left = $"... ({rows.Count - 7} more)"; // 溢出: 末行省略提示 (Minecraft 服务器风格), 前 7 行显示任务
@@ -179,13 +185,13 @@ public class FcsHud {
     /// <summary>队列行: [预定打击时间] 方位 距离 [弹种固定 4 字符居中] 模式字母; 预定 -1 = [--:--:--].</summary>
     private static string QueueRow(FireTask t) {
         string planned = t.PlannedStrikeTime > 0f ? MissionClock.Format(t.PlannedStrikeTime) : "[--:--:--]";
-        char mode = t.Mode switch { ChargeMode.Tight => 'T', ChargeMode.Extra => 'X', _ => 'N' };
+        char mode = ChargeModeLabel.Letter(t.Mode);
         return $"{planned} {t.Angle:000.0} {t.Distance:00.00} {Center(t.Shell.ToString(), 4)} {mode}";
     }
 
     /// <summary>齐射对第二行: 前导 >>>[SALVO] (10 字符, 与 [--:--:--] 同宽), 数据同首行.</summary>
     private static string SalvoRow(FireTask t) {
-        char mode = t.Mode switch { ChargeMode.Tight => 'T', ChargeMode.Extra => 'X', _ => 'N' };
+        char mode = ChargeModeLabel.Letter(t.Mode);
         return $">>>[SALVO] {t.Angle:000.0} {t.Distance:00.00} {Center(t.Shell.ToString(), 4)} {mode}";
     }
 

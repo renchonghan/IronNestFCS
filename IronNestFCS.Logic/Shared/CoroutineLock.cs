@@ -29,9 +29,4 @@ public sealed class CoroutineLock {
     public void Release() {
         _held = false;
     }
-
-    /// <summary>重绑定（热重载）时强制复位，防止上一轮异常残留导致死锁。</summary>
-    public void Reset() {
-        _held = false;
-    }
 }

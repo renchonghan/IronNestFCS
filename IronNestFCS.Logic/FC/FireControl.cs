@@ -9,6 +9,11 @@ namespace IronNestFCS.Logic.FCS;
 /// <summary>装药模式三档 (T/N/X): Tight 最省 / Normal 默认效率 (仰角≤30° 尽量) / Extra 强制最大.</summary>
 public enum ChargeMode { Tight, Normal, Extra }
 
+/// <summary>装药模式字母 (队列编号/显示同口径): T/N/X.</summary>
+public static class ChargeModeLabel {
+    public static char Letter(ChargeMode m) => m switch { ChargeMode.Tight => 'T', ChargeMode.Extra => 'X', _ => 'N' };
+}
+
 /// <summary>四档运行模式: FullAuto 扫荡强制自动开火 / SemiAuto 自动到击发 / PreAiming 自动到解保险 / Manual 全手动.</summary>
 public enum FireMode { Manual, PreAiming, SemiAuto, FullAuto }
 
@@ -25,12 +30,13 @@ public class FireTask {
     public float Distance;   // 最新解算距离 (HUD 显示缓存)
     public Vector2 AimBoard; // 交汇点 (板面单位) — 3D 预瞄线终点直连 (与轨迹线终点同点); 直瞄 = 目标当前位置
     public bool SalvoPair;   // 齐射对标志: 派发时两炮同任务 + SyncCommand
+    public bool Manual;      // 手动压入 (右键实体/令牌): 队列前段顺序冻结 — 人工大于自动 (扫荡任务 false)
     public int LockedCharge = -1; // 派发锁存的装药解析 (COFM 与仰角解算数据源; -1 = 未锁存, 完成/撤销清零)
     public bool Dump;        // DUMP 占位 (FC 内部构造: 同膛内弹 1 包药 0° 平射; 不进队列/Finished, 无目标)
 }
 
 /// <summary>
-/// [FC] FireControl — 2.0 大脑 (迁移期: 与旧 FSC 并存, 未接线).
+/// [FC] FireControl — 2.0 大脑 (FcsModule 已接线; FSC 只剩硬件绑定壳).
 /// 循环 25fps: 接收火控请求 → 任务队列 (智能派发: 实装匹配优先) → 每帧诸元 (方位/距离→装药模式→仰角→提前量解析解)
 ///   → 持续输出 GC 指令 (DesiredX + AzimuthSelect) → 就绪判定 (AllReady+选中) → 统一火控 (五步确认+Arm+击发, 短锁)
 ///   → 收尾 (Fired 快照 / 阵亡撤任务 / FALL 换炮). 预定打击时间: 当前任务时钟 + FlyTime ≥ 预定 → 开火.
@@ -198,21 +204,80 @@ public class FireControl {
     }
 
     private void ProcessRequests() {
+        bool added = false;
         foreach (var r in _requests) {
-            if (!_queue.Contains(r)) {
-                // 动目标强制 N 入队: T (最小药数) 随距离变, 目标一动锁存装药就没裕量了 (打不到新距离);
-                // N 解析倾向多装 (仰角≤30° 尽量) 有余量. 入队时点判定: TWS 速度矢量非零 = 动目标
-                if (r.Mode == ChargeMode.Tight) {
-                    var target = DcPort?.GetTarget(r.Entity!);
-                    if (target != null && target.Velocity.magnitude > 0.0001f) {
-                        r.Mode = ChargeMode.Normal;
-                        MelonLogger.Msg($"[FC] fc#{r.Id} moving target: Tight → Normal");
-                    }
+            if (_queue.Contains(r)) continue;
+            // 动目标强制 N 入队: T (最小药数) 随距离变, 目标一动锁存装药就没裕量了 (打不到新距离);
+            // N 解析倾向多装 (仰角≤30° 尽量) 有余量. 入队时点判定: TWS 速度矢量非零 = 动目标
+            if (r.Mode == ChargeMode.Tight) {
+                var target = DcPort?.GetTarget(r.Entity!);
+                if (target != null && target.Velocity.magnitude > 0.0001f) {
+                    r.Mode = ChargeMode.Normal;
+                    MelonLogger.Msg($"[FC] fc#{r.Id} moving target: Tight → Normal");
                 }
-                _queue.Add(r);
             }
+            _queue.Add(r);
+            added = true;
         }
         _requests.Clear();
+        if (added) ReorderQueue(); // 每次请求批 (≈ 扫荡 3s 轮) 入队后全量重排 — 新 FDC 出现即重排插前
+    }
+
+    /// <summary>队列重排 (稳定): 手动段 (玩家压入顺序冻结) 永远在前 — 人工大于自动;
+    /// 自动段按 优先级 (杀伤区继承, 降序) → 层内最大缺口点名链 排序. 在炮/在途任务不动 (只排队内).</summary>
+    private void ReorderQueue() {
+        var manual = new List<FireTask>();
+        var auto = new List<FireTask>();
+        foreach (var t in _queue) (t.Manual ? manual : auto).Add(t);
+        if (auto.Count == 0) return; // 只有手动任务: 顺序本就冻结
+        // 稳定冒泡: 优先级降序 (相等保持原顺序 — 用户口径)
+        for (int i = 0; i < auto.Count - 1; i++)
+            for (int j = 0; j < auto.Count - 1 - i; j++)
+                if (auto[j].Priority < auto[j + 1].Priority) (auto[j], auto[j + 1]) = (auto[j + 1], auto[j]);
+        // 层内点名链: 每优先级层单独按最大方位缺口锚定 (见 GapChain)
+        float turretAz = GunL != null && !float.IsNaN(GunL.Azimuth) ? GunL.Azimuth
+            : GunR != null ? GunR.Azimuth : 0f;
+        var chain = new List<FireTask>(auto.Count);
+        int s = 0;
+        while (s < auto.Count) {
+            int e = s;
+            while (e < auto.Count && auto[e].Priority == auto[s].Priority) e++;
+            var level = auto.GetRange(s, e - s);
+            if (level.Count <= 1) chain.AddRange(level);
+            else chain.AddRange(GapChain(level, turretAz));
+            s = e;
+        }
+        _queue.Clear();
+        _queue.AddRange(manual);
+        _queue.AddRange(chain);
+    }
+
+    /// <summary>层内点名链: 按目标方位找最大空弧 (缺口), 从离炮塔当前方位较近的缺口端切入单调扫一圈 —
+    /// 缺口是唯一跳过的大回摆 (圆上周游最短路径); 无解算方位 (NaN) 的任务排层尾 (保原顺序).</summary>
+    private static List<FireTask> GapChain(List<FireTask> level, float turretAz) {
+        if (level.Count <= 1) return level;
+        var solved = level.FindAll(t => !float.IsNaN(t.Angle));
+        var unsolved = level.FindAll(t => float.IsNaN(t.Angle));
+        if (solved.Count <= 1) { solved.AddRange(unsolved); return solved; }
+        solved.Sort((a, b) => a.Angle.CompareTo(b.Angle));
+        int n = solved.Count;
+        // 找最大缺口: 相邻方位差 + 环绕差; gapEnd = 缺口顺时针右端的目标索引 (环绕缺口 → n, 取模后即 0)
+        int gapEnd = 0;
+        float bestGap = 0f;
+        for (int i = 0; i < n; i++) {
+            float g = i < n - 1 ? solved[i + 1].Angle - solved[i].Angle : 360f - (solved[n - 1].Angle - solved[0].Angle);
+            if (g > bestGap) { bestGap = g; gapEnd = i + 1; }
+        }
+        // 切入取近: 顺时针从缺口右端 vs 逆时针从缺口左端 — 入场摆动短的那边
+        float cwEntry = Mathf.Abs(Mathf.DeltaAngle(turretAz, solved[gapEnd % n].Angle));
+        float ccwEntry = Mathf.Abs(Mathf.DeltaAngle(turretAz, solved[(gapEnd - 1 + n) % n].Angle));
+        var chain = new List<FireTask>(n);
+        if (cwEntry <= ccwEntry)
+            for (int k = 0; k < n; k++) chain.Add(solved[(gapEnd + k) % n]);
+        else
+            for (int k = 0; k < n; k++) chain.Add(solved[(gapEnd - 1 - k + n) % n]);
+        chain.AddRange(unsolved);
+        return chain;
     }
 
     /// <summary>智能派发: 只队首 (乱序在 Start 时 SortQueueOnce 排一次, 派发不搜索后续).
@@ -289,9 +354,10 @@ public class FireControl {
         if (_queue.Count < 2) return;
         var head = _queue[0];
         if (head.SalvoPair || float.IsNaN(head.Angle)) return; // 齐射队首不重排 (等两炮空膛); 无解算方位无从比较
+        if (head.Manual) return; // 手动段顺序冻结 (人工大于自动): 45° 匹配重排只在自动段内做
         for (int i = 1; i < _queue.Count; i++) {
             var t = _queue[i];
-            if (t.SalvoPair || float.IsNaN(t.Angle)) continue;
+            if (t.SalvoPair || float.IsNaN(t.Angle) || t.Manual) continue; // 手动任务不动 (段位/顺序都冻结)
             float dA = Mathf.Abs(Mathf.DeltaAngle(head.Angle, t.Angle));
             if (dA > 45f) continue;
             bool matches = (GunL != null && LoadoutMatches(GunL, t)) || (GunR != null && LoadoutMatches(GunR, t));
@@ -316,17 +382,7 @@ public class FireControl {
         return gun.ChamberLive == t.Shell.ToString() && gun.ChargesLive >= ChargeOf(t, 0f);
     }
 
-    private static int ChargeOf(FireTask t, float dist) {
-        switch (t.Mode) {
-            case ChargeMode.Tight: return BallisticCalculator.MinimumCharge(dist);
-            case ChargeMode.Extra: return 6;
-            default: // Normal: 保证仰角 ≤ 30° 尽量, 达不到取 6
-                for (int c = BallisticCalculator.MinimumCharge(dist); c <= 6; c++) {
-                    if (ShellData.ElevationDeg(dist, c) <= 30f) return c;
-                }
-                return 6;
-        }
-    }
+    private static int ChargeOf(FireTask t, float dist) => BallisticCalculator.ChargeFor(t.Mode, dist); // T/N/X 统一口径 (与 DC 扫荡成本同源, 双处维护会漂移)
 
     /// <summary>单任务解算 (C4 统一口径 — 队列显示与在炮真解算同源): 相对方位/距离 → LeadSolve 提前量 (k 按装药) → 交汇点.
     /// 回写 task.Angle/Distance/AimBoard (无预瞄时 AimBoard=NaN 哨兵); 返回 (dist, angle, aimKm, vKm, aKm, jKm) 供快照/下发.</summary>

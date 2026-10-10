@@ -6,7 +6,7 @@ using UnityEngine;
 
 namespace IronNestFCS.Logic.FCS;
 
-/// <summary>炮上动作 (2.0 Action 状态机), 相位代号映射见 Architecture.md HUD 段.</summary>
+/// <summary>炮上动作 (2.0 Action 状态机), 相位代号映射见 Function.md 相位表.</summary>
 public enum GunAction {
     Idle,   // 0-0 空闲 (仅 Manual 模式由 FC 显示)
     Selc,   // 1-2 采购 (保证弹巢至少有一个相应的弹)
@@ -66,8 +66,9 @@ public class GunControl {
     public CoroutineLock? CalculatorLock;
     /// <summary>装填期 Calculate 已完成 (齐射右炮等它 — 计算台共享, 不能抢先按解算推药).</summary>
     public bool CalcDone;
-    public bool Fired { get; private set; }                        // 本发已击发 (GC 内部防重; 不对外 — FC 用 FlyRemaining 作击发确认)
+    public bool Fired { get; private set; }                        // 本发已击发 (GC 内部防重; 对外 — FC 用 Fired 沿作击发确认)
     public bool KernelMode { get; private set; }                   // 内核态: 硬件动作执行中 (指令只记录不生效)
+    /// <summary>击发确认口径: FC 用 Fired 沿 (不用 FlyRemaining — 装填期炮表残留值会骗过早收尾).</summary>
     /// <summary>游戏 CANFIRE 信号 (实测不含保险: 装填完成 — 弹+药+炮闩锁 — 未开保险即 True;
     /// 就是"俯仰手柄解锁"的综合信号): 绿十字/落弹点显示门槛 (1.x 同口径, 弹没装好不出落点).</summary>
     public bool CanFire { get { try { return _gun.CanFire(); } catch { return false; } } }
@@ -102,7 +103,7 @@ public class GunControl {
     // ===== GC → DC: 落点指示器 (FcsModule 注入 DC 回调) =====
     /// <summary>击发确认 (锁存总飞时已取到): DC 画落点线 — 落点 = GC 冻结的开火前最后瞄准点 (板面坐标, 开火后游戏把标记拉回铁巢, 必须 GC 侧冻结).
     /// 附 Flight 引用 — 剩余/落地由 DC 每帧直接读字段 (统一口径, 不逐帧传导).</summary>
-    public System.Action<LeftRight, float, float, BulletType, float, Flight>? OnImpactFired;
+    public System.Action<LeftRight, float, float, BulletType, Flight>? OnImpactFired;
 
     /// <summary>齐射对端 (SyncCommand 时相位级同步互相等; 对炮 FALL → 本炮也 FALL 防陪死).</summary>
     public GunControl? SyncPeer;
@@ -257,8 +258,9 @@ public class GunControl {
             FlyTime = fly,
             FiredAtLocal = Time.time,
             FiredAtMission = MissionClock.Seconds, // 出膛时刻任务时钟 (FC 完成队列 FireMission 同口径)
+            ImpactBoard = _lastAimLive, // 冻结落点 (开火前最后瞄准点, 与落点线同源 — 扫荡覆盖判定用)
         };
-        OnImpactFired?.Invoke(_side, _lastAimLive.x, _lastAimLive.y, firedShell, fly, CurrentFlight);
+        OnImpactFired?.Invoke(_side, _lastAimLive.x, _lastAimLive.y, firedShell, CurrentFlight);
     }
 
     /// <summary>任务链 (单发): 弹药准备 (逐步决策) → TRAK (持续) → 击发后 REST → IDLE. 齐射走 SalvoDirector.

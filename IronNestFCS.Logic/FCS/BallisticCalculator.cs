@@ -30,11 +30,12 @@ public class BallisticCalculator {
         elevationDisplay = GameObject.Find("Odomiter Output Elivation")?.GetComponent<OdometerDisplay>();
         shellDial = GameObject.Find(".Shell Dial")?.GetComponent<DialInteractable>();
 
+        // 升降角输出表是纯显示件 (mod 不读): 缺失只告警, 不拖累开机绑定 (旧实现把它列为必要条件)
+        if (elevationDisplay == null) MelonLogger.Msg("[FCS] BallisticCalculator: Odomiter Output Elivation not found (display-only, optional)");
         return distanceDial != null
                && chargeDial != null
                && directionDial != null
                && calculateButton != null
-               && elevationDisplay != null
                && shellDial != null;
     }
 
@@ -67,10 +68,6 @@ public class BallisticCalculator {
         calculateButton?.OnClickDown();
         yield return new WaitForSeconds(0.5f);
     }
-    
-    public float GetElevation() {
-        return elevationDisplay?.currentNumber ?? 0;
-    }
 
     public static int MinimumCharge(float distance) {
         return distance switch {
@@ -82,5 +79,17 @@ public class BallisticCalculator {
             _ => 6
         };
     }
-    
+
+    /// <summary>装药包数 (T/N/X 统一口径 — FC 派发与 DC 扫荡成本同源, 别双处维护): T = 最小装药; N = 仰角≤30° 尽量, 达不到取 6; X = 6.</summary>
+    public static int ChargeFor(ChargeMode mode, float distKm) {
+        switch (mode) {
+            case ChargeMode.Tight: return MinimumCharge(distKm);
+            case ChargeMode.Extra: return 6;
+            default: // Normal: 保证仰角 ≤ 30° 尽量
+                for (int c = MinimumCharge(distKm); c <= 6; c++) {
+                    if (ShellData.ElevationDeg(distKm, c) <= 30f) return c;
+                }
+                return 6;
+        }
+    }
 }

@@ -8,7 +8,7 @@ using UnityEngine.InputSystem;
 namespace IronNestFCS.Logic;
 
 /// <summary>
-/// Logic 程序集的入口 (2.0): 开机自检装配链 + 四模块 (RD/DC/FC/GC) 接线, 旧调度层已停用 (LegacyDisabled).
+/// Logic 程序集的入口 (2.0): 开机自检装配链 + 四模块 (RD/DC/FC/GC) 接线, 旧调度层已清退 (FSC 只剩硬件绑定壳).
 /// 数据链: RD → DC_U → FC → GC → DC_D; F9 热重载 = Shutdown (全模块 Stop + 清端口) → 重 Initialize.
 /// 开机自检 = 跨帧装配状态机 (进任务, Update 驱动不用协程): System Init 重试硬件绑定 (实体就绪等待),
 /// 各模块行 [DONE] = 真实装配完成; 失败行 [FAIL] 红显冻结面板, 回主菜单 (FMR 消失) → NO SIGNAL 接管.
@@ -93,12 +93,13 @@ public class FcsModule : IFcsModule
         // 核弹警报 (ATMC, 不依赖自动装填 — 纯活读): CANFIRE 上升沿 (装填完成) 且膛内是 ATMC → Load 一轮三声
         // (推弹落位不响, 响着就击发也不切 — 音轨短, 自然放完即可);
         // Launch = 开火瞬间 (renderer2.OnNukeFired 回调), 单次自然放完 (落地不切尾巴)
+        bool anyNuke = IsNukeChamber(gunL?.ChamberLive) || IsNukeChamber(gunR?.ChamberLive);
+        bool anyCanFire = (gunL?.CanFire ?? false) || (gunR?.CanFire ?? false);
+        // 装填确认圈 (核弹圈旋转开始点; 手动装填同覆盖) 不依赖警报音频就绪 — 音频加载失败圈也得转
+        if (renderer2 != null) renderer2.NukeArmed = anyCanFire && anyNuke;
         if (nukeAlarm != null && nukeAlarm.Ready) {
-            bool anyNuke = IsNukeChamber(gunL?.ChamberLive) || IsNukeChamber(gunR?.ChamberLive);
-            bool anyCanFire = (gunL?.CanFire ?? false) || (gunR?.CanFire ?? false);
             if (anyCanFire && !_nukeCanFire && anyNuke) nukeAlarm.StartLoad();
             _nukeCanFire = anyCanFire;
-            if (renderer2 != null) renderer2.NukeArmed = anyCanFire && anyNuke; // 装填确认信号 (核弹圈旋转开始点; 手动装填同覆盖)
         }
 
         var kb = Keyboard.current;
@@ -181,7 +182,7 @@ public class FcsModule : IFcsModule
                 }
                 if (t > BootBenchWait) {
                     float dl = radar2 != null ? radar2.LastIntervalMs : 0f;
-                    string suffix = $" DL:{dl:0}ms PL:0.0%";
+                    string suffix = $" DL:{dl:0}ms PL:0.0%"; // PL 恒 0 (mod 不注入假丢包 — 只报数据链实测间隔)
                     string p = $"{Stamp()} [INFO] DataLine Bench ";
                     lines[9].ActiveText = p + new string('-', Mathf.Max(0, 64 - p.Length - suffix.Length)) + suffix;
                     Advance();
@@ -229,7 +230,7 @@ public class FcsModule : IFcsModule
                 if (t > pause) { l.State = BootLineState.Done; Advance(); } // [DONE] 即推下一行 (无推进间隙)
             } else if (Time.time - _bootRetryT > BootRetry) {
                 _bootRetryT = Time.time;
-                if (++_bootFails > BootFailCap) { l.State = BootLineState.Fail; AbortBoot(); return; }
+                if (++_bootFails >= BootFailCap) { l.State = BootLineState.Fail; AbortBoot(); return; } // 第 BootFailCap 次连续失败即中断 (旧 `>` 是第 Cap+1 次才断, 与"上限 Cap"差一)
             }
         }
     }
@@ -355,8 +356,8 @@ public class FcsModule : IFcsModule
         gunL!.OnBallisticPush = (side, x, y, r, b, ready, fly) => r2.PushBallistic(side, new Vector2(x, y), r, b, ready, fly);
         gunR!.OnBallisticPush = (side, x, y, r, b, ready, fly) => r2.PushBallistic(side, new Vector2(x, y), r, b, ready, fly);
         // GC → DC_D: 落点指示器 (GC 击发确认 → DC 画线; Flight 引用直读 — 剩余/落地由 DC 每帧读字段, 不再逐帧传导)
-        gunL.OnImpactFired = (side, x, y, shell, fly, flight) => r2.ImpactFired(side, x, y, shell, fly, flight);
-        gunR.OnImpactFired = (side, x, y, shell, fly, flight) => r2.ImpactFired(side, x, y, shell, fly, flight);
+        gunL.OnImpactFired = (side, x, y, shell, flight) => r2.ImpactFired(side, x, y, shell, flight);
+        gunR.OnImpactFired = (side, x, y, shell, flight) => r2.ImpactFired(side, x, y, shell, flight);
         fireControl!.OnQueueChanged = fc => r2.UpdateQueueIndicator(fc);
         fireControl.OnFireSolution = (side, target, aim, v, a, j, t) => r2.UpdateFireSolution(side, target, aim, v, a, j, t);
         r2.Start();
@@ -417,7 +418,7 @@ public class FcsModule : IFcsModule
         return System.Enum.TryParse<BulletType>(chamber.Trim(), out var bt) && bt == BulletType.ATMC;
     }
 
-    /// <summary>NumpadPlus/Minus: 控制所有蒸汽阀门开/关.</summary>
+    /// <summary>[调试设施] NumpadPlus/Minus: 控制所有蒸汽阀门开/关 (0f = 全关 / 999f = 全开 — 超出刻度即满量程, 旧版同款).</summary>
     private static void AdjustAllValves(float value)
     {
         var all = GameObject.FindObjectsOfType<GameObject>();

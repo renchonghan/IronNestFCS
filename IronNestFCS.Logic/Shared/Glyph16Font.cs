@@ -92,8 +92,8 @@ public static class Glyph16Font {
         ['X'] = J|K|L|M,
         ['Y'] = J|K|I,
         ['Z'] = A1|A2|K|L|D1|D2,
-        // ---- 小写字母 (暂时用不上, 未调试, a 已知有误待定) ----
-        ['a'] = E|F|G1|G2|C|D1|D2,
+        // ---- 小写字母 (暂时用不上, 未调试; a 已按用户定稿) ----
+        ['a'] = E|I|G1|G2|D1|D2,   // 左下竖 e + 中下竖 i + 中横 g1g2 + 底横 d1d2 (用户定稿)
         ['b'] = F|E|G1|G2|C|D1|D2,
         ['c'] = E|G1|G2|D1|D2,
         ['d'] = B|C|G1|G2|E|D1|D2,
@@ -155,9 +155,16 @@ public static class Glyph16Font {
         ['~'] = A1|G1|F|H,  // 左上角圈: 当 ° 用 (a1 上 / g1 下 / f 左 / h 右)
     };
 
-    /// <summary>画一个字符: scale = 字符宽 (板面单位), 字形高 1.6 x scale, 笔画粗随字号同比缩放 (实体标签基准 0.008).</summary>
-    public static void DrawCharSegments(Transform parent, char ch, Color color, float x0, float scale)
-    {
+    /// <summary>画一个字符 (全宽): scale = 字符宽 (板面单位), 字形高 1.6 x scale, 笔画粗随字号同比缩放 (实体标签基准 0.008).</summary>
+    public static void DrawCharSegments(Transform parent, char ch, Color color, float x0, float scale) =>
+        DrawCore(parent, ch, color, x0, scale, 1f, 0.008f);
+
+    /// <summary>半宽字符: 宽度 = scale/2 (段 x 坐标 ×0.5), 笔画粗系数 0.010 — 紧凑数字文本用.</summary>
+    public static void DrawCharSegmentsNarrow(Transform parent, char ch, Color color, float x0, float scale) =>
+        DrawCore(parent, ch, color, x0, scale, 0.5f, 0.010f);
+
+    /// <summary>两套画法共用核心: widthFactor 压段 x 坐标 (全宽 1 / 半宽 0.5), thickness 笔画粗系数.</summary>
+    private static void DrawCore(Transform parent, char ch, Color color, float x0, float scale, float widthFactor, float thickness) {
         if (!Glyph16.TryGetValue(ch, out var mask)) mask = A1|A2|B|C|D1|D2|E|F|G1|G2; // 未知字符全亮 (8 形)
         for (int bit = 0; bit < SegBit16.Length; bit++) {
             if ((mask & (1 << bit)) == 0) continue;
@@ -165,34 +172,13 @@ public static class Glyph16Font {
             var go = new GameObject("FCS_LabelSeg");
             go.transform.SetParent(parent, false);
             var line = go.AddComponent<Il2CppShapes.Line>();
-            line.Thickness = 0.008f * (scale / LabelSegW);
-            line.Start = new Vector3(x0 + a.x * scale, a.y * scale, 0f);
-            line.End = new Vector3(x0 + b.x * scale, b.y * scale, 0f);
+            line.Thickness = thickness * (scale / LabelSegW);
+            line.Start = new Vector3(x0 + a.x * scale * widthFactor, a.y * scale, 0f);
+            line.End = new Vector3(x0 + b.x * scale * widthFactor, b.y * scale, 0f);
             line.Color = color;
             line.ColorStart = color;
             line.ColorEnd = color;
             var r = go.GetComponent<Renderer>(); // 强制渲染队列到顶: 与 SandboxRenderer 线同款, 防照片穿插 (DC 所有元素统一 5000)
-            if (r != null) r.material.renderQueue = 5000;
-        }
-    }
-
-    /// <summary>半宽字符: 宽度 = scale/2 (段 x 坐标 ×0.5), 笔画粗系数 0.010 — 紧凑数字文本用.</summary>
-    public static void DrawCharSegmentsNarrow(Transform parent, char ch, Color color, float x0, float scale)
-    {
-        if (!Glyph16.TryGetValue(ch, out var mask)) mask = A1|A2|B|C|D1|D2|E|F|G1|G2; // 未知字符全亮 (8 形)
-        for (int bit = 0; bit < SegBit16.Length; bit++) {
-            if ((mask & (1 << bit)) == 0) continue;
-            var (a, b) = Seg16[SegBit16[bit]];
-            var go = new GameObject("FCS_LabelSeg");
-            go.transform.SetParent(parent, false);
-            var line = go.AddComponent<Il2CppShapes.Line>();
-            line.Thickness = 0.010f * (scale / LabelSegW);
-            line.Start = new Vector3(x0 + a.x * scale * 0.5f, a.y * scale, 0f);
-            line.End = new Vector3(x0 + b.x * scale * 0.5f, b.y * scale, 0f);
-            line.Color = color;
-            line.ColorStart = color;
-            line.ColorEnd = color;
-            var r = go.GetComponent<Renderer>();
             if (r != null) r.material.renderQueue = 5000;
         }
     }
