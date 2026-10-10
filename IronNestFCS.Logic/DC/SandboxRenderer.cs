@@ -443,29 +443,7 @@ public class SandboxRenderer {
     public void UpdateQueueIndicator(GameObject entity, Slot slot, int queuePos, bool salvo, BulletType shell, ChargeMode mode, Vector2 aimEnd, bool drawLine = false) {
         if (MapSurfaceRef == null) return;
         var entityBoard = (Vector2)MapSurfaceRef.InverseTransformPoint(entity.transform.position);
-        if (!_queueMarks.TryGetValue(entity, out var mark)) {
-            mark = new QueueIndicator {
-                Root = new GameObject("FCS2_QueueMark"),
-                RadiusRoot = new GameObject("FCS2_QueueRadius"),
-                RadiationRoot = new GameObject("FCS2_QueueRadiation"),
-                LabelRoot = new GameObject("FCS2_QueueLabel"),
-                BulletRoot = new GameObject("FCS2_QueueBullet"),
-                LineRoot = new GameObject("FCS2_QueueLine"),
-                OuterRoot = new GameObject("FCS2_QueueOuter"),
-                SalvoRoot = new GameObject("FCS2_QueueSalvo"),
-            };
-            mark.Root.transform.SetParent(MapSurfaceRef, false);
-            mark.RadiusRoot.transform.SetParent(mark.Root.transform, false);
-            mark.RadiationRoot.transform.SetParent(mark.Root.transform, false);
-            mark.LabelRoot.transform.SetParent(mark.Root.transform, false);
-            mark.BulletRoot.transform.SetParent(mark.Root.transform, false);
-            mark.LineRoot.transform.SetParent(MapSurfaceRef, false); // 预瞄线直接挂板面 (落点层), 不跟队列标记根
-            mark.SalvoRoot.transform.SetParent(mark.Root.transform, false);
-            mark.OuterRoot.transform.SetParent(mark.Root.transform, false);
-            // 第二圈菱形 (旧版 outerSegs 同款: 选中/排队即出, 半径 0.05×√2×1.35, 线宽 0.01, 板面单位 ×SurfScale)
-            DrawDiamond(mark.OuterRoot.transform, 0.05f * Mathf.Sqrt(2f) * 1.35f * SurfScale, 0.01f * SurfScale, Color.red, RedPrio);
-            _queueMarks[entity] = mark;
-        }
+        var mark = EnsureQueueMark(entity);
         // 根在实体 (菱形选中框留目标); 编号/弹种标签/杀伤圈跟预瞄点 (hasAim 时偏移); 无预瞄回实体
         mark.Root.transform.localPosition = new Vector3(entityBoard.x, entityBoard.y, RedOffset);
         mark.LineRoot.transform.localPosition = new Vector3(entityBoard.x, entityBoard.y, GreenOffset); // 预瞄线根在实体 (线终点 = aimEnd); 绿权重 (绿层, 永远浮红线上)
@@ -538,6 +516,34 @@ public class SandboxRenderer {
         else if (mark.TargetLine != null && mark.TargetLine.gameObject.activeSelf) {
             mark.TargetLine.gameObject.SetActive(false); // 不在炮任务: 隐藏 (恒定实体)
         }
+    }
+
+    /// <summary>队列标记实体 (恒定: 每实体一套, 建一次 — 含第二圈菱形; 编号/圈/预瞄线子根).</summary>
+    private QueueIndicator EnsureQueueMark(GameObject entity) {
+        if (!_queueMarks.TryGetValue(entity, out var mark)) {
+            mark = new QueueIndicator {
+                Root = new GameObject("FCS2_QueueMark"),
+                RadiusRoot = new GameObject("FCS2_QueueRadius"),
+                RadiationRoot = new GameObject("FCS2_QueueRadiation"),
+                LabelRoot = new GameObject("FCS2_QueueLabel"),
+                BulletRoot = new GameObject("FCS2_QueueBullet"),
+                LineRoot = new GameObject("FCS2_QueueLine"),
+                OuterRoot = new GameObject("FCS2_QueueOuter"),
+                SalvoRoot = new GameObject("FCS2_QueueSalvo"),
+            };
+            mark.Root.transform.SetParent(MapSurfaceRef, false);
+            mark.RadiusRoot.transform.SetParent(mark.Root.transform, false);
+            mark.RadiationRoot.transform.SetParent(mark.Root.transform, false);
+            mark.LabelRoot.transform.SetParent(mark.Root.transform, false);
+            mark.BulletRoot.transform.SetParent(mark.Root.transform, false);
+            mark.LineRoot.transform.SetParent(MapSurfaceRef, false); // 预瞄线直接挂板面 (落点层), 不跟队列标记根
+            mark.SalvoRoot.transform.SetParent(mark.Root.transform, false);
+            mark.OuterRoot.transform.SetParent(mark.Root.transform, false);
+            // 第二圈菱形 (旧版 outerSegs 同款: 选中/排队即出, 半径 0.05×√2×1.35, 线宽 0.01, 板面单位 ×SurfScale)
+            DrawDiamond(mark.OuterRoot.transform, 0.05f * Mathf.Sqrt(2f) * 1.35f * SurfScale, 0.01f * SurfScale, Color.red, RedPrio);
+            _queueMarks[entity] = mark;
+        }
+        return mark;
     }
 
     private static string BuildQueueLabel(QueueIndicator m) {
