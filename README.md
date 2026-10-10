@@ -1,5 +1,8 @@
 # IronNestFCS
 
+> **卡斯蒂利亚召唤, 你必须响应。**
+> — 最高统帅部致铁巢
+
 [Demo Video](https://www.bilibili.com/video/BV1xc7F6WEET/)
 
 [Iron Nest: Heavy Turret Simulator](https://store.steampowered.com/app/4300500/) 的 [MelonLoader](https://melonwiki.xyz/) Mod，为游戏中的重型炮塔加入一套自动化**火控系统（Fire Control System, FCS）**：在地图上点选目标，Mod 会自动解算弹道、采购/装填炮弹、调整炮塔方向与仰角，并完成确认与击发的全套流程。
@@ -121,3 +124,7 @@ dotnet build IronNestFCS.sln -c Release
 ## 免责声明
 
 本项目为非官方的第三方 Mod，与游戏开发商无关。仅供学习与单机娱乐使用，使用风险自负。
+
+---
+
+*光荣归于卡斯蒂利亚!!! 本声明已经过审批。*

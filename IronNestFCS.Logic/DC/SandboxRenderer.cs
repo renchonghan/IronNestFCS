@@ -567,6 +567,7 @@ public class SandboxRenderer {
         // 射表偏差探针: GC 标记 = 游戏按炮口 E/A 自解的真实落点 (弹坑所在); FC aim = 射表解算.
         // 两者差 = 射表拟合偏差 (瞄多/瞄少的直接证据). 不看 activeSelf: 击发后 FC push 冻结会把线隐藏, 数据仍在 AimBoard
         if (_tracks.TryGetValue(side, out var trLine) && trLine.Root != null
+            && Time.time - trLine.LastValid < 3f // 窗口校验: 静止目标无预瞄不 push, 残留旧参数 (零值) 会打误导性探针日志
             && !float.IsNaN(trLine.AimBoard.x) && !float.IsNaN(trLine.AimBoard.y)) {
             MelonLogger.Msg($"[DC] impact src: gc=({board.x:F3},{board.y:F3}) fc=({trLine.AimBoard.x:F3},{trLine.AimBoard.y:F3}) d={Vector2.Distance(board, trLine.AimBoard):F3}板面");
         }
