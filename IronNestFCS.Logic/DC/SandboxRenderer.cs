@@ -272,59 +272,9 @@ public class SandboxRenderer {
         }
         const float gap = 0.02f, armLen = 0.045f;
         const float top = gap + armLen; // 臂端距中心
-        if (!_ballistic.TryGetValue(side, out var mark) || mark.Root == null) {
-            mark = new BallisticMark { Root = new GameObject(side == LeftRight.Left ? "FCS2_AimLeft" : "FCS2_AimRight") };
-            mark.Root.transform.SetParent(MapSurfaceRef, false);
-            _ballistic[side] = mark;
-        }
+        var mark = EnsureAimMark(side, gap, top);
         mark.Root.transform.localPosition = new Vector3(boardPos.x, boardPos.y, GreenOffset);
-        if (mark.RadiusRoot == null) {
-            mark.RadiusRoot = new GameObject("FCS2_AimRadius");
-            mark.RadiusRoot.transform.SetParent(mark.Root.transform, false);
-            mark.RadiationRoot = new GameObject("FCS2_AimRadiation");
-            mark.RadiationRoot.transform.SetParent(mark.Root.transform, false);
-            mark.CrossRoot = new GameObject("FCS2_AimCross");
-            mark.CrossRoot.transform.SetParent(mark.Root.transform, false);
-            mark.CornerRoot = new GameObject("FCS2_AimCorners");
-            mark.CornerRoot.transform.SetParent(mark.Root.transform, false);
-            mark.BulletRoot = new GameObject("FCS2_AimBullet");
-            mark.BulletRoot.transform.SetParent(mark.Root.transform, false);
-            mark.FlyRoot = new GameObject("FCS2_AimFlyTime");
-            mark.FlyRoot.transform.SetParent(mark.Root.transform, false);
-            // CS 准星式四臂 + L/R 字标 (复用旧 BuildAimMark 参数)
-            Vector2[] dirs = { new(0f, 1f), new(0f, -1f), new(1f, 0f), new(-1f, 0f) };
-            foreach (var d in dirs) {
-                Line(mark.CrossRoot.transform, d * gap, d * top, 0.005f, Color.green);
-            }
-            float sideSign = side == LeftRight.Left ? -1f : 1f;
-            const float tagScale = 0.0225f;
-            float tagCenter = sideSign * (top + tagScale * 1.5f);
-            var tagRoot = new GameObject("FCS2_AimTag");
-            tagRoot.transform.SetParent(mark.CrossRoot.transform, false);
-            tagRoot.transform.localPosition = new Vector3(tagCenter - tagScale * 0.5f, -0.8f * tagScale, 0f); // 字形中心骑线 (同旧版)
-            Glyph16Font.DrawCharSegments(tagRoot.transform, side == LeftRight.Left ? 'L' : 'R', Color.green, 0f, tagScale);
-        }
-        // AllReady 生气符号 (四象限直角弯, 拐点卡在准星四臂内角 (±gap,±gap), 边长 = 半臂长):
-        // 每弯 = 一条边从外侧到拐点 + 一条边从拐点朝外; 未就绪拆掉.
-        if (mark.Ready != ready) {
-            mark.Ready = ready;
-            ClearChildren(mark.CornerRoot.transform);
-            if (ready) {
-                float h = armLen * 0.5f;
-                // 左上: (-gap-h,gap)→(-gap,gap)→(-gap,gap+h)
-                Line(mark.CornerRoot.transform, new Vector2(-gap - h, gap), new Vector2(-gap, gap), 0.005f, Color.green);
-                Line(mark.CornerRoot.transform, new Vector2(-gap, gap), new Vector2(-gap, gap + h), 0.005f, Color.green);
-                // 右上: (gap+h,gap)→(gap,gap)→(gap,gap+h)
-                Line(mark.CornerRoot.transform, new Vector2(gap + h, gap), new Vector2(gap, gap), 0.005f, Color.green);
-                Line(mark.CornerRoot.transform, new Vector2(gap, gap), new Vector2(gap, gap + h), 0.005f, Color.green);
-                // 左下: (-gap-h,-gap)→(-gap,-gap)→(-gap,-gap-h)
-                Line(mark.CornerRoot.transform, new Vector2(-gap - h, -gap), new Vector2(-gap, -gap), 0.005f, Color.green);
-                Line(mark.CornerRoot.transform, new Vector2(-gap, -gap), new Vector2(-gap, -gap - h), 0.005f, Color.green);
-                // 右下: (gap+h,-gap)→(gap,-gap)→(gap,-gap-h)
-                Line(mark.CornerRoot.transform, new Vector2(gap + h, -gap), new Vector2(gap, -gap), 0.005f, Color.green);
-                Line(mark.CornerRoot.transform, new Vector2(gap, -gap), new Vector2(gap, -gap - h), 0.005f, Color.green);
-            }
-        }
+        RebuildAimCorners(mark, ready, gap, armLen);
         // 弹种标签: 十字上端居中 (与 L/R 字标同字号)
         string bt = ((BulletType)bulletType).ToString();
         if (bt != mark.BulletText) {
@@ -359,6 +309,66 @@ public class SandboxRenderer {
         // 核弹装填确认后转 (全局相位, 与队列/落弹环同步 — 开火瞬间无割裂): 只转辐射标 (外圈虚线圆/刻度保持静止, 与落弹点口径一致)
         var nukeRot = NukeRot();
         if (mark.RadiationRoot != null) mark.RadiationRoot.transform.localRotation = (BulletType)bulletType == BulletType.ATMC && NukeArmed ? nukeRot : Quaternion.identity;
+    }
+
+    /// <summary>瞄准十字实体 (恒定: 每炮一套, 建一次 — 含十字四臂 + L/R 字标; 子根惰性建).</summary>
+    private BallisticMark EnsureAimMark(LeftRight side, float gap, float top) {
+        if (!_ballistic.TryGetValue(side, out var mark) || mark.Root == null) {
+            mark = new BallisticMark { Root = new GameObject(side == LeftRight.Left ? "FCS2_AimLeft" : "FCS2_AimRight") };
+            mark.Root.transform.SetParent(MapSurfaceRef, false);
+            _ballistic[side] = mark;
+        }
+        if (mark.RadiusRoot == null) {
+            mark.RadiusRoot = new GameObject("FCS2_AimRadius");
+            mark.RadiusRoot.transform.SetParent(mark.Root.transform, false);
+            mark.RadiationRoot = new GameObject("FCS2_AimRadiation");
+            mark.RadiationRoot.transform.SetParent(mark.Root.transform, false);
+            mark.CrossRoot = new GameObject("FCS2_AimCross");
+            mark.CrossRoot.transform.SetParent(mark.Root.transform, false);
+            mark.CornerRoot = new GameObject("FCS2_AimCorners");
+            mark.CornerRoot.transform.SetParent(mark.Root.transform, false);
+            mark.BulletRoot = new GameObject("FCS2_AimBullet");
+            mark.BulletRoot.transform.SetParent(mark.Root.transform, false);
+            mark.FlyRoot = new GameObject("FCS2_AimFlyTime");
+            mark.FlyRoot.transform.SetParent(mark.Root.transform, false);
+            // CS 准星式四臂 + L/R 字标 (复用旧 BuildAimMark 参数)
+            Vector2[] dirs = { new(0f, 1f), new(0f, -1f), new(1f, 0f), new(-1f, 0f) };
+            foreach (var d in dirs) {
+                Line(mark.CrossRoot.transform, d * gap, d * top, 0.005f, Color.green);
+            }
+            float sideSign = side == LeftRight.Left ? -1f : 1f;
+            const float tagScale = 0.0225f;
+            float tagCenter = sideSign * (top + tagScale * 1.5f);
+            var tagRoot = new GameObject("FCS2_AimTag");
+            tagRoot.transform.SetParent(mark.CrossRoot.transform, false);
+            tagRoot.transform.localPosition = new Vector3(tagCenter - tagScale * 0.5f, -0.8f * tagScale, 0f); // 字形中心骑线 (同旧版)
+            Glyph16Font.DrawCharSegments(tagRoot.transform, side == LeftRight.Left ? 'L' : 'R', Color.green, 0f, tagScale);
+        }
+        return mark;
+    }
+
+    /// <summary>AllReady 生气符号 (四象限直角弯, 拐点卡在准星四臂内角 (±gap,±gap), 边长 = 半臂长):
+    /// 每弯 = 一条边从外侧到拐点 + 一条边从拐点朝外; 未就绪拆掉.</summary>
+    private static void RebuildAimCorners(BallisticMark mark, bool ready, float gap, float armLen) {
+        if (mark.Ready != ready) {
+            mark.Ready = ready;
+            ClearChildren(mark.CornerRoot.transform);
+            if (ready) {
+                float h = armLen * 0.5f;
+                // 左上: (-gap-h,gap)→(-gap,gap)→(-gap,gap+h)
+                Line(mark.CornerRoot.transform, new Vector2(-gap - h, gap), new Vector2(-gap, gap), 0.005f, Color.green);
+                Line(mark.CornerRoot.transform, new Vector2(-gap, gap), new Vector2(-gap, gap + h), 0.005f, Color.green);
+                // 右上: (gap+h,gap)→(gap,gap)→(gap,gap+h)
+                Line(mark.CornerRoot.transform, new Vector2(gap + h, gap), new Vector2(gap, gap), 0.005f, Color.green);
+                Line(mark.CornerRoot.transform, new Vector2(gap, gap), new Vector2(gap, gap + h), 0.005f, Color.green);
+                // 左下: (-gap-h,-gap)→(-gap,-gap)→(-gap,-gap-h)
+                Line(mark.CornerRoot.transform, new Vector2(-gap - h, -gap), new Vector2(-gap, -gap), 0.005f, Color.green);
+                Line(mark.CornerRoot.transform, new Vector2(-gap, -gap), new Vector2(-gap, -gap - h), 0.005f, Color.green);
+                // 右下: (gap+h,-gap)→(gap,-gap)→(gap,-gap-h)
+                Line(mark.CornerRoot.transform, new Vector2(gap + h, -gap), new Vector2(gap, -gap), 0.005f, Color.green);
+                Line(mark.CornerRoot.transform, new Vector2(gap, -gap), new Vector2(gap, -gap - h), 0.005f, Color.green);
+            }
+        }
     }
 
     /// <summary>Unity 对象引用相等比较器 (绕过 == 假空重载): 销毁对象 instanceID 归零, 默认哈希下两个不同的销毁对象会被判等 — 队列标记键/去重集合必须用它.</summary>
