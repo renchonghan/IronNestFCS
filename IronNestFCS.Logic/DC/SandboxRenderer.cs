@@ -692,6 +692,53 @@ public class SandboxRenderer {
         im.TimerY = im.ImpactBoard.y + (-0.2f * SurfScale - dy);
     }
 
+    /// <summary>核弹指示器旋转 + 三角收拢 (恒定实体每帧只动端点):
+    /// 整体逆时针 60°/s (= 1/6 圈/s — 三对称转 120° 即"归位", 视觉周期 2s);
+    /// 开火后 1s 透明度淡入 (旋转开始不生硬); 收拢终点 = 顶角重合 (d→h: 内顶点压在圆心, 三三角不再叠成一团)</summary>
+    private void UpdateNukeImpact(ImpactIndicator im, float remain) {
+        if (im.Flight == null) return; // 前置守卫 (调用方已保证; 跨方法丢字段收窄的编译器口径)
+        var rot = NukeRot(); // 全局相位 — 与瞄准圈/队列圈同步, 开火瞬间无割裂
+        im.RadiationRoot.transform.localRotation = rot; // 辐射标跟转 (内圈圆旋转对称无感, 扇叶/刻度转)
+        im.TriRoot.transform.localRotation = rot;
+        // 淡入 (只辐射标+三角, 外圈/红线/字不参与): 完全透明 1s (传导延迟), 再 1s 缓慢浮现 (alpha 0→1)
+        float fade = Mathf.Clamp01((im.Flight.FlyTime - remain - 1f) / 1f);
+        foreach (var (line, _) in im.RadiationLines) line.Color = new Color(1f, 0f, 0f, fade);
+        for (int k = 0; k < im.TriLines.Length; k++) if (im.TriLines[k] != null) im.TriLines[k].Color = new Color(1f, 0f, 0f, fade);
+        float denom = im.Flight.FlyTime - 1.5f;
+        if (denom < 0.001f) denom = im.Flight.FlyTime; // 短弹道: 收拢压到全程
+        float frac = Mathf.Clamp01((im.Flight.FlyTime - remain) / denom);
+        float h = 0.5f * im.NukeR / Mathf.Sqrt(3f); // 顶点距 (边长 0.5R)
+        float d = Mathf.Lerp(2.8f * im.NukeR, h, frac); // 从 2.8R 收到 h (顶角重合于圆心)
+        // 最后 1.5s: 辐射告警收拢 — s: 1 → s_stop = 0.125/rKm (内圈直径 = 线宽 5t 即停, 再缩没意义);
+        // 三角跟缩 ts = min(1, s/0.208) — 保证外廓 0.5R·ts ≤ 扇叶外缘 2.4R·s (扇叶缩过 0.5R 后三角同步缩);
+        // 两处线宽都补偿 (世界线宽不随缩放走)
+        float sStop = NukeSStop(im.RadiusKm);
+        float shrinkP = Mathf.Clamp01((1.5f - remain) / 1.5f);
+        float s = Mathf.Lerp(1f, sStop, shrinkP);
+        float ts = Mathf.Min(1f, s / 0.208f);
+        im.RadiationRoot.transform.localScale = new Vector3(s, s, s);
+        im.TriRoot.transform.localScale = new Vector3(ts, ts, ts);
+        if (s > 0.001f) {
+            foreach (var (line, t) in im.RadiationLines) line.Thickness = t / s;
+        }
+        if (ts > 0.05f) {
+            float tTri = 0.05f * GeoMap.MapCellSize / ts; // 三角线宽补偿 (基准 5t)
+            for (int k = 0; k < im.TriLines.Length; k++) if (im.TriLines[k] != null) im.TriLines[k].Thickness = tTri;
+        }
+        for (int k = 0; k < 3; k++) {
+            float a = Mathf.PI / 6f + k * 2f * Mathf.PI / 3f; // 30/150/270° (与扇叶互补)
+            TrisVerts(a, d, h, out var p1, out var p2, out var p3);
+            im.TriLines[k * 3].Start = new Vector3(p1.x, p1.y, 0f);
+            im.TriLines[k * 3].End = new Vector3(p2.x, p2.y, 0f);
+            im.TriLines[k * 3 + 1].Start = new Vector3(p2.x, p2.y, 0f);
+            im.TriLines[k * 3 + 1].End = new Vector3(p3.x, p3.y, 0f);
+            im.TriLines[k * 3 + 2].Start = new Vector3(p3.x, p3.y, 0f);
+            im.TriLines[k * 3 + 2].End = new Vector3(p1.x, p1.y, 0f);
+        }
+        // 收拢结束 (最后 1.5s 刚完, remain≤0): 内圈开始扩散 — 用计时不等落地事件
+        if (remain <= 0f) StartNukeExpand(im);
+    }
+
     /// <summary>核弹扩散启动 (飞行计时到 0 或落地事件都行, 只触发一次): 扇叶/三角/外圈藏, 中心内圈实体复用为扩散环.</summary>
     private static void StartNukeExpand(ImpactIndicator im) {
         if (im.NukeLandedAt >= 0f) return;
@@ -902,50 +949,9 @@ public class SandboxRenderer {
                     Glyph16Font.DrawCharSegments(im.TimerRoot.transform, t[k], Color.red, k * im.Step, im.SegW);
                 }
             }
-            // 核弹指示器旋转 + 三角收拢 (恒定实体每帧只动端点):
-            // 整体逆时针 60°/s (= 1/6 圈/s — 三对称转 120° 即"归位", 视觉周期 2s);
-            // 开火后 1s 透明度淡入 (旋转开始不生硬); 收拢终点 = 顶角重合 (d→h: 内顶点压在圆心, 三三角不再叠成一团)
+            // 核弹指示器旋转 + 三角收拢 (恒定实体每帧只动端点): 调用前置 = ATMC 且三角已建 (TriLines[0] 非空)
             if (im.Shell == BulletType.ATMC && im.TriLines[0] != null) {
-                var rot = NukeRot(); // 全局相位 — 与瞄准圈/队列圈同步, 开火瞬间无割裂
-                im.RadiationRoot.transform.localRotation = rot; // 辐射标跟转 (内圈圆旋转对称无感, 扇叶/刻度转)
-                im.TriRoot.transform.localRotation = rot;
-                // 淡入 (只辐射标+三角, 外圈/红线/字不参与): 完全透明 1s (传导延迟), 再 1s 缓慢浮现 (alpha 0→1)
-                float fade = Mathf.Clamp01((im.Flight.FlyTime - remain - 1f) / 1f);
-                foreach (var (line, _) in im.RadiationLines) line.Color = new Color(1f, 0f, 0f, fade);
-                for (int k = 0; k < im.TriLines.Length; k++) if (im.TriLines[k] != null) im.TriLines[k].Color = new Color(1f, 0f, 0f, fade);
-                float denom = im.Flight.FlyTime - 1.5f;
-                if (denom < 0.001f) denom = im.Flight.FlyTime; // 短弹道: 收拢压到全程
-                float frac = Mathf.Clamp01((im.Flight.FlyTime - remain) / denom);
-                float h = 0.5f * im.NukeR / Mathf.Sqrt(3f); // 顶点距 (边长 0.5R)
-                float d = Mathf.Lerp(2.8f * im.NukeR, h, frac); // 从 2.8R 收到 h (顶角重合于圆心)
-                // 最后 1.5s: 辐射告警收拢 — s: 1 → s_stop = 0.125/rKm (内圈直径 = 线宽 5t 即停, 再缩没意义);
-                // 三角跟缩 ts = min(1, s/0.208) — 保证外廓 0.5R·ts ≤ 扇叶外缘 2.4R·s (扇叶缩过 0.5R 后三角同步缩);
-                // 两处线宽都补偿 (世界线宽不随缩放走)
-                float sStop = NukeSStop(im.RadiusKm);
-                float shrinkP = Mathf.Clamp01((1.5f - remain) / 1.5f);
-                float s = Mathf.Lerp(1f, sStop, shrinkP);
-                float ts = Mathf.Min(1f, s / 0.208f);
-                im.RadiationRoot.transform.localScale = new Vector3(s, s, s);
-                im.TriRoot.transform.localScale = new Vector3(ts, ts, ts);
-                if (s > 0.001f) {
-                    foreach (var (line, t) in im.RadiationLines) line.Thickness = t / s;
-                }
-                if (ts > 0.05f) {
-                    float tTri = 0.05f * GeoMap.MapCellSize / ts; // 三角线宽补偿 (基准 5t)
-                    for (int k = 0; k < im.TriLines.Length; k++) if (im.TriLines[k] != null) im.TriLines[k].Thickness = tTri;
-                }
-                for (int k = 0; k < 3; k++) {
-                    float a = Mathf.PI / 6f + k * 2f * Mathf.PI / 3f; // 30/150/270° (与扇叶互补)
-                    TrisVerts(a, d, h, out var p1, out var p2, out var p3);
-                    im.TriLines[k * 3].Start = new Vector3(p1.x, p1.y, 0f);
-                    im.TriLines[k * 3].End = new Vector3(p2.x, p2.y, 0f);
-                    im.TriLines[k * 3 + 1].Start = new Vector3(p2.x, p2.y, 0f);
-                    im.TriLines[k * 3 + 1].End = new Vector3(p3.x, p3.y, 0f);
-                    im.TriLines[k * 3 + 2].Start = new Vector3(p3.x, p3.y, 0f);
-                    im.TriLines[k * 3 + 2].End = new Vector3(p1.x, p1.y, 0f);
-                }
-                // 收拢结束 (最后 1.5s 刚完, remain≤0): 内圈开始扩散 — 用计时不等落地事件
-                if (remain <= 0f) StartNukeExpand(im);
+                UpdateNukeImpact(im, remain);
             }
         }
     }
