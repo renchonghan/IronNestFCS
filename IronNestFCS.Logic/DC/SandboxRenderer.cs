@@ -556,26 +556,7 @@ public class SandboxRenderer {
         }
         // 边界检查: 落点出地图 (向外扩一小格) 不显示指示器 — 落点打到板外时红线别飞出火控台 (统一 GeoMap.IsOnBoard)
         if (!GeoMap.IsOnBoard(board, GeoMap.MapCellSize)) return;
-        if (!_impacts.TryGetValue(side, out var im) || im.Root == null) {
-            im = new ImpactIndicator { Root = new GameObject("FCS2_ImpactIndicator") };
-            im.Root.transform.SetParent(MapSurfaceRef, false);
-            im.FixedRoot = new GameObject("FCS2_ImpactFixed");
-            im.SolidRoot = new GameObject("FCS2_ImpactSolid");
-            im.DotRoot = new GameObject("FCS2_ImpactDot");
-            im.CircleRoot = new GameObject("FCS2_ImpactCircle");
-            im.RadiationRoot = new GameObject("FCS2_ImpactRadiation");
-            im.TriRoot = new GameObject("FCS2_ImpactTris");
-            im.TimerRoot = new GameObject("FCS2_ImpactTimer");
-            im.BulletRoot = new GameObject("FCS2_ImpactBullet");
-            foreach (var c in new[] { im.FixedRoot, im.SolidRoot, im.DotRoot, im.CircleRoot, im.RadiationRoot, im.TriRoot, im.TimerRoot, im.BulletRoot })
-                c.transform.SetParent(im.Root.transform, false);
-            // 红线/红点挂 ImpactOffset 同层 (圈/字/核弹三角在各自动作里单独设 z, 这里只抬线层)
-            foreach (var c in new[] { im.FixedRoot, im.SolidRoot, im.DotRoot })
-                c.transform.localPosition = new Vector3(0f, 0f, ImpactOffset);
-            // 实心红点 (圆画在局部原点, 后续移动父级位置即可, 只建一次)
-            FillDot(im.DotRoot.transform, Vector2.zero, 0.012f, Color.red, ImpactPrio);
-            _impacts[side] = im;
-        }
+        var im = EnsureImpact(side);
         // 每发重画/重置 (弹道终点/弹种可能变)
         im.ImpactBoard = board;
         im.NestBoard = (Vector2)MapSurfaceRef.InverseTransformPoint(NestRef.position);
@@ -590,25 +571,7 @@ public class SandboxRenderer {
         im.TimerRoot.SetActive(true);
         im.BulletRoot.SetActive(true);
         im.CircleRoot.SetActive(true);
-        // 目标轨迹线: 击发 → 火控线参数转移给最终线 (冻结, 倒计时驱动缩短), 火控线立即释放 (下个任务解算接管).
-        // 不看 activeSelf: 击发后 FC push 冻结已把线隐藏, 数据仍在.
-        // 转移校验: ① LastValid 3s 窗口 — 静态目标无预瞄 (v=0) 不 push, tr 里是上一发 (假目标) 的旧参数, 超窗拒转移
-        // (真目标开火不再把假目标轨迹复活成最终线); ② 参数有效性 — 交汇点非 NaN 且飞时为正
-        if (_tracks.TryGetValue(side, out var tr) && tr.Root != null && tr.Target != null && MapSurfaceRef != null
-            && Time.time - tr.LastValid < 3f
-            && !float.IsNaN(tr.AimBoard.x) && tr.T0 > 0f) {
-            var fin = EnsureTrack(_finals, side);
-            fin.Target = tr.Target;
-            fin.AimBoard = tr.AimBoard;
-            fin.VBoard = tr.VBoard;
-            fin.ABoard = tr.ABoard;
-            fin.JBoard = tr.JBoard;
-            fin.T0 = tr.T0;
-            fin.P0Board = (Vector2)MapSurfaceRef.InverseTransformPoint(tr.Target.position); // 冻结起点 = 击发瞬间目标位置
-            fin.Flight = flight; // 最终线缩短驱动 (统一口径)
-            fin.Root.SetActive(true);
-            tr.Root.SetActive(false); // 火控线释放
-        }
+        TransferFinalTrack(side, flight);
         // 红色固定虚线 (全长弹道, 落地保留): 与 A1 同款 — 游戏 Dashed 材质单线, 保持红色 (恒定实体, 建一次)
         if (im.FixedLine == null) {
             im.FixedLine = CreateDashedLine(im.FixedRoot.transform, "FCS2_ImpactFixed", 0.006f, Color.red, ImpactPrio);
@@ -641,7 +604,63 @@ public class SandboxRenderer {
         }
         im.RadiationRoot.SetActive(im.Shell == BulletType.ATMC);
         im.TriRoot.SetActive(im.Shell == BulletType.ATMC);
-        // 弹种标签 (飞行时挪到队列编号位: 与队列时 L-X 同 y = 0.14 + dy; 板面空间 = 实体空间常量 × SurfScale)
+        RebuildImpactLabels(im);
+        // 淡入预写 alpha 0 (只核弹的辐射标+三角 — 消除开火瞬间到下一帧 UpdateImpacts 之间的 ~16ms 全亮闪)
+        if (im.Shell == BulletType.ATMC) {
+            foreach (var (line, _) in im.RadiationLines) line.Color = new Color(1f, 0f, 0f, 0f);
+            for (int k = 0; k < im.TriLines.Length; k++) if (im.TriLines[k] != null) im.TriLines[k].Color = new Color(1f, 0f, 0f, 0f);
+        }
+        im.Root.SetActive(true);
+    }
+
+    /// <summary>落点指示器实体 (恒定: 每炮一套, 建一次 — 不新建不销毁).</summary>
+    private ImpactIndicator EnsureImpact(LeftRight side) {
+        if (_impacts.TryGetValue(side, out var im) && im.Root != null) return im;
+        im = new ImpactIndicator { Root = new GameObject("FCS2_ImpactIndicator") };
+        im.Root.transform.SetParent(MapSurfaceRef, false);
+        im.FixedRoot = new GameObject("FCS2_ImpactFixed");
+        im.SolidRoot = new GameObject("FCS2_ImpactSolid");
+        im.DotRoot = new GameObject("FCS2_ImpactDot");
+        im.CircleRoot = new GameObject("FCS2_ImpactCircle");
+        im.RadiationRoot = new GameObject("FCS2_ImpactRadiation");
+        im.TriRoot = new GameObject("FCS2_ImpactTris");
+        im.TimerRoot = new GameObject("FCS2_ImpactTimer");
+        im.BulletRoot = new GameObject("FCS2_ImpactBullet");
+        foreach (var c in new[] { im.FixedRoot, im.SolidRoot, im.DotRoot, im.CircleRoot, im.RadiationRoot, im.TriRoot, im.TimerRoot, im.BulletRoot })
+            c.transform.SetParent(im.Root.transform, false);
+        // 红线/红点挂 ImpactOffset 同层 (圈/字/核弹三角在各自动作里单独设 z, 这里只抬线层)
+        foreach (var c in new[] { im.FixedRoot, im.SolidRoot, im.DotRoot })
+            c.transform.localPosition = new Vector3(0f, 0f, ImpactOffset);
+        // 实心红点 (圆画在局部原点, 后续移动父级位置即可, 只建一次)
+        FillDot(im.DotRoot.transform, Vector2.zero, 0.012f, Color.red, ImpactPrio);
+        _impacts[side] = im;
+        return im;
+    }
+
+    /// <summary>目标轨迹线: 击发 → 火控线参数转移给最终线 (冻结, 倒计时驱动缩短), 火控线立即释放 (下个任务解算接管).
+    /// 不看 activeSelf: 击发后 FC push 冻结已把线隐藏, 数据仍在.
+    /// 转移校验: ① LastValid 3s 窗口 — 静态目标无预瞄 (v=0) 不 push, tr 里是上一发 (假目标) 的旧参数, 超窗拒转移
+    /// (真目标开火不再把假目标轨迹复活成最终线); ② 参数有效性 — 交汇点非 NaN 且飞时为正</summary>
+    private void TransferFinalTrack(LeftRight side, Flight flight) {
+        if (_tracks.TryGetValue(side, out var tr) && tr.Root != null && tr.Target != null && MapSurfaceRef != null
+            && Time.time - tr.LastValid < 3f
+            && !float.IsNaN(tr.AimBoard.x) && tr.T0 > 0f) {
+            var fin = EnsureTrack(_finals, side);
+            fin.Target = tr.Target;
+            fin.AimBoard = tr.AimBoard;
+            fin.VBoard = tr.VBoard;
+            fin.ABoard = tr.ABoard;
+            fin.JBoard = tr.JBoard;
+            fin.T0 = tr.T0;
+            fin.P0Board = (Vector2)MapSurfaceRef.InverseTransformPoint(tr.Target.position); // 冻结起点 = 击发瞬间目标位置
+            fin.Flight = flight; // 最终线缩短驱动 (统一口径)
+            fin.Root.SetActive(true);
+            tr.Root.SetActive(false); // 火控线释放
+        }
+    }
+
+    /// <summary>弹种标签 (飞行时挪到队列编号位: 与队列时 L-X 同 y = 0.14 + dy; 板面空间 = 实体空间常量 × SurfScale) + 计时基线.</summary>
+    private void RebuildImpactLabels(ImpactIndicator im) {
         var (segW, step, dy) = LabelMetrics();
         string bt = im.Shell.ToString();
         ClearChildren(im.BulletRoot.transform);
@@ -655,12 +674,6 @@ public class SandboxRenderer {
         im.SegW = segW;
         im.Step = step;
         im.TimerY = im.ImpactBoard.y + (-0.2f * SurfScale - dy);
-        // 淡入预写 alpha 0 (只核弹的辐射标+三角 — 消除开火瞬间到下一帧 UpdateImpacts 之间的 ~16ms 全亮闪)
-        if (im.Shell == BulletType.ATMC) {
-            foreach (var (line, _) in im.RadiationLines) line.Color = new Color(1f, 0f, 0f, 0f);
-            for (int k = 0; k < im.TriLines.Length; k++) if (im.TriLines[k] != null) im.TriLines[k].Color = new Color(1f, 0f, 0f, 0f);
-        }
-        im.Root.SetActive(true);
     }
 
     /// <summary>核弹扩散启动 (飞行计时到 0 或落地事件都行, 只触发一次): 扇叶/三角/外圈藏, 中心内圈实体复用为扩散环.</summary>
