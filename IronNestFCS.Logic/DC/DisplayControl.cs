@@ -254,9 +254,29 @@ public class DisplayControl {
         foreach (var t in Targets) if (t.Side == Side3.Friendly && !t.Virtual) friends.Add(Board(t));
         var consumed = new HashSet<GameObject>();
         var plans = new List<SweepPlan>();
+        PlanArmours(enemies, friends, consumed, plans);
+        PlanSofts(enemies, friends, consumed, plans);
 
-        // 装甲阶段 (两次判定: 先数圈内伴生, 有伴生才比价): APHE 覆盖尝试 → 与 AP + 圈内逐个点杀比价
-        // (覆盖成本 ≤ 点杀成本 + 1 走覆盖 — 装甲价值 20 恒回本, 只认成本账, 否则无脑全 APHE); 纯单目标直接 AP; 圈内有友军禁用 APHE
+        // 排序: 优先级 (杀伤区继承圈内最大值 — 反炮兵插队) 降序, 同级收益密度降序 → 发请求 (队列顺序 = 派发顺序)
+        plans.Sort((x, y) => {
+            int p = y.Priority.CompareTo(x.Priority);
+            return p != 0 ? p : (y.Value / y.Cost).CompareTo(x.Value / x.Cost);
+        });
+        foreach (var plan in plans) {
+            Requests.Add(new FireTask {
+                Entity = plan.Seed.Entity,
+                Name = plan.Seed.Name,
+                Priority = plan.Priority,
+                Shell = plan.Shell,
+                Mode = ChargeModeSelection,
+            });
+        }
+        OnSweepQueue?.Invoke(Targets);
+    }
+
+    /// <summary>装甲阶段 (两次判定: 先数圈内伴生, 有伴生才比价): APHE 覆盖尝试 → 与 AP + 圈内逐个点杀比价
+    /// (覆盖成本 ≤ 点杀成本 + 1 走覆盖 — 装甲价值 20 恒回本, 只认成本账, 否则无脑全 APHE); 纯单目标直接 AP; 圈内有友军禁用 APHE.</summary>
+    private void PlanArmours(List<DcTarget> enemies, List<Vector2> friends, HashSet<GameObject> consumed, List<SweepPlan> plans) {
         var armours = enemies.FindAll(e => e.Armour > 0);
         foreach (var a in armours) {
             if (consumed.Contains(a.Entity)) continue;
@@ -283,9 +303,11 @@ public class DisplayControl {
                 plans.Add(new SweepPlan { Seed = a, Shell = BulletType.AP, Cost = ShellCost(BulletType.AP) + Powder(a), Value = 20f, Priority = PriorityOf(a) });
             }
         }
+    }
 
-        // 软目标阶段 (回本判据): 覆盖弹按 HCHE→HE→LE 序尝试, 覆盖成本 ≤ 圈内总价值 (5×n) 就走覆盖 —
-        // 比点杀贵一点也吃 (省轮次, "能回本即可"); 分散目标圈不到人覆盖弹基本都亏 → 兜底 DRIL 点杀; 圈内有友军禁用该覆盖弹
+    /// <summary>软目标阶段 (回本判据): 覆盖弹按 HCHE→HE→LE 序尝试, 覆盖成本 ≤ 圈内总价值 (5×n) 就走覆盖 —
+    /// 比点杀贵一点也吃 (省轮次, "能回本即可"); 分散目标圈不到人覆盖弹基本都亏 → 兜底 DRIL 点杀; 圈内有友军禁用该覆盖弹.</summary>
+    private void PlanSofts(List<DcTarget> enemies, List<Vector2> friends, HashSet<GameObject> consumed, List<SweepPlan> plans) {
         var softs = enemies.FindAll(e => e.Armour <= 0);
         foreach (var s in softs) {
             if (consumed.Contains(s.Entity)) continue;
@@ -310,22 +332,6 @@ public class DisplayControl {
             consumed.Add(s.Entity);
             plans.Add(plan);
         }
-
-        // 排序: 优先级 (杀伤区继承圈内最大值 — 反炮兵插队) 降序, 同级收益密度降序 → 发请求 (队列顺序 = 派发顺序)
-        plans.Sort((x, y) => {
-            int p = y.Priority.CompareTo(x.Priority);
-            return p != 0 ? p : (y.Value / y.Cost).CompareTo(x.Value / x.Cost);
-        });
-        foreach (var plan in plans) {
-            Requests.Add(new FireTask {
-                Entity = plan.Seed.Entity,
-                Name = plan.Seed.Name,
-                Priority = plan.Priority,
-                Shell = plan.Shell,
-                Mode = ChargeModeSelection,
-            });
-        }
-        OnSweepQueue?.Invoke(Targets);
     }
 
     /// <summary>目标是否已被覆盖 (队列 + 在炮任务 + 未落地炮弹): 指定实体或落入任务弹种杀伤半径内 → 不编排.

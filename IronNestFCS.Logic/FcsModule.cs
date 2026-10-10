@@ -47,11 +47,20 @@ public class FcsModule : IFcsModule
     private bool _bootFailed;
     private bool _nukeCanFire;
     private bool _shutdown;
+    private Transform? _fmr; // 任务实体根缓存 (Fire Mission Root 常驻任务场景; 每帧 Find 全场景遍历不划算 — 失效惰性重找)
+
+    /// <summary>任务场景判据 (FMR 在案 = 在任务里; 回主菜单 FMR 消失). 缓存引用, 失效自动重找.</summary>
+    private bool FmrAlive {
+        get {
+            if (_fmr == null) _fmr = GameObject.Find("Fire Mission Root")?.transform;
+            return _fmr != null;
+        }
+    }
 
     public bool Initialize()
     {
         // 主菜单/无任务场景: 不开机 (NO SIGNAL 占位); 进任务 (FMR 在案) = 开机自检装配链
-        if (GameObject.Find("Fire Mission Root") == null) return false;
+        if (!FmrAlive) return false;
         _booting = true;
         _bootStage = 0;
         _bootFails = 0;
@@ -66,7 +75,7 @@ public class FcsModule : IFcsModule
     {
         if (_shutdown) {
             // 开机失败冻结面板: 仍盯场景 — FMR 消失 (回主菜单) 才清屏, NO SIGNAL 接管
-            if (_bootFailed && GameObject.Find("Fire Mission Root") == null) ClearBoot();
+            if (_bootFailed && !FmrAlive) ClearBoot();
             return;
         }
         if (_booting) { BootTick(); return; }
@@ -75,8 +84,7 @@ public class FcsModule : IFcsModule
         if (hud != null && Time.time - _lastAliveCheck > 2f) {
             _lastAliveCheck = Time.time;
             // 任务实体根 = 场景判据 (实测: 回主菜单时 Fire Mission Root 消失, 沙盘/铁巢棋子仍常驻)
-            bool fmr = GameObject.Find("Fire Mission Root") != null;
-            if (!fmr) {
+            if (!FmrAlive) {
                 _shutdown = true;
                 Shutdown();
                 MelonLogger.Msg("[FCS] scene unloaded, HUD → NO SIGNAL");
@@ -126,7 +134,7 @@ public class FcsModule : IFcsModule
     private void BootTick()
     {
         // 开机中回主菜单: FMR 消失 → 中断自清 (下一帧清屏, NO SIGNAL 接管)
-        if (GameObject.Find("Fire Mission Root") == null) { AbortBoot(); return; }
+        if (!FmrAlive) { AbortBoot(); return; }
         var lines = _boot!.Lines;
         float t = Time.time - _bootStageT;
         switch (_bootStage) {

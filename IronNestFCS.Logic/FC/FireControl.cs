@@ -192,12 +192,18 @@ public class FireControl {
         }
     }
 
-    /// <summary>队列任务坐标解算 (显示用): 与在炮真解算同源 SolveOne (C4), 不碰硬件不派发.</summary>
+    /// <summary>队列任务坐标解算 (显示用): 与在炮真解算同源 SolveOne (C4), 不碰硬件不派发.
+    /// 目标失效 (阵亡/雷达关) → 队内直接撤 (与在炮任务同口径 — 不挂 HUD 队列等派发才撤, 僵尸任务).</summary>
     private void UpdateQueueSolutions() {
-        foreach (var t in _queue) {
+        for (int i = _queue.Count - 1; i >= 0; i--) {
+            var t = _queue[i];
             if (t == _gL.Task || t == _gR.Task) continue; // 在炮任务由 ComputeGunSolutions 解
             var target = DcPort?.GetTarget(t.Entity!);
-            if (target == null) continue;
+            if (target == null) {
+                MelonLogger.Msg($"[FC] queue fc#{t.Id} target gone, cancel");
+                RequestCancel(t);
+                continue;
+            }
             var (rawDist, _) = RelToTarget(target.WorldPos);
             SolveOne(t, target, ChargeOf(t, rawDist)); // 队列显示: 按当前距离解析装药 (派发时重解)
         }
