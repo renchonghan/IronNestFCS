@@ -68,8 +68,7 @@ public class DisplayControl {
             GroupTrains();       // 列车聚簇: 中心车出 TWS 文本, 其余成员隐藏 (定案后删探针)
             UpdateIcons();       // 实体图标差集 (在列表→画, 不在→删)
             TrackTokens();       // 令牌拖放: 上地图注册虚拟目标, 拖离自动取消
-            PruneSwept();        // 去重集合轮询放回 (STP/RST 清队列后目标别再被永久挡住)
-            if (AutoTask) Sweep();
+            if (AutoTask) Sweep(); // 3s 一轮 (Sweep 内部节流): 覆盖判定选漏网之鱼
         }
     }
 
@@ -213,9 +212,12 @@ public class DisplayControl {
     /// 弹种规则 (EQKE/核弹/特种排除): 装甲 AP (10) 点杀, 成对 ≤APHE 半径 0.25km 一发 APHE (15) 覆盖 (同穿甲能力);
     /// 无甲 DRIL (3) 点杀, 扎堆按 LE (8, r0.15) / HE (10, r0.25) / HCHE (18, r0.55) 覆盖比价 (药价 0.25/包计入).
     /// 集群 = 一发覆盖弹锁种子头 (杀伤半径内必死), 溅射成员跳过不再打; 覆盖半径内有友军 → 禁用该覆盖弹 (别学美国人).
-    /// 排序 = 收益密度 (装甲 20 / 无甲 5) / 总成本 降序; 成本相等覆盖胜 (轮次少优先).</summary>
-    private readonly HashSet<GameObject> _swept = new();
+    /// 排序 = 收益密度 (装甲 20 / 无甲 5) / 总成本 降序; 成本相等覆盖胜 (轮次少优先).
+    /// 3s 一轮 (与雷达扫描同数量级): 每轮按 现有任务 (队列+在炮) + 未落地炮弹 的杀伤覆盖算漏网之鱼 —
+    /// 手动压入的任务/飞行中的弹同样参与覆盖 (不重复编排); 弹落地跳一轮 (击杀结算死区). 无批次去重集合.</summary>
     private const float PowderCost = 0.25f; // 征用/包 (20 包 = 5 征用)
+    private readonly HashSet<Flight> _flightsInAir = new(); // 上一轮还在飞的炮弹 (落地沿检测)
+    private float _lastSweep;
 
     private class SweepPlan {
         public DcTarget Seed = null!;
@@ -225,8 +227,24 @@ public class DisplayControl {
     }
 
     private void Sweep() {
+        if (Time.time - _lastSweep < 3f) return;
+        _lastSweep = Time.time;
+        // 落地结算死区: 上一轮还在飞的炮弹本轮已落地 → 跳一轮 (击杀结算需要时间, 否则落地后目标还没出表就被当漏网重排)
+        if (FcPort != null) {
+            bool justLanded = false;
+            foreach (var e in FcPort.Finished) {
+                var f = e.Flight;
+                if (f == null) continue;
+                if (!f.Landed) _flightsInAir.Add(f);
+                else if (_flightsInAir.Remove(f)) justLanded = true;
+            }
+            if (justLanded) {
+                MelonLogger.Msg("[DC] sweep: shell landed, skip this round (kill settlement)");
+                return;
+            }
+        }
         var enemies = new List<DcTarget>();
-        foreach (var t in Targets) if (t.Side == Side3.Enemy && !t.Virtual && !_swept.Contains(t.Entity)) enemies.Add(t);
+        foreach (var t in Targets) if (t.Side == Side3.Enemy && !t.Virtual && !Covered(t)) enemies.Add(t);
         if (enemies.Count == 0) return;
         var friends = new List<Vector2>();
         foreach (var t in Targets) if (t.Side == Side3.Friendly && !t.Virtual) friends.Add(Board(t));
@@ -275,7 +293,6 @@ public class DisplayControl {
         // 收益密度降序 → 发请求 (队列顺序 = 派发顺序)
         plans.Sort((x, y) => (y.Value / y.Cost).CompareTo(x.Value / x.Cost));
         foreach (var plan in plans) {
-            _swept.Add(plan.Seed.Entity);
             Requests.Add(new FireTask {
                 Entity = plan.Seed.Entity,
                 Name = plan.Seed.Name,
@@ -287,20 +304,32 @@ public class DisplayControl {
         OnSweepQueue?.Invoke(Targets);
     }
 
-    /// <summary>扫荡去重集合轮询放回 (3s 一次): 队列空 (STP/RST 清过 或 本批打完) → 全部放回重新评估 —
-    /// 不然目标被 _swept 永久挡住, 再开 AutoTask 死活不入队; 溅射漏网 (成员没死) 也靠这补刀.
-    /// 队列活跃 (任务在队/在炮) → 只清死实体.</summary>
-    private float _lastSweptPrune;
-    private void PruneSwept() {
-        if (Time.time - _lastSweptPrune < 3f) return;
-        _lastSweptPrune = Time.time;
-        bool anyTask = FcPort != null && (FcPort.QueueCount > 0 || FcPort.LeftTask != null || FcPort.RightTask != null);
-        if (anyTask) {
-            _swept.RemoveWhere(e => e == null); // 阵亡出表: 清死引用
+    /// <summary>目标是否已被覆盖 (队列 + 在炮任务 + 未落地炮弹): 指定实体或落入任务弹种杀伤半径内 → 不编排.
+    /// 半径活读 ShellData.KillRadiusKm (绝不写死); DUMP 占位 (无目标) 不参与; 手动任务与扫荡任务同口径.</summary>
+    private bool Covered(DcTarget t) {
+        if (FcPort == null) return false;
+        var tasks = new List<FireTask>(FcPort.Queue);
+        if (FcPort.LeftTask != null) tasks.Add(FcPort.LeftTask);
+        if (FcPort.RightTask != null) tasks.Add(FcPort.RightTask);
+        foreach (var task in tasks) {
+            if (task.Dump) continue;
+            var seed = task.Entity != null ? GetTarget(task.Entity) : null;
+            if (seed != null && WithinCover(seed, task.Shell, t)) return true;
         }
-        else {
-            _swept.Clear(); // 队列空: 计划作废 (STP/RST) 或本批打完 — 全放回
+        // 未落地的炮弹同样覆盖其落点圈 (落地后 = 已结算, 活着才算漏网补刀)
+        foreach (var e in FcPort.Finished) {
+            if (e.Flight == null || e.Flight.Landed) continue;
+            var seed = e.Task.Entity != null ? GetTarget(e.Task.Entity) : null;
+            if (seed != null && WithinCover(seed, e.Task.Shell, t)) return true;
         }
+        return false;
+    }
+
+    /// <summary>覆盖判定: t 是种子实体本身, 或在种子弹种杀伤半径内.</summary>
+    private bool WithinCover(DcTarget seed, BulletType shell, DcTarget t) {
+        if (seed.Entity == t.Entity) return true;
+        float r = ShellData.KillRadiusKm(shell) / GeoMap.KmPerLocal;
+        return (Board(seed) - Board(t)).magnitude <= r;
     }
 
     /// <summary>目标板面坐标 (集群距离判定, 与渲染/杀伤圈同口径).</summary>
@@ -342,7 +371,7 @@ public class DisplayControl {
 
     private readonly Dictionary<Transform, string> _tokens = new(); // 令牌 → 虚拟目标名称
 
-    /// <summary>右键实体 toggle: 无任务 → 入队; 已有 → 升级齐射; 已齐射 → 取消.</summary>
+    /// <summary>右键实体 toggle: 无任务 → 入队; 已有 → 升级齐射; 已齐射 → 取消. (摧毁目标不可点由点击盒拆除保证 — 阵亡实体盒子随雷达出表拆掉)</summary>
     public void RightClickEntity(GameObject go) {
         if (go == null) return;
         var existing = FcPort?.FindEntityTask(go);
@@ -378,30 +407,41 @@ public class DisplayControl {
 
     // ===== 令牌拖放检测 (MapToken_* 棋子) =====
     private readonly HashSet<Transform> _trackedTokens = new();
-    private readonly Dictionary<Transform, bool> _tokenOnMap = new();
+    private readonly Dictionary<Transform, int> _tokenEdgeFrames = new(); // 边界确认计数: 正 = 连续在图上帧数, 负 = 连续离图帧数
     private float _lastTokenScan;
 
-    /// <summary>每帧: 新令牌发现 (1s 一批) + 上下地图边界判定.</summary>
+    /// <summary>每帧: 新令牌发现 (1s 一批) + 上下地图边界判定.
+    /// 发现时已在图上 = 立即注册 (游戏重建棋子/F9 重载后棋子已在图上, 等"拖入"上升沿永远等不到 → 右键任务上炮即被撤);
+    /// 边界翻转 8 帧 (~0.32s) 迟滞确认 — 拖放经过边界/棋子重建的位置抖动不误触发注册/移除 (任务"突然消失"源之一).</summary>
     private void TrackTokens() {
         if (Time.time - _lastTokenScan > 1f) {
             _lastTokenScan = Time.time;
+            _trackedTokens.RemoveWhere(t => t == null);
+            foreach (var key in new List<Transform>(_tokenEdgeFrames.Keys)) if (key == null) _tokenEdgeFrames.Remove(key!); // Unity 假空: 死句柄 == null 但仍可作字典键移除
             foreach (var go in GameObject.FindObjectsOfType<GameObject>()) {
                 // 标记令牌只注册 T1-10 (MapToken_Artillery 系列); 击杀/侦察/参考点令牌不注册虚拟目标
                 if (go == null || !go.name.StartsWith("MapToken_Artillery") || go.name.Contains("Killed")) continue;
-                if (_trackedTokens.Add(go.transform)) _tokenOnMap[go.transform] = IsOnMap(go.transform.position);
+                if (!_trackedTokens.Add(go.transform)) continue;
+                if (IsOnMap(go.transform.position)) {
+                    AddToken(go.transform, go.name); // 已在图上: 直接注册 (名称 = 令牌名)
+                    _tokenEdgeFrames[go.transform] = 8;
+                    MelonLogger.Msg($"[DC] token '{go.name}' discovered on map, registered");
+                }
             }
         }
         foreach (var token in _trackedTokens) {
             if (token == null) continue;
             bool inside = IsOnMap(token.position);
-            bool was = _tokenOnMap.TryGetValue(token, out var w) && w;
-            _tokenOnMap[token] = inside;
-            if (inside && !was) {
-                AddToken(token, token.name); // 拖上地图: 注册虚拟目标 (名称 = 令牌名)
+            bool registered = _tokens.ContainsKey(token);
+            int f = _tokenEdgeFrames.TryGetValue(token, out var v) ? v : 0;
+            f = inside ? (f >= 0 ? f + 1 : 1) : (f <= 0 ? f - 1 : -1);
+            _tokenEdgeFrames[token] = f;
+            if (inside && !registered && f >= 8) {
+                AddToken(token, token.name); // 拖上地图 (连续在图上确认): 注册虚拟目标
                 MelonLogger.Msg($"[DC] token '{token.name}' placed on map");
             }
-            else if (!inside && was) {
-                RemoveToken(token);          // 拖离地图: 位置源失效 → FC 撤任务
+            else if (!inside && registered && f <= -8) {
+                RemoveToken(token);          // 拖离地图 (连续离图确认): 位置源失效 → FC 撤任务
                 MelonLogger.Msg($"[DC] token '{token.name}' left map, task removed");
             }
         }
@@ -499,6 +539,19 @@ public class DisplayControl {
     /// <summary>地图上令牌右键 → 虚拟目标入队 (与实体右键同款 toggle 语义).</summary>
     public void RightClickToken(GameObject token) {
         if (token == null) return;
+        if (!IsOnMap(token.transform.position)) {
+            MelonLogger.Msg($"[DC] token '{token.name}' not on map, ignore right-click");
+            return; // 托盘里的令牌不是目标, 入队只会变成上炮即撤的僵尸任务
+        }
+        // 自愈: 点击时令牌不在虚拟目标表 (发现竞态/棋子被游戏重建漏注册) → 当场注册并直接进目标表 —
+        // 否则任务派发后 GetTarget 查无 → 上炮即撤 ("一闪就没")
+        if (!_tokens.ContainsKey(token.transform)) {
+            _trackedTokens.Add(token.transform);
+            _tokenEdgeFrames[token.transform] = 8; // 已确认在图上, 边界计数直接置稳
+            AddToken(token.transform, token.name);
+            UpsertTarget(token, token.name, token.transform.position, Side3.Enemy, EntityKind.Other, 0, true);
+            MelonLogger.Msg($"[DC] token '{token.name}' registered on right-click (self-heal)");
+        }
         var existing = FcPort?.FindEntityTask(token);
         if (existing != null) {
             if (!existing.SalvoPair) existing.SalvoPair = true;

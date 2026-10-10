@@ -123,6 +123,16 @@ public class ScenePanel {
                 Dc?.RightClickEntity(go);
             }, right: true); // 右键 (左键留给游戏自身拖拽)
         }
+        // 死亡拆盒: 父级实体不在雷达 Contacts (阵亡出表) → 注销 + 销毁盒子 — 摧毁目标不可点, 尸体不挡射线
+        // (拆盒后右键自然无门控可达: 盒都没了就没有"点"这回事; 死亡检测延迟窗口 ~1-3s, 期间点击由雷达下一轮扫描自愈)
+        var alive = new HashSet<Transform>();
+        foreach (var c in RadarPort.Contacts) if (c != null && c.Entity != null) alive.Add(c.Entity.transform);
+        var deadBoxes = new List<Collider>();
+        foreach (var c in _entityColliders) {
+            if (c == null) continue;
+            if (!alive.Contains(c.transform.parent)) deadBoxes.Add(c);
+        }
+        foreach (var c in deadBoxes) RemoveBox(c, _entityColliders);
         // 地图令牌 (MapToken_* 棋子): 右键 = 虚拟目标入队 (拖放由 DC 数据循环检测).
         // 令牌自带游戏 collider (0.09) 不可用: 注册它的话 StraightenClickBoxes 每帧归正会拧令牌本体 —
         // 统一挂 FCS 自建子盒, 尺寸 0.03 局部 (用户定稿: 0.06 再缩一半)
@@ -143,6 +153,25 @@ public class ScenePanel {
                 Dc?.RightClickToken(token);
             }, right: true);
         }
+        // 击杀改名令牌同款拆盒 (Killed 系列不可点, 注册扫描本就跳过 — 已挂的盒子拆掉)
+        var deadTokens = new List<Collider>();
+        foreach (var c in _tokenColliders) {
+            if (c == null) continue;
+            var parent = c.transform.parent;
+            if (parent == null || parent.name.Contains("Killed")) deadTokens.Add(c);
+        }
+        foreach (var c in deadTokens) RemoveBox(c, _tokenColliders);
+    }
+
+    /// <summary>拆点击盒: 注销 + 销毁盒子 (_owned 移出防 ShutDown 重复销毁).</summary>
+    private void RemoveBox(Collider c, HashSet<Collider> set) {
+        string parentName = c.transform.parent != null ? c.transform.parent.name : "?";
+        set.Remove(c);
+        _clicks.Unregister(c);
+        var go = c.gameObject;
+        if (go != null) _owned.Remove(go);
+        if (go != null) UnityEngine.Object.Destroy(go);
+        MelonLogger.Msg($"[DC] click box removed: '{parentName}'");
     }
 
     // ===== 沙盘右侧第二列 (原 T1-T4 按钮位置): AUTO TASK / AUTO FIRE / (空) / SAR RADAR / TWS CGMTI / (空) / T/N/X =====

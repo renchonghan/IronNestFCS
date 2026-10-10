@@ -60,6 +60,11 @@ public class ClickRaycaster
         }
     }
 
+    /// <summary>注销一个点击 Collider (目标阵亡拆盒用; 盒子销毁后旧条目本会被假空跳过, 显式注销更干净, 顺带清死引用).</summary>
+    public void Unregister(Collider collider) {
+        targets.RemoveAll(t => t.collider == null || t.collider.Equals(collider));
+    }
+
     /// <summary>清空注册表（重载/卸载时调用）。</summary>
     public void Clear() => targets.Clear();
 }

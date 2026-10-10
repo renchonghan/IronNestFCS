@@ -89,6 +89,7 @@ public class GunControl {
     private bool _lastHasFired;                // pendingReload 上升沿检测 (击发自检兜底)
     private bool? _lastCanFire;                // CanFire 沿检测 (装填完成 → 击发沿复位; 下降沿 = 出膛)
     private bool _forceFullPowder;             // 上轮 LOAD 推药失败: 下轮 PWDR 无视分配器读数强制拉满
+    private int _cofmFailures;                 // 连续 COFM 超时计数 (强制拉满重试后还失败 → 抛错 FALL; 成功/新任务清零)
     private readonly List<object> _childHandles = new(); // 子协程句柄 (2-2 并行 Calculate 等; Stop 时回收, F9 防泄漏)
     private bool _disposed;
     /// <summary>当前飞行 (击发时创建, 落地后保留引用 — HUD/DC 读 Landed/Remain; 下一发击发覆盖; DUMP 不建).</summary>
@@ -288,6 +289,7 @@ public class GunControl {
         AllReady = false;
         Fired = false;
         CalcDone = false; // 每任务一次 Calculate 信号复位
+        _cofmFailures = 0; // COFM 连续失败计数按任务口径 (新任务重计数)
         // 击发沿基线同步到当前状态 (不能直接清 false): 上一发击发后未装填时 pendingReload 残留 true,
         // 清 false 会让下一帧击发自检把残留沿误判成新开火 → 入队瞬间红线闪一下
         _lastHasFired = _gun.HasFired();
@@ -311,15 +313,22 @@ public class GunControl {
             if (!_gun.HaveBulletInCylinder(DesiredShell)) {
                 return new SalvoStep { Action = GunAction.Selc, Deadline = 20f, Routine = SelcRoutine };
             }
-            // 选弹后必须推弹入膛 (固定两步, 否则膛永远空着死循环); 复合步相位跟真实动作
-            return new SalvoStep { Action = GunAction.Shrd, Deadline = 28f, Routine = ShrdShldStep };
+            // 选弹后必须推弹入膛 (固定两步, 否则膛永远空着死循环); 复合步相位跟真实动作.
+            // 期限覆盖内部兜底全链: 计数清零 10 + 转仓 ≤10.5 + 推弹按钮激活窗 9×2 (失败重按一次) + 推弹启动确认 10×2 + 推弹入膛 30 ≈ 89s → 95
+            // (旧 28s 低于合法慢跑路径: 机构复位慢+转仓多步+推弹动画长合计可超 28s, 正常跑也会误杀 FALL;
+            // 重按两次都无效在例程内直接抛错走 FALL, 不会真拖到期限)
+            return new SalvoStep { Action = GunAction.Shrd, Deadline = 95f, Routine = ShrdShldStep };
         }
         if (!chargeOk) {
             if (Charges > DesiredCharge && SyncCommand) { // 齐射多药: 同样进 1-3 等 FC 接管 (只能整发打掉)
                 return new SalvoStep { Action = GunAction.Dump, Deadline = 15f, Routine = DumpWaitRoutine };
             }
-            // PWDR 拉杆只改"选药" (实装不变), 必须接 LOAD 推药入膛再回决策, 否则 loaded 永远 0 死循环
-            return new SalvoStep { Action = GunAction.Pwdr, Deadline = 45f, Routine = PwdrLoadStep };
+            // PWDR 拉杆只改"选药" (实装不变), 必须接 LOAD 推药入膛再回决策, 否则 loaded 永远 0 死循环.
+            // 期限覆盖可恢复最坏链 ≈ 111s: 等码 20 + 计算 3 + 采购 2×12 (池不足时; 10 次无效自带抛错)
+            // + 拉杆 ≤6 包 (秒拉 ~6s, 含一次按钮激活窗错位 +9) + 等读数 15 (错位时走满) + 推药钮 9 (药没拉够不激活)
+            // + COFM 25 (药没推进膛走满) → 120 (旧 45s 误杀这条可恢复慢跑路径; 真故障由 COFM 连续 2 次抛错 FALL,
+            // 拉杆全哑 54s 的路径超期限 → 看门狗 FALL, 也不会无限空转)
+            return new SalvoStep { Action = GunAction.Pwdr, Deadline = 120f, Routine = PwdrLoadStep };
         }
         // 弹对+药对 = 装填完成 (比 CanFire 更精细的实装校验; CanFire 实测不含保险本可直接用, 但弹药逐项对号更稳)
         return null; // 弹药就绪
@@ -500,11 +509,20 @@ public class GunControl {
 
     /// <summary>SHLD 推弹: 按推弹按钮 + 等入膛 (机构动作中不读膛内, 用 WaitShellRammed 的状态机判定).
     /// 推弹按钮按下后立即并行 Calculate (子协程 — ~3s 计算被 ~5-10s 推弹动画覆盖, 不白等);
-    /// 齐射只左炮算 (计算台共享), 右炮在 2-3 等 CalcDone.</summary>
+    /// 齐射只左炮算 (计算台共享), 右炮在 2-3 等 CalcDone.
+    /// 推弹没启动判定: 弹还在弹仓 = 按钮没按上 (机构/按钮激活窗口竞态, 偶发) → 重按一次;
+    /// 弹已离仓 (推弹架上/膛内) = 机构在动, 绝不重按防双推. 重按仍不动 → 抛错走 FALL (不静默空转).</summary>
     private IEnumerator ShldRoutine() {
         yield return _gun.PressRammer();
         if (!(SyncCommand && _side == LeftRight.Right)) StartChild(CalcPowderRefresh());
         yield return _gun.WaitRammingStart();
+        if (_gun.BulletInChamber() == null && _gun.ReloadStateKey() != "ShellRamming" && _gun.HaveBulletInCylinder(DesiredShell)) {
+            MelonLogger.Warning($"[GC] {_side}: shell still in cylinder after press, re-press rammer");
+            yield return _gun.PressRammer();
+            yield return _gun.WaitRammingStart();
+            if (_gun.BulletInChamber() == null && _gun.ReloadStateKey() != "ShellRamming" && _gun.HaveBulletInCylinder(DesiredShell))
+                throw new System.Exception("rammer press ineffective twice (shell stuck in cylinder)");
+        }
         yield return _gun.WaitShellRammed();
         RefreshSnapshot();
     }
@@ -606,8 +624,13 @@ public class GunControl {
         if (!cofm) {
             // 推药失败/药没推进膛: 分配器实际量与读数脱节 (读数残留/滞后), 下轮 PWDR 无视读数强制拉满
             _forceFullPowder = true;
-            MelonLogger.Msg($"[GC] {_side}: LOAD cofm timeout — loaded={_gun.LoadedPowderCharges()}, powder reading untrusted, next PWDR force full");
+            _cofmFailures++;
+            MelonLogger.Msg($"[GC] {_side}: LOAD cofm timeout (#{_cofmFailures}) — loaded={_gun.LoadedPowderCharges()}, powder reading untrusted, next PWDR force full");
+            // 防御: 强制拉满重试后还装不进 = 推药机构真故障 → 抛错走 FALL, 不无限空转 (单次偶发由重试自愈)
+            if (_cofmFailures >= 2)
+                throw new System.Exception($"LOAD cofm failed {_cofmFailures} times consecutively (loaded={_gun.LoadedPowderCharges()})");
         }
+        else _cofmFailures = 0; // 装填成功: 计数清零
         RefreshSnapshot();
     }
 

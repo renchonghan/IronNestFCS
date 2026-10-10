@@ -229,10 +229,20 @@ public class GunSystem {
         }
     }
 
-    /// <summary>按推弹按钮把炮弹送上推弹架 (面板 2-1 DLRD 阶段).</summary>
+    /// <summary>按推弹按钮把炮弹送上推弹架 (面板 2-1 DLRD 阶段).
+    /// 按钮引用失效时重新扫描绑定 (游戏重建装填控制台后旧引用点击无效 — RamPowder 同款).</summary>
     public IEnumerator PressRammer() {
         yield return WaitForReloadReady();
-        yield return UiClick.WaitAndClick(loadBulletButton!);
+        if (loadBulletButton == null || loadBulletButton.gameObject == null) {
+            var gunSystem = GameObject.Find("Gun System " + _surfix)?.transform;
+            var reloadingConsole = gunSystem?.Find("--Reloading Console");
+            loadBulletButton = reloadingConsole?.FindChild("Universal Button Load shell Rammer")?.GetComponent<LookAtTarget>();
+            if (loadBulletButton == null) {
+                MelonLogger.Error($"[GunSystem] PressRammer: load shell button missing");
+                yield break;
+            }
+        }
+        yield return UiClick.WaitAndClick(loadBulletButton);
     }
 
     /// <summary>按完推弹按钮后等推弹机启动 (装填状态机进入 ShellRamming), 10 秒兜底.</summary>
