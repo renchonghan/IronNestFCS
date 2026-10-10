@@ -304,7 +304,7 @@ public class SandboxRenderer {
         // 外圈跟任务弹种: 穿甲弹带 X 指示 (旧版同款; ATMC = 辐射标 + 外圈带六刻度)
         RebuildCircle(mark.RadiusRoot.transform, killRadiusKm, GreenOffset, Color.green, solid: false, pierce: IsArmorPierce((BulletType)bulletType),
             (BulletType)bulletType, ref mark.RadiusKm, ref mark.SegCount, ref mark.Pierce, ref mark.PierceBt);
-        if ((BulletType)bulletType == BulletType.ATMC) RebuildRadiation(mark.RadiationRoot!.transform, killRadiusKm, Color.green, GreenPrio, ref mark.RadiationKm);
+        if ((BulletType)bulletType == BulletType.ATMC) RebuildRadiation(mark.RadiationRoot.transform, killRadiusKm, Color.green, GreenPrio, ref mark.RadiationKm);
         else if (mark.RadiationRoot != null && mark.RadiationRoot.transform.childCount > 0) { ClearChildren(mark.RadiationRoot.transform); mark.RadiationKm = -1f; }
         // 核弹装填确认后转 (全局相位, 与队列/落弹环同步 — 开火瞬间无割裂): 只转辐射标 (外圈虚线圆/刻度保持静止, 与落弹点口径一致)
         var nukeRot = NukeRot();
@@ -1318,10 +1318,10 @@ public class SandboxRenderer {
     }
 
     private class BallisticMark {
-        public GameObject? Root;
-        public GameObject? RadiusRoot;
-        public GameObject? RadiationRoot; // 核弹辐射标 (ATMC 专属, 跟绿圈同层)
-        public GameObject? CrossRoot;
+        public GameObject Root = null!;      // 与 QueueIndicator/ImpactIndicator 同口径: 建实体时必赋值 (Unity 假空仍可 == null 判销毁)
+        public GameObject RadiusRoot = null!;
+        public GameObject RadiationRoot = null!; // 核弹辐射标 (ATMC 专属, 跟绿圈同层)
+        public GameObject CrossRoot = null!;
         public GameObject CornerRoot = null!;
         public GameObject BulletRoot = null!;
         public GameObject FlyRoot = null!;
