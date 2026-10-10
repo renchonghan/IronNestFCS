@@ -475,14 +475,18 @@ public class GunControl {
         }
     }
 
-    /// <summary>SELC 采购: 弹巢缺目标弹 → 采购台短锁内查+买 (两炮共用互不重买).</summary>
+    /// <summary>SELC 采购: 弹巢缺目标弹 → 采购台短锁内查+买 (两炮共用互不重买).
+    /// 任务中途被撤 (DesiredX 已 -1) 立即停手 — 不然拿着 -1 去买弹 (BuyShell -1 card 报错 + 误报 FALL).</summary>
     private IEnumerator SelcRoutine() {
         yield return _purchaseLock.Acquire();
         try {
+            if (ManualControl || DesiredCharge < 0) yield break; // 任务被撤: 停手
             if (!_gun.HaveBulletInCylinder(DesiredShell)) {
                 yield return _deck.BuyShell(DesiredShell, _side);
                 float waited = 0f;
-                while (!_gun.HaveBulletInCylinder(DesiredShell) && waited < 5f) {
+                while (waited < 5f) {
+                    if (ManualControl || DesiredCharge < 0) yield break; // 等待中途被撤: 停手 (不误报 not landed)
+                    if (_gun.HaveBulletInCylinder(DesiredShell)) break;
                     yield return new WaitForSeconds(0.5f);
                     waited += 0.5f;
                 }
@@ -515,9 +519,11 @@ public class GunControl {
     /// 推弹没启动判定: 弹还在弹仓 = 按钮没按上 (机构/按钮激活窗口竞态, 偶发) → 重按一次;
     /// 弹已离仓 (推弹架上/膛内) = 机构在动, 绝不重按防双推. 重按仍不动 → 抛错走 FALL (不静默空转).</summary>
     private IEnumerator ShldRoutine() {
+        if (ManualControl || DesiredCharge < 0) yield break; // 任务被撤: 停手 (别拿 -1 弹种重按)
         yield return _gun.PressRammer();
         if (!(SyncCommand && _side == LeftRight.Right)) StartChild(CalcPowderRefresh());
         yield return _gun.WaitRammingStart();
+        if (ManualControl || DesiredCharge < 0) yield break; // 等待中途被撤: 停手 (重按判据会读 -1 弹种)
         if (_gun.BulletInChamber() == null && _gun.ReloadStateKey() != "ShellRamming" && _gun.HaveBulletInCylinder(DesiredShell)) {
             MelonLogger.Warning($"[GC] {_side}: shell still in cylinder after press, re-press rammer");
             yield return _gun.PressRammer();
@@ -556,6 +562,7 @@ public class GunControl {
     /// 齐射: 锁内一次买够两炮总量 (2×need, 1.x 同款), 双炮并行给药不抢池.
     /// 拉杆前等游戏状态机进 SelectPowderCharge (推弹完全结束, 码确认; 超时兜底继续).</summary>
     private IEnumerator PwdrRoutine() {
+        if (ManualControl || DesiredCharge < 0) yield break; // 任务被撤: 停手 (别按 -1 装药拉杆)
         // 拉杆前等机构停稳 (同 SHRD/RamPowder 口径): 膛内弹直装路径起链后 2ms 即进 PWDR,
         // 上一发机构未复位时 Button Dispencer 不激活 (左炮高发 — 9s 超时白等 + 拉杆错位)
         yield return _gun.WaitForReloadReady();
@@ -611,6 +618,7 @@ public class GunControl {
     /// <summary>LOAD 装填: 按装填钮 (药拉够后激活, 游戏据此推药入膛) + 实装确认 (2-5 COFM 弹对药对+炮闩锁).
     /// 不卡 CanFire: 实测不含保险 (装完未开保险即 True) 本可直接等, 但逐项实装校验对号更稳.</summary>
     private IEnumerator LoadRoutine() {
+        if (ManualControl || DesiredCharge < 0) yield break; // 任务被撤: 停手 (别按 -1 装药推药)
         yield return _gun.RamPowder(); // 机构停稳 + 等装填钮激活点击
         float waited = 0f;
         const float cofmTimeout = 25f; // 装填全流程 (RamCharges→BreachLocked) 实测 ~20s, 留裕量
