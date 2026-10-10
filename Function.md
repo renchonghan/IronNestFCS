@@ -116,7 +116,7 @@ IronNestFCS 是自动化火控系统 (Fire Control System) Mod。玩家只需在
 
 ```
 14.23.05 [INFO] System Init ...
-14.23.06 [INFO] System Loaded For FCS 2.0.0
+14.23.06 [INFO] System Loaded For FCS 2.1.0
 14.23.06 [CORE] Enable Peripherals ...
                 |- Gun Control System ------------------- [DONE]
                 |- Data Process System ------------------ [DONE]

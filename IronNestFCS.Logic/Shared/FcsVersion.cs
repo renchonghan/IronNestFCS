@@ -14,6 +14,6 @@ public static class FcsVersion {
                 return $"{v.Major}.{v.Minor}.{v.Build}"; // 四段变三段 (Revision 不显示)
         }
         catch { }
-        return "2.0.0"; // 兜底 (程序集版本读不到时回老值)
+        return "2.1.0"; // 兜底 (程序集版本读不到时回老值)
     }
 }

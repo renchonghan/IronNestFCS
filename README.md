@@ -45,7 +45,7 @@ MelonLoader 是运行本 Mod 必需的前置工具（所有 MelonLoader Mod 都�
 ## 第 3 步：下载本 Mod
 
 1. 打开本仓库的 Releases 发布页：**[Releases](../../releases)**
-2. 下载最新的 **`IronNestFCS_v2.0.0.zip`**（火控，必装）
+2. 下载最新的 **`IronNestFCS_v2.1.0.zip`**（火控，必装）
 3. （可选）如果你还想用"自定义唱片机"，再下载 **`CustomRecords` 压缩包**
 4. 解压你下载的 zip（右键 → 全部解压缩），得到文件夹
 
